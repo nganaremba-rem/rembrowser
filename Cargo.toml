@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 cef = { version = "=152.3.0", default-features = false }
+libc = "0.2.190"

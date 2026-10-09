@@ -11,7 +11,7 @@ echo "start:    [$(pages)] title=[$(wtitle)]"
 wtype -M ctrl t -m ctrl; sleep 3; echo "ctrl-t:   [$(pages)] title=[$(wtitle)]"
 wtype -M ctrl -k Tab -m ctrl; sleep 1; echo "ctrl-tab: title=[$(wtitle)]"
 wtype -M ctrl -k Tab -m ctrl; sleep 1; echo "ctrl-tab: title=[$(wtitle)]"
-wtype -M ctrl w -m ctrl; sleep 2; echo "ctrl-w:   [$(pages)] title=[$(wtitle)]"
+wtype -k Escape; sleep 0.3; wtype -M ctrl w -m ctrl; sleep 2; echo "ctrl-w:   [$(pages)] title=[$(wtitle)]"
 echo "DRM: $(node cdp.mjs https://example.com "$(cat play.js)")"
 echo "ads: $(node cdp.mjs https://example.com "$(cat adtest.js)")"
 niri msg action focus-window --id "$id"; sleep 0.3

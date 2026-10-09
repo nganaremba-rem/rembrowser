@@ -4,8 +4,13 @@
 //! `execute_process` returns >= 0 in those and we exit immediately.
 
 mod adblock;
+mod commands;
+mod downloads;
+mod keys;
 mod privacy;
 mod tabs;
+mod ui;
+mod vim;
 
 use cef::*;
 
@@ -31,11 +36,13 @@ fn main() {
     let profile = format!("{root}/Default");
     privacy::write_widevine_hint(&profile);
     adblock::start();
+    // Before CEF reads its switches: the config can turn on dark-mode.
+    commands::load_config();
 
     let url = std::env::args()
         .skip(1)
         .find(|a| !a.starts_with("--"))
-        .unwrap_or_else(|| HOME_URL.into());
+        .map_or_else(|| commands::resolve_url(""), |a| commands::resolve_url(&a));
 
     let settings = Settings {
         root_cache_path: root.as_str().into(),

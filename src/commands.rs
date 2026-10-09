@@ -1,0 +1,384 @@
+//! Ex commands (vimb names) + options. The config file is just ex commands, so it
+//! runs through the same `exec` as the `:` command line.
+
+use crate::{tabs, ui, vim};
+use cef::ImplBrowser;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+#[derive(Default)]
+struct Opts {
+    set: HashMap<String, String>,
+    shortcuts: HashMap<String, String>,
+    default_shortcut: Option<String>,
+}
+
+thread_local! {
+    static OPTS: RefCell<Opts> = RefCell::new(Opts::default());
+}
+
+pub fn opt(key: &str) -> Option<String> {
+    OPTS.with_borrow(|o| o.set.get(key).cloned())
+}
+
+pub fn opt_bool(key: &str, default: bool) -> bool {
+    opt(key).map_or(default, |v| matches!(v.as_str(), "on" | "true" | "1" | "yes"))
+}
+
+pub fn opt_num(key: &str, default: i32) -> i32 {
+    opt(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
+fn expand_tilde(p: &str) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(home()).join(rest),
+        None => PathBuf::from(p),
+    }
+}
+
+/// vimb's data dir, shared so ~/.local/bin/vimb-pick (history, bookmarks, harpoon) keeps working.
+pub fn data_dir() -> PathBuf {
+    std::env::var("XDG_DATA_HOME").map_or_else(|_| PathBuf::from(home()).join(".local/share"), PathBuf::from).join("vimb")
+}
+
+/// ~/.config/rembrowser/config, else the vimb config as-is.
+pub fn load_config() {
+    let cfg = std::env::var("XDG_CONFIG_HOME").map_or_else(|_| PathBuf::from(home()).join(".config"), PathBuf::from);
+    let own = cfg.join("rembrowser/config");
+    let path = if own.exists() { own } else { cfg.join("vimb/config") };
+    source(&path);
+}
+
+fn source(path: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        eprintln!("rembrowser: can't read {}", path.display());
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.is_empty() && !line.starts_with('#') && !line.starts_with('"') {
+            exec(line);
+        }
+    }
+}
+
+const MAP_CMDS: &[&str] = &[
+    "nmap", "nnoremap", "imap", "inoremap", "cmap", "cnoremap", "nunmap", "iunmap", "cunmap",
+];
+
+/// Run one command line. `a|b` runs both, except for map commands whose RHS owns the `|`
+/// (vimb: `nnoremap <Space>uz :set status-bar!|set fullscreen!<CR>`).
+pub fn exec(line: &str) {
+    let line = line.trim().trim_start_matches(':').trim();
+    let first = line.split_whitespace().next().unwrap_or("");
+    if MAP_CMDS.contains(&first) {
+        exec_one(line);
+    } else {
+        for part in line.split('|') {
+            exec_one(part);
+        }
+    }
+}
+
+fn exec_one(line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let name_end = line.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).unwrap_or(line.len());
+    let (name, rest) = line.split_at(name_end);
+    let bang = rest.starts_with('!');
+    let args = rest.trim_start_matches('!').trim();
+    match name {
+        "o" | "open" => open(args, false),
+        "t" | "tabopen" | "tabnew" => open(args, true),
+        "q" | "quit" | "close" | "tabclose" => tabs::close_active(),
+        "qa" | "qall" | "quitall" | "wqa" => tabs::quit_all(),
+        "back" => tabs::with_active(|b| b.go_back()),
+        "forward" => tabs::with_active(|b| b.go_forward()),
+        "reload" if bang => tabs::with_active(|b| b.reload_ignore_cache()),
+        "reload" => tabs::with_active(|b| b.reload()),
+        "stop" => tabs::with_active(|b| b.stop_load()),
+        "tabnext" | "tabn" => tabs::cycle(1),
+        "tabprev" | "tabp" | "tabprevious" => tabs::cycle(-1),
+        "tabfirst" => tabs::select(0),
+        "tablast" => tabs::select(usize::MAX),
+        "b" | "buffer" => match args.parse::<usize>() {
+            Ok(n) if n > 0 => tabs::select(n - 1),
+            _ => ui::message("usage: :buffer N", true),
+        },
+        "tabs" => tab_picker(),
+        "set" => set(args),
+        "nmap" | "nnoremap" | "imap" | "inoremap" | "cmap" | "cnoremap" => map(name, args),
+        "nunmap" | "iunmap" | "cunmap" => vim::unmap(&name[..1], args),
+        "shortcut-add" => match args.split_once('=') {
+            Some((k, v)) => {
+                OPTS.with_borrow_mut(|o| o.shortcuts.insert(k.trim().into(), v.trim().into()));
+            }
+            None => ui::message("usage: shortcut-add name=url$0", true),
+        },
+        "shortcut-default" => OPTS.with_borrow_mut(|o| o.default_shortcut = Some(args.into())),
+        "source" | "so" => source(&expand_tilde(args)),
+        "sh" | "shell" => shell(args, !bang),
+        "shellex" => shellex(args),
+        "normal" | "norm" => vim::run_keys(args, bang),
+        "eval" | "e" => tabs::js(args),
+        "bma" => bookmark_add(args),
+        "qpush" => queue_push(),
+        "qpop" => queue_pop(),
+        "echo" => ui::message(args, false),
+        "zoom" => vim::zoom(args.parse().unwrap_or(0.0)),
+        // vimb autocommands only handed DRM sites to Helium; rembrowser plays DRM natively.
+        "au" | "autocmd" | "augroup" => {}
+        _ => ui::message(&format!("Not a command: {name}"), true),
+    }
+}
+
+fn map(cmd: &str, args: &str) {
+    let Some((lhs, rhs)) = args.split_once(char::is_whitespace) else {
+        ui::message(&format!("usage: {cmd} LHS RHS"), true);
+        return;
+    };
+    vim::map(&cmd[..1], lhs, rhs.trim_start(), cmd.contains("noremap"));
+}
+
+/// `set k=v`, `set k!` (toggle), `set k` (on), `set nok` (off).
+fn set(args: &str) {
+    let (key, val) = match args.split_once('=') {
+        Some((k, v)) => (k.trim().to_string(), v.trim().to_string()),
+        None if args.ends_with('!') => {
+            let k = args.trim_end_matches('!').trim().to_string();
+            let v = if opt_bool(&k, default_on(&k)) { "off" } else { "on" };
+            (k, v.into())
+        }
+        None => match args.strip_prefix("no") {
+            Some(k) if opt(args).is_none() => (k.into(), "off".into()),
+            _ => (args.into(), "on".into()),
+        },
+    };
+    OPTS.with_borrow_mut(|o| o.set.insert(key.clone(), val.clone()));
+    match key.as_str() {
+        "status-bar" => ui::set_bar_visible(opt_bool("status-bar", true)),
+        "fullscreen" => tabs::set_fullscreen(opt_bool("fullscreen", false)),
+        _ => {}
+    }
+}
+
+fn default_on(key: &str) -> bool {
+    matches!(key, "status-bar" | "smooth-scrolling" | "incsearch")
+}
+
+/// Text from `:open` → URL. Shortcuts: `aw niri` → arch wiki search; plain words →
+/// default shortcut; things that look like hosts get https://.
+pub fn resolve_url(arg: &str) -> String {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return opt("home-page").unwrap_or_else(|| crate::HOME_URL.into());
+    }
+    if arg.contains("://") || ["about:", "data:", "file:", "chrome:", "view-source:"].iter().any(|p| arg.starts_with(p)) {
+        return arg.into();
+    }
+    let (first, rest) = arg.split_once(' ').unwrap_or((arg, ""));
+    let template = OPTS.with_borrow(|o| o.shortcuts.get(first).cloned());
+    if let Some(t) = template.filter(|_| !rest.is_empty()) {
+        return fill(&t, rest);
+    }
+    if !arg.contains(' ') && looks_like_host(arg) {
+        let local = arg.starts_with("localhost") || arg.starts_with("127.") || arg.starts_with("192.168.");
+        return format!("{}://{arg}", if local { "http" } else { "https" });
+    }
+    let default = OPTS.with_borrow(|o| o.default_shortcut.as_ref().and_then(|d| o.shortcuts.get(d)).cloned());
+    fill(&default.unwrap_or_else(|| "https://duckduckgo.com/?q=$0".into()), arg)
+}
+
+fn looks_like_host(s: &str) -> bool {
+    let host = s.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(host, |(h, _)| h);
+    host == "localhost"
+        || (host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
+            && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+}
+
+/// vimb shortcut template: $0 = all words, $1.. = single words.
+fn fill(template: &str, words: &str) -> String {
+    let parts: Vec<&str> = words.split_whitespace().collect();
+    let mut out = template.replace("$0", &encode(words));
+    for (i, p) in parts.iter().enumerate().rev() {
+        out = out.replace(&format!("${}", i + 1), &encode(p));
+    }
+    out
+}
+
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b' ' => "+".into(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+pub fn open(arg: &str, new_tab: bool) {
+    let url = resolve_url(arg);
+    if new_tab {
+        tabs::open(&url, false);
+    } else {
+        tabs::load(&url);
+    }
+}
+
+/// Every program rembrowser starts goes through here. Chromium's sockets/files aren't
+/// close-on-exec, so a long-lived child (wl-copy, mpv) would otherwise keep them open,
+/// e.g. hold the DevTools port after the browser quit. Mark fds > 2 CLOEXEC just
+/// before exec (not close: std still needs its own error-report pipe until exec).
+pub fn command(program: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut c = Command::new(program);
+    // SAFETY: close_range is a single async-signal-safe syscall.
+    unsafe {
+        c.pre_exec(|| {
+            libc::close_range(3, libc::c_uint::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int);
+            Ok(())
+        });
+    }
+    c
+}
+
+fn env_cmd(cmd: &str) -> Command {
+    let (uri, title) = (tabs::active_url(), tabs::active_title());
+    let mut c = command("sh");
+    c.arg("-c").arg(cmd).stdin(Stdio::null());
+    // vimb names keep existing scripts (vimb-pick) working.
+    c.env("VIMB_URI", &uri).env("VIMB_TITLE", &title).env("VIMB_PID", std::process::id().to_string());
+    c.env("REMBROWSER_URI", &uri).env("REMBROWSER_TITLE", &title);
+    c
+}
+
+/// `:sh! cmd` = fire and forget; `:sh cmd` = also show the first output line.
+fn shell(cmd: &str, show: bool) {
+    let mut c = env_cmd(cmd);
+    if !show {
+        let _ = c.stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        return;
+    }
+    std::thread::spawn(move || {
+        let out = c.output().map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string());
+        ui::run_on_ui(0, move || ui::message(&out.unwrap_or_else(|e| e.to_string()), false));
+    });
+}
+
+/// `:shellex cmd` runs cmd and executes each stdout line as an ex command
+/// (vimb-pick prints `open URL`, `normal KEYS`).
+fn shellex(cmd: &str) {
+    let mut c = env_cmd(cmd);
+    c.stderr(Stdio::null());
+    std::thread::spawn(move || {
+        let Ok(out) = c.output() else { return };
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        ui::run_on_ui(0, move || text.lines().for_each(exec));
+    });
+}
+
+/// Fuzzel tab picker (Space Space): titles in, index out.
+fn tab_picker() {
+    let rows: Vec<String> = tabs::titles()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (t, u))| format!("{}  {}   —   {u}", i + 1, if t.is_empty() { &u } else { &t }))
+        .collect();
+    std::thread::spawn(move || {
+        let child = command("fuzzel")
+            .args(["--dmenu", "--index", "--width", "90", "--prompt", "tabs ❯ "])
+            .arg("--lines")
+            .arg(rows.len().clamp(1, 15).to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn();
+        let Ok(mut child) = child else { return };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(rows.join("\n").as_bytes());
+        }
+        let pick = child.wait_with_output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok());
+        if let Some(i) = pick {
+            ui::run_on_ui(0, move || tabs::select(i));
+        }
+    });
+}
+
+fn append_line(file: &str, line: &str) {
+    let dir = data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(file)) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// vimb history format: "uri\ttitle", oldest first.
+pub fn record_history(url: &str, title: &str) {
+    if url.starts_with("http") {
+        append_line("history", &format!("{url}\t{}", title.replace('\t', " ")));
+    }
+}
+
+fn bookmark_add(tags: &str) {
+    let url = tabs::active_url();
+    append_line("bookmark", &format!("{url}\t{}\t{tags}", tabs::active_title().replace('\t', " ")));
+    ui::message(&format!("bookmarked {url}"), false);
+}
+
+fn queue_push() {
+    let url = tabs::active_url();
+    append_line("queue", &url);
+    ui::message(&format!("queued {url}"), false);
+}
+
+fn queue_pop() {
+    let path = data_dir().join("queue");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines = text.lines();
+    match lines.next() {
+        Some(first) => {
+            let rest: Vec<&str> = lines.collect();
+            let _ = std::fs::write(&path, if rest.is_empty() { String::new() } else { rest.join("\n") + "\n" });
+            open(first, false);
+        }
+        None => ui::message("read-later queue is empty", true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_urls_like_vimb() {
+        exec("shortcut-add dd=https://duckduckgo.com/?q=$0");
+        exec("shortcut-add aw=https://wiki.archlinux.org/index.php?search=$0");
+        exec("shortcut-default dd");
+        assert_eq!(resolve_url("aw niri wm"), "https://wiki.archlinux.org/index.php?search=niri+wm");
+        assert_eq!(resolve_url("github.com/foo"), "https://github.com/foo");
+        assert_eq!(resolve_url("localhost:8080"), "http://localhost:8080");
+        assert_eq!(resolve_url("rust traits"), "https://duckduckgo.com/?q=rust+traits");
+        assert_eq!(resolve_url("aw"), "https://duckduckgo.com/?q=aw");
+        assert_eq!(resolve_url("about:blank"), "about:blank");
+        assert_eq!(resolve_url("c++"), "https://duckduckgo.com/?q=c%2B%2B");
+    }
+
+    #[test]
+    fn set_forms() {
+        exec("set scroll-step=60");
+        assert_eq!(opt_num("scroll-step", 0), 60);
+        exec("set hint-follow-last");
+        assert!(opt_bool("hint-follow-last", false));
+        exec("set incsearch!");
+        assert!(!opt_bool("incsearch", true));
+    }
+}

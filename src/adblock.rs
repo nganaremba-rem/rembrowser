@@ -12,7 +12,6 @@ use adblock::{
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::OnceLock,
     time::{Duration, SystemTime},
 };
@@ -80,7 +79,7 @@ fn build(dat: &Path) -> Option<Engine> {
         let file = dir.join(format!("{name}.txt"));
         let tmp = file.with_extension("tmp");
         // curl instead of an HTTP crate: it's on every Arch box and keeps the binary small.
-        let ok = Command::new("curl")
+        let ok = crate::commands::command("curl")
             .args(["-fsSL", "--max-time", "30", "-o"])
             .arg(&tmp)
             .arg(url)
@@ -122,5 +121,56 @@ mod tests {
         let _ = ENGINE.set(engine);
         assert!(should_block("https://ad.doubleclick.net/x.js", "https://example.com/", "script"));
         assert!(!should_block("https://example.com/app.js", "https://example.com/", "script"));
+    }
+}
+
+/// CEF glue: called on the IO thread once per request.
+pub mod hook {
+    use super::should_block;
+    use cef::*;
+
+    wrap_resource_request_handler! {
+        pub struct RemResourceRequestHandler;
+
+        impl ResourceRequestHandler {
+            // IO thread, once per request: keep it cheap.
+            fn on_before_resource_load(
+                &self,
+                _browser: Option<&mut Browser>,
+                frame: Option<&mut Frame>,
+                request: Option<&mut Request>,
+                _callback: Option<&mut Callback>,
+            ) -> ReturnValue {
+                let Some(req) = request else { return ReturnValue::CONTINUE };
+                let Some(rtype) = adblock_type(req.resource_type()) else { return ReturnValue::CONTINUE };
+                let url = CefString::from(&req.url()).to_string();
+                let source = frame
+                    .map(|f| CefString::from(&f.url()).to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| CefString::from(&req.referrer_url()).to_string());
+                if should_block(&url, &source, rtype) {
+                    ReturnValue::CANCEL
+                } else {
+                    ReturnValue::CONTINUE
+                }
+            }
+        }
+    }
+
+    /// CEF resource type → adblock request type. None = never block (top-level navigations).
+    fn adblock_type(t: ResourceType) -> Option<&'static str> {
+        Some(match t {
+            ResourceType::MAIN_FRAME => return None,
+            ResourceType::SUB_FRAME => "sub_frame",
+            ResourceType::STYLESHEET => "stylesheet",
+            ResourceType::SCRIPT => "script",
+            ResourceType::IMAGE | ResourceType::FAVICON => "image",
+            ResourceType::FONT_RESOURCE => "font",
+            ResourceType::OBJECT | ResourceType::PLUGIN_RESOURCE => "object",
+            ResourceType::MEDIA => "media",
+            ResourceType::XHR => "xmlhttprequest",
+            ResourceType::PING | ResourceType::CSP_REPORT => "ping",
+            _ => "other",
+        })
     }
 }

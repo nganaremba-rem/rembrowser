@@ -77,6 +77,10 @@ pub fn apply_switches(cl: &mut CommandLine) {
     for s in SWITCHES {
         cl.append_switch(Some(&(*s).into()));
     }
+    // vimb `set dark-mode=on`: sites see prefers-color-scheme: dark.
+    if crate::commands::opt_bool("dark-mode", false) {
+        cl.append_switch(Some(&"force-dark-mode".into()));
+    }
 }
 
 enum Pref {

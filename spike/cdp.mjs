@@ -15,8 +15,9 @@ const call = (method, params = {}) => new Promise((res) => {
   ws.addEventListener('message', on);
   ws.send(JSON.stringify({ id: my, method, params }));
 });
-if (!process.env.NEW_TARGET) await call('Page.navigate', { url });
+if (!process.env.NEW_TARGET && !process.env.NO_NAV) await call('Page.navigate', { url });
 await new Promise((r) => setTimeout(r, Number(process.env.WAIT ?? 3000)));
 const r = await call('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
-console.log(typeof r.result?.result?.value === 'string' ? r.result.result.value : JSON.stringify(r.result ?? r.error));
+const v = r.result?.result?.value;
+console.log(v !== undefined && typeof v !== 'object' ? String(v) : JSON.stringify(r.result ?? r.error));
 ws.close();
