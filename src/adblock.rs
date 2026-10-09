@@ -1,0 +1,126 @@
+//! Network ad/tracker blocking with Brave's adblock-rust (uBlock Origin syntax).
+//!
+//! The engine is built on a background thread and cached serialized in
+//! $XDG_CACHE_HOME/rembrowser/engine.dat, so later launches load it in milliseconds.
+//! Requests made before it's ready pass through.
+
+use adblock::{
+    Engine,
+    lists::{FilterSet, ParseOptions},
+    request::Request,
+};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::OnceLock,
+    time::{Duration, SystemTime},
+};
+
+static ENGINE: OnceLock<Engine> = OnceLock::new();
+
+const LISTS: &[(&str, &str)] = &[
+    ("easylist", "https://easylist.to/easylist/easylist.txt"),
+    ("easyprivacy", "https://easylist.to/easylist/easyprivacy.txt"),
+    ("ubo-filters", "https://ublockorigin.github.io/uAssets/filters/filters.txt"),
+    ("ubo-privacy", "https://ublockorigin.github.io/uAssets/filters/privacy.txt"),
+    ("ubo-badware", "https://ublockorigin.github.io/uAssets/filters/badware.txt"),
+    ("ubo-quick-fixes", "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt"),
+    ("peter-lowe", "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&showintro=0&mimetype=plaintext"),
+];
+
+/// uBO refreshes its lists every ~4 days.
+const MAX_AGE: Duration = Duration::from_secs(4 * 24 * 3600);
+
+fn cache_dir() -> PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .unwrap_or_else(|_| format!("{}/.cache", std::env::var("HOME").unwrap_or_default()));
+    PathBuf::from(base).join("rembrowser")
+}
+
+fn age(p: &Path) -> Option<Duration> {
+    SystemTime::now().duration_since(fs::metadata(p).ok()?.modified().ok()?).ok()
+}
+
+/// Write via a temp file + rename so a crash never leaves a half-written cache.
+fn write_atomic(p: &Path, data: &[u8]) {
+    let tmp = p.with_extension("tmp");
+    if fs::write(&tmp, data).is_ok() {
+        let _ = fs::rename(tmp, p);
+    }
+}
+
+pub fn start() {
+    std::thread::spawn(|| {
+        let dat = cache_dir().join("engine.dat");
+        // Fast path: any cached engine is used right away, even a stale one.
+        if let Some(e) = fs::read(&dat).ok().and_then(|b| {
+            let mut e = Engine::default();
+            e.deserialize(&b).ok().map(|_| e)
+        }) {
+            let _ = ENGINE.set(e);
+        }
+        // Rebuild when stale or missing. A rebuilt engine takes effect next launch
+        // unless none was loaded yet.
+        // ponytail: no hot-swap; swap via RwLock<Arc<Engine>> if long sessions need fresh lists.
+        if age(&dat).is_none_or(|a| a > MAX_AGE) {
+            if let Some(e) = build(&dat) {
+                let _ = ENGINE.set(e);
+            }
+        }
+    });
+}
+
+fn build(dat: &Path) -> Option<Engine> {
+    let dir = cache_dir().join("lists");
+    fs::create_dir_all(&dir).ok()?;
+    let mut set = FilterSet::new(false);
+    let mut any = false;
+    for (name, url) in LISTS {
+        let file = dir.join(format!("{name}.txt"));
+        let tmp = file.with_extension("tmp");
+        // curl instead of an HTTP crate: it's on every Arch box and keeps the binary small.
+        let ok = Command::new("curl")
+            .args(["-fsSL", "--max-time", "30", "-o"])
+            .arg(&tmp)
+            .arg(url)
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            let _ = fs::rename(&tmp, &file);
+        }
+        // A failed download falls back to the previous copy of that list.
+        if let Ok(text) = fs::read_to_string(&file) {
+            set.add_filter_list(text, ParseOptions::default());
+            any = true;
+        }
+    }
+    if !any {
+        eprintln!("rembrowser: adblock: no filter lists available (offline?)");
+        return None;
+    }
+    let engine = Engine::new_with_filter_set(set);
+    write_atomic(dat, &engine.serialize());
+    Some(engine)
+}
+
+/// `rtype` uses adblock's request type names ("script", "image", "sub_frame", ...).
+pub fn should_block(url: &str, source: &str, rtype: &str) -> bool {
+    let Some(engine) = ENGINE.get() else { return false };
+    Request::new(url, source, rtype, "GET").is_ok_and(|r| engine.check_network_request(&r).should_block())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_tracker_but_not_page() {
+        let mut set = FilterSet::new(false);
+        set.add_filter_list("||doubleclick.net^\n".into(), ParseOptions::default());
+        let engine = Engine::new_with_filter_set(set);
+        let _ = ENGINE.set(engine);
+        assert!(should_block("https://ad.doubleclick.net/x.js", "https://example.com/", "script"));
+        assert!(!should_block("https://example.com/app.js", "https://example.com/", "script"));
+    }
+}

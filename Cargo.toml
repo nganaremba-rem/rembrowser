@@ -1,0 +1,8 @@
+[package]
+name = "rembrowser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+cef = { version = "=152.3.0", default-features = false }
