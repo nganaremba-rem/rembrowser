@@ -425,6 +425,7 @@ fn insert_key(k: &str) -> bool {
         }
         // vimb: edit the field in editor-command (nvim popup).
         "<C-t>" => {
+            EDIT_WANTED.set(Some(std::time::Instant::now()));
             tabs::js("__rem.editGet()");
             true
         }
@@ -747,6 +748,8 @@ fn yank(text: &str) {
 thread_local! {
     /// A `p`/`P` waiting for the page's clipboard answer (only without wl-paste).
     static PASTE_WANTED: std::cell::Cell<Option<(std::time::Instant, bool)>> = const { std::cell::Cell::new(None) };
+    /// Ctrl-T / ;e waiting for the page to hand over the field's text.
+    static EDIT_WANTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 /// `https://a.com/b/c/?q` → `https://a.com/b/`.
@@ -775,11 +778,31 @@ fn url_root(url: &str) -> String {
 
 // ── command line ─────────────────────────────────────────────────
 
+/// A URL as it goes into a map or the command line. Maps hand it to the shell
+/// (`:sh! mpv '<C-R>%'`), and a page chooses its own URLs: a quote in one would end
+/// the quoting and run the rest as a command. Those characters are percent-encoded
+/// (same URL), which makes it safe inside single or double quotes.
+/// Not safe unquoted (`&`, `;` and `|` are ordinary URL characters): quote it, or use
+/// $REMBROWSER_URI.
+fn shell_safe(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    for c in url.chars() {
+        match c {
+            '\'' | '"' | '`' | '$' | '\\' | '!' => out.push_str(&format!("%{:02X}", c as u32)),
+            c if c.is_whitespace() || c.is_control() => {
+                out.push_str(&format!("%{:02X}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// <C-r>{reg}: % URL, ; last hinted URL, : last command, / last search.
 pub fn register(k: &str) -> Option<String> {
     match k {
-        "%" => Some(tabs::active_url()),
-        ";" => VIM.with_borrow(|v| Some(v.last_hint.clone())),
+        "%" => Some(shell_safe(&tabs::active_url())),
+        ";" => VIM.with_borrow(|v| Some(shell_safe(&v.last_hint))),
         ":" => VIM.with_borrow(|v| Some(v.last_cmd.clone())),
         "/" => VIM.with_borrow(|v| v.last_search.as_ref().map(|s| s.0.clone())),
         _ => None,
@@ -870,7 +893,13 @@ pub fn on_page_msg(fields: &[&str]) {
         },
         ["pip-none"] => ui::message("no video on this page", true),
         ["edit-none"] => ui::message("no text field focused", true),
-        ["edit-text", text] => edit_field(editor::percent_decode(text)),
+        // Only the answer to our own request (Ctrl-T, ;e): a page can't open the
+        // editor by itself.
+        ["edit-text", text] => {
+            if EDIT_WANTED.take().is_some_and(|at| at.elapsed().as_secs() < 5) {
+                edit_field(editor::percent_decode(text));
+            }
+        }
         ["hint-none"] if VIM.with_borrow(|v| v.mode) == Mode::Hint => {
             set_mode(Mode::Normal);
             ui::message("no hints", true);
@@ -911,7 +940,10 @@ fn hint_picked(href: &str, text: &str, x: f64, y: f64) {
         HintAct::Save => tabs::download(href),
         HintAct::Remove => tabs::js("__rem.picked?.remove()"),
         HintAct::Queue(front) => commands::queue_add(href, front),
-        HintAct::Edit => tabs::js("__rem.editGet(__rem.picked)"),
+        HintAct::Edit => {
+            EDIT_WANTED.set(Some(std::time::Instant::now()));
+            tabs::js("__rem.editGet(__rem.picked)")
+        }
         HintAct::Mpv => commands::mpv(href),
     }
 }
@@ -941,6 +973,17 @@ mod tests {
         assert_eq!(zoom_step(119.0, -1.0), 110.0);
         assert_eq!(zoom_step(500.0, 1.0), 500.0);
         assert_eq!(zoom_step(140.0, 0.0), 100.0);
+    }
+
+    #[test]
+    fn urls_cannot_break_out_of_shell_quotes() {
+        // What a hostile page would name itself to hijack `:sh! mpv '<C-R>%'`.
+        let s = shell_safe("https://evil.example/a';touch ~/pwned;'?q=$(id)&x=`id`\"\\ b");
+        assert!(!s.contains(['\'', '"', '`', '$', '\\', ' ']));
+        assert_eq!(s, "https://evil.example/a%27;touch%20~/pwned;%27?q=%24(id)&x=%60id%60%22%5C%20b");
+        // An ordinary URL is untouched.
+        let ok = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=10s#top";
+        assert_eq!(shell_safe(ok), ok);
     }
 
     #[test]

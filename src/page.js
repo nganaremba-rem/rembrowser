@@ -174,32 +174,6 @@ window.__rem ??= (() => {
   };
   R.blur = () => deepActive()?.blur();
 
-  // ── permission prompt inside a web-app window (no command popup there) ──
-  R.ask = (id, origin, what) => {
-    const host = document.createElement('rem-ask');
-    host.style.cssText = 'all:initial;position:fixed;top:12px;left:50%;translate:-50% 0;z-index:2147483647';
-    const sh = host.attachShadow({ mode: 'closed' });
-    const css = new CSSStyleSheet();
-    css.replaceSync(`div{font:14px/1.4 system-ui,sans-serif;color:#cdd6f4;background:#1e1e2e;border:1.5px solid #fab387;
-      border-radius:12px;padding:12px 14px;box-shadow:0 12px 40px #000a;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-      b{color:#fab387} button{font:inherit;color:#cdd6f4;background:#313244;border:1px solid #45475a;border-radius:8px;
-      padding:4px 10px;cursor:pointer} button:hover{border-color:#fab387}`);
-    sh.adoptedStyleSheets = [css];
-    const box = document.createElement('div');
-    const msg = document.createElement('span');
-    const o = document.createElement('b'); o.textContent = origin;
-    msg.append(o, ` wants to use your ${what}.`);
-    box.append(msg);
-    for (const [label, choice] of [['Allow once', 'allow'], ['Always allow', 'always'], ['Deny', 'deny'], ['Never', 'never']]) {
-      const b = document.createElement('button');
-      b.textContent = label;
-      b.onclick = () => { host.remove(); send('perm-answer', id, choice); };
-      box.append(b);
-    }
-    sh.append(box);
-    document.documentElement.append(host);
-  };
-
   // ── external editor: insert-mode Ctrl-T / ;e ──────────────────
   // The field is remembered: focus moves to the editor window meanwhile.
   R.editGet = (el = deepActive()) => {

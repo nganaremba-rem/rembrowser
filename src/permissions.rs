@@ -14,8 +14,6 @@ enum Pending {
 }
 
 struct Ask {
-    /// The asking browser: web-app windows answer through their own page.
-    browser_id: i32,
     origin: String,
     key: String,
     pending: Pending,
@@ -157,36 +155,20 @@ fn request(browser: Option<&Browser>, origin: &str, media: bool, bits: u32, pend
         *n
     });
     let what = describe(media, bits);
-    let browser_id = browser.map_or(-1, |b| b.identifier());
     ASKS.with_borrow_mut(|a| {
         a.insert(
             id,
             Ask {
-                browser_id,
                 origin: origin.into(),
                 key,
                 pending,
             },
         )
     });
-    // The command popup lives in the browser window; a web app asks inside its own page.
-    if browser.is_some_and(crate::apps::is_app) {
-        let js = format!(
-            "__rem.ask({id},{},{})",
-            popup::js_str(origin),
-            popup::js_str(&what)
-        );
-        crate::tabs::js_in(browser_id, &js);
-    } else {
-        popup::ask(id, origin, &what);
-    }
-}
-
-/// From a web app's in-page prompt: only that browser may answer its own question.
-pub fn answer_from(browser_id: i32, id: u64, choice: &str) {
-    if ASKS.with_borrow(|a| a.get(&id).is_some_and(|x| x.browser_id == browser_id)) {
-        answer(id, choice);
-    }
+    // Always the popup of the asking page's window: the popup is our own browser,
+    // which the page cannot reach. (A prompt drawn inside the page could be answered
+    // by the page itself.)
+    popup::ask(id, origin, &what, browser.and_then(crate::tabs::owner_of));
 }
 
 /// From the popup: allow | always | deny | never | dismiss.

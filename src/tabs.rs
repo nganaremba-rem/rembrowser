@@ -144,6 +144,14 @@ pub fn current_window() -> Option<Window> {
     }
 }
 
+/// The window a page lives in: its web-app window, or the browser window of its tab.
+pub fn owner_of(browser: &Browser) -> Option<Owner> {
+    if apps::is_app(browser) {
+        return Some(Owner::App(browser.identifier()));
+    }
+    index_of(&mut browser.clone()).map(|(win, _)| Owner::Win(win))
+}
+
 /// Page messages (focus, hints) count from the active tab or the focused web app.
 fn is_current(browser: &mut Browser) -> bool {
     active()
@@ -1002,15 +1010,6 @@ wrap_display_handler! {
         ) -> i32 {
             let msg = message.map(|m| m.to_string()).unwrap_or_default();
             let Some(body) = msg.strip_prefix("\u{1}rem\t") else { return 0 };
-            // Answer to a permission prompt shown inside a web-app window.
-            if let Some(rest) = body.strip_prefix("perm-answer\t") {
-                if let (Some(b), Some((id, choice))) = (browser.as_ref(), rest.split_once('\t')) {
-                    if let Ok(id) = id.parse() {
-                        permissions::answer_from(b.identifier(), id, choice);
-                    }
-                }
-                return 1;
-            }
             // Homescreen search box: only from the homescreen itself.
             if let Some(text) = body.strip_prefix("home-open\t") {
                 let from_home = browser.as_ref().and_then(|b| b.main_frame()).is_some_and(|f| home::is_home(&CefString::from(&f.url()).to_string()));

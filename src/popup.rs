@@ -324,13 +324,14 @@ pub fn form(title: &str, fields: &[(&str, &str)], on_submit: impl FnOnce(Vec<Str
 }
 
 /// Permission question; the answer comes back through `permissions::answer`.
-pub fn ask(id: u64, origin: &str, what: &str) {
+/// `owner`: the window of the page that asks (None = the focused one).
+pub fn ask(id: u64, origin: &str, what: &str, owner: Option<Owner>) {
     let js = format!(
         "rem.open({{kind:'prompt',id:{id},origin:{},what:{}}})",
         js_str(origin),
         js_str(what)
     );
-    ui::run_on_ui(0, move || show(js));
+    ui::run_on_ui(0, move || show_in(owner.unwrap_or_else(tabs::current_owner), js));
 }
 
 /// A yes/no question (y / Enter = yes; n / Esc = no). `yes` labels the yes button.
@@ -362,10 +363,15 @@ fn place(p: &Pop) {
 }
 
 fn show(js: String) {
-    let owner = tabs::current_owner();
-    let Some(win) = tabs::current_window() else {
-        return;
+    show_in(tabs::current_owner(), js);
+}
+
+fn show_in(owner: Owner, js: String) {
+    let win = match owner {
+        Owner::App(id) => crate::apps::window_of(id),
+        Owner::Win(id) => tabs::window_of(id),
     };
+    let Some(win) = win else { return };
     let ready = with_owner(owner, |p| {
         place(p);
         p.ctl.set_visible(1);
