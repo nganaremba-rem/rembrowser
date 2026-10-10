@@ -9,6 +9,7 @@
 //! (mode change, message, navigation, tab switch). `set status-bar` / `set tab-bar`
 //! pin them.
 
+use crate::popup::Owner;
 use crate::{commands, tabs};
 use cef::*;
 use std::cell::{Cell, RefCell};
@@ -37,7 +38,14 @@ pub const PEACH: u32 = 0xFFFA_B387;
 /// Longest tab title shown (chars).
 const TAB_TITLE: usize = 22;
 
+/// A status line. The browser window's lives in Chrome (tab-bar aware); each web app
+/// window gets its own overlay.
 struct Bar {
+    owner: Owner,
+    /// Web-app bars: their overlay and window (the browser's are in Chrome).
+    app: Option<(OverlayController, Window)>,
+    /// Held up: insert / hint / pass / command / pending keys.
+    hold: bool,
     mode: LabelButton,
     url: LabelButton,
     right: LabelButton,
@@ -59,15 +67,13 @@ struct Chrome {
 }
 
 thread_local! {
-    static BAR: RefCell<Option<Bar>> = const { RefCell::new(None) };
+    static BARS: RefCell<Vec<Bar>> = const { RefCell::new(Vec::new()) };
     static CHROME: RefCell<Option<Chrome>> = const { RefCell::new(None) };
     /// Unpinned bars stay up until these instants.
     static STATUS_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
     static TABS_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
-    /// Status bar held up: insert / hint / pass / command / pending keys.
-    static HOLD: Cell<bool> = const { Cell::new(false) };
-    /// Top-right notice (downloads): created on first use.
-    static TOAST: RefCell<Option<(OverlayController, LabelButton)>> = const { RefCell::new(None) };
+    /// Top-right notice (downloads) in the focused window: created on first use.
+    static TOAST: RefCell<Option<(Owner, Window, OverlayController, LabelButton)>> = const { RefCell::new(None) };
     static TOAST_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
@@ -76,8 +82,13 @@ const STATUS_H: i32 = 28;
 /// How long an unpinned bar stays after something happened.
 const SHOW_MS: u64 = 1500;
 
+fn with_owner<R>(o: Owner, f: impl FnOnce(&mut Bar) -> R) -> Option<R> {
+    BARS.with_borrow_mut(|b| b.iter_mut().find(|b| b.owner == o).map(f))
+}
+
+/// The status line of the focused window (web app or browser).
 fn with<R>(f: impl FnOnce(&mut Bar) -> R) -> Option<R> {
-    BAR.with_borrow_mut(|b| b.as_mut().map(f))
+    with_owner(tabs::current_owner(), f)
 }
 
 fn set_color(l: &LabelButton, color: u32) {
@@ -115,14 +126,82 @@ fn bar_panel(bg: u32, spacing: i32, insets: Insets, min_h: i32) -> Panel {
 
 /// The browser window closed (web apps may live on): forget its widgets.
 pub fn reset() {
-    BAR.with_borrow_mut(|b| b.take());
+    forget(Owner::Main);
     CHROME.with_borrow_mut(|c| c.take());
-    TOAST.with_borrow_mut(|t| t.take());
-    HOLD.set(false);
+}
+
+/// That window closed: drop its status line (and the toast if it was there).
+pub fn forget(owner: Owner) {
+    BARS.with_borrow_mut(|b| b.retain(|b| b.owner != owner));
+    TOAST.with_borrow_mut(|t| {
+        if t.as_ref().is_some_and(|t| t.0 == owner) {
+            t.take();
+        }
+    });
 }
 
 pub fn is_built() -> bool {
-    BAR.with_borrow(|b| b.is_some())
+    with_owner(Owner::Main, |_| ()).is_some()
+}
+
+/// Mode pill, URL/message, right-hand info: the three labels of a status line.
+fn labels(panel: &Panel) -> (LabelButton, LabelButton, LabelButton) {
+    let mode = label(" NORMAL ", TABBAR_BG, FONT_BOLD, None);
+    let url = label("", TEXT, FONT, None);
+    url.set_horizontal_alignment(HorizontalAlignment::LEFT);
+    let right = label("", SUBTEXT, FONT, None);
+    for v in [View::from(&mode), View::from(&url), View::from(&right)] {
+        panel.add_child_view(Some(&mut v.clone()));
+    }
+    if let Some(l) = panel.get_layout().and_then(|l| l.as_box_layout()) {
+        l.set_flex_for_view(Some(&mut View::from(&url)), 1);
+    }
+    (mode, url, right)
+}
+
+/// A web app window's own status line (after its first load, like the browser's).
+pub fn app_bar(w: &Window, id: i32) {
+    let owner = Owner::App(id);
+    if with_owner(owner, |_| ()).is_some() {
+        return;
+    }
+    let panel = bar_panel(
+        BAR_BG,
+        12,
+        Insets {
+            top: 0,
+            left: 0,
+            bottom: 0,
+            right: 8,
+        },
+        STATUS_H,
+    );
+    let (mode, url, right) = labels(&panel);
+    let Some(ctl) = w.add_overlay_view(Some(&mut View::from(&panel)), DockingMode::CUSTOM, 0)
+    else {
+        return;
+    };
+    ctl.set_visible(0);
+    BARS.with_borrow_mut(|b| {
+        b.push(Bar {
+            owner,
+            app: Some((ctl, w.clone())),
+            hold: false,
+            mode,
+            url,
+            right,
+            url_text: String::new(),
+            mode_text: "NORMAL".into(),
+            mode_color: BLUE,
+        })
+    });
+    place();
+    run_on_ui(0, recolor);
+}
+
+/// Keyboard focus moved between windows: show the right status line.
+pub fn focus_changed() {
+    update();
 }
 
 /// (tab bar slot, status bar slot) for the window layout: empty spacers, visible only
@@ -179,6 +258,40 @@ pub fn attach(w: &Window) {
 
 /// Overlay bounds follow the window (resize, fullscreen).
 pub fn place() {
+    BARS.with_borrow(|bars| {
+        for (ctl, win) in bars.iter().filter_map(|b| b.app.as_ref()) {
+            let size = View::from(win).size();
+            ctl.set_bounds(Some(&Rect {
+                x: 0,
+                y: size.height - STATUS_H,
+                width: size.width,
+                height: STATUS_H,
+            }));
+        }
+    });
+    TOAST.with_borrow(|t| {
+        let Some((owner, win, ctl, _)) = t else {
+            return;
+        };
+        let size = View::from(win).size();
+        let pref = ctl
+            .contents_view()
+            .map(|v| v.preferred_size())
+            .unwrap_or_default();
+        let width = pref.width.min(size.width - 24);
+        // Below a pinned tab bar (browser window); 12px from the edges.
+        let top = if *owner == Owner::Main && commands::opt_bool("tab-bar", false) {
+            TABBAR_H
+        } else {
+            0
+        } + 12;
+        ctl.set_bounds(Some(&Rect {
+            x: size.width - width - 12,
+            y: top,
+            width,
+            height: STATUS_H + 4,
+        }));
+    });
     let Some(w) = tabs::window() else { return };
     let size = View::from(&w).size();
     CHROME.with_borrow(|c| {
@@ -200,33 +313,22 @@ pub fn place() {
             }));
         }
     });
-    TOAST.with_borrow(|t| {
-        let Some((ctl, _)) = t else { return };
-        let pref = ctl
-            .contents_view()
-            .map(|v| v.preferred_size())
-            .unwrap_or_default();
-        let width = pref.width.min(size.width - 24);
-        // Below a pinned tab bar; 12px from the edges.
-        let top = if commands::opt_bool("tab-bar", false) {
-            TABBAR_H
-        } else {
-            0
-        } + 12;
-        ctl.set_bounds(Some(&Rect {
-            x: size.width - width - 12,
-            y: top,
-            width,
-            height: STATUS_H + 4,
-        }));
-    });
 }
 
 /// Top-right notice. `sticky` keeps it up (download running); otherwise it fades
 /// after a few seconds.
 pub fn toast(text: &str, sticky: bool) {
+    let owner = tabs::current_owner();
+    // Lives in one window: move it when another window has focus.
+    if TOAST.with_borrow(|t| t.as_ref().is_some_and(|t| t.0 != owner)) {
+        if let Some((_, _, ctl, _)) = TOAST.with_borrow_mut(Option::take) {
+            ctl.destroy();
+        }
+    }
     if TOAST.with_borrow(|t| t.is_none()) {
-        let Some(w) = tabs::window() else { return };
+        let Some(w) = tabs::current_window() else {
+            return;
+        };
         let panel = bar_panel(
             SURFACE,
             0,
@@ -245,10 +347,10 @@ pub fn toast(text: &str, sticky: bool) {
         else {
             return;
         };
-        TOAST.with_borrow_mut(|t| *t = Some((ctl, l)));
+        TOAST.with_borrow_mut(|t| *t = Some((owner, w.clone(), ctl, l)));
     }
     TOAST.with_borrow(|t| {
-        if let Some((ctl, l)) = t {
+        if let Some((_, _, ctl, l)) = t {
             l.set_text(Some(&text.into()));
             set_color(
                 l,
@@ -268,7 +370,7 @@ pub fn toast(text: &str, sticky: bool) {
     if !sticky {
         run_on_ui(4030, || {
             if TOAST_UNTIL.get().is_some_and(|t| Instant::now() >= t) {
-                TOAST.with_borrow(|t| t.as_ref().map(|(c, _)| c.set_visible(0)));
+                TOAST.with_borrow(|t| t.as_ref().map(|(_, _, c, _)| c.set_visible(0)));
             }
         });
     }
@@ -283,7 +385,16 @@ fn update() {
     let pin_tabs = commands::opt_bool("tab-bar", false);
     let pin_status = commands::opt_bool("status-bar", false);
     let tabs_on = pin_tabs || live(&TABS_UNTIL);
-    let status_on = pin_status || HOLD.get() || live(&STATUS_UNTIL);
+    let cur = tabs::current_owner();
+    let shown = |b: &Bar| pin_status || (b.owner == cur && (b.hold || live(&STATUS_UNTIL)));
+    let status_on = with_owner(Owner::Main, |b| shown(b)).unwrap_or(pin_status);
+    BARS.with_borrow(|bars| {
+        for b in bars {
+            if let Some((ctl, _)) = &b.app {
+                ctl.set_visible(shown(b) as i32);
+            }
+        }
+    });
     let tabs_was = CHROME.with_borrow(|c| {
         let c = c.as_ref()?;
         View::from(&c.tab_slot).set_visible(pin_tabs as i32);
@@ -317,18 +428,13 @@ pub fn build() {
     let Some(panel) = CHROME.with_borrow(|c| c.as_ref().map(|c| c.status.clone())) else {
         return;
     };
-    let mode = label(" NORMAL ", TABBAR_BG, FONT_BOLD, None);
-    let url = label("", TEXT, FONT, None);
-    url.set_horizontal_alignment(HorizontalAlignment::LEFT);
-    let right = label("", SUBTEXT, FONT, None);
-    for v in [View::from(&mode), View::from(&url), View::from(&right)] {
-        panel.add_child_view(Some(&mut v.clone()));
-    }
-    if let Some(l) = panel.get_layout().and_then(|l| l.as_box_layout()) {
-        l.set_flex_for_view(Some(&mut View::from(&url)), 1);
-    }
-    BAR.with_borrow_mut(|b| {
-        *b = Some(Bar {
+    let (mode, url, right) = labels(&panel);
+    BARS.with_borrow_mut(|b| {
+        b.retain(|b| b.owner != Owner::Main);
+        b.push(Bar {
+            owner: Owner::Main,
+            app: None,
+            hold: false,
             mode,
             url,
             right,
@@ -353,12 +459,17 @@ pub fn theme(w: &Window) {
 
 /// Per-view colours; only stick once the view is in the window (see theme()).
 pub fn recolor() {
-    with(|b| View::from(&b.mode).set_background_color(b.mode_color));
+    BARS.with_borrow(|bars| {
+        bars.iter()
+            .for_each(|b| View::from(&b.mode).set_background_color(b.mode_color))
+    });
     tabs::refresh_tabbar();
 }
 
 pub fn set_mode(name: &str, color: u32) {
+    let hold = name != "NORMAL";
     let changed = with(|b| {
+        b.hold = hold;
         if b.mode_text == name && b.mode_color == color {
             return false;
         }
@@ -370,8 +481,6 @@ pub fn set_mode(name: &str, color: u32) {
         true
     });
     if changed == Some(true) {
-        let hold = name != "NORMAL";
-        HOLD.set(hold);
         // Back to normal: linger briefly instead of vanishing mid-glance.
         if hold {
             update()
@@ -400,7 +509,12 @@ fn show_url(b: &mut Bar, url: &str) {
 
 /// The active tab's URL; a new one (navigation, tab switch) flashes the status bar.
 pub fn set_url(url: &str) {
-    let changed = with(|b| {
+    set_url_for(Owner::Main, url);
+}
+
+/// A window's page URL (the browser's active tab, or a web app's page).
+pub fn set_url_for(owner: Owner, url: &str) {
+    let changed = with_owner(owner, |b| {
         let changed = b.url_text != url;
         b.url_text = url.to_string();
         show_url(b, url);
@@ -427,8 +541,9 @@ pub fn clear_message() {
     });
 }
 
+/// Tab count / search / loading info — the browser window's status line.
 pub fn set_right(text: &str) {
-    with(|b| b.right.set_text(Some(&text.into())));
+    with_owner(Owner::Main, |b| b.right.set_text(Some(&text.into())));
 }
 
 /// `set status-bar` / `set tab-bar` changed: pin or unpin.

@@ -78,6 +78,7 @@ pub fn set_app_focus(view: Option<BrowserView>) {
     if changed {
         APP_FOCUS.with_borrow_mut(|a| *a = view);
         vim::reset();
+        ui::focus_changed();
     }
 }
 
@@ -391,12 +392,50 @@ pub fn zoom() -> f64 {
         .map_or(0.0, |h| h.zoom_level())
 }
 
+/// Zoom the current page and remember it for that site (like Chrome's per-site zoom).
 pub fn set_zoom(level: f64) {
     with_active(|b| {
         if let Some(h) = b.host() {
             h.set_zoom_level(level);
         }
     });
+    let host = host_of(&active_url());
+    if !host.is_empty() {
+        let mut z = zoom_levels();
+        z.retain(|(h, _)| *h != host);
+        if level.abs() > 0.01 {
+            z.push((host, level));
+        }
+        let text: String = z.iter().map(|(h, l)| format!("{h}\t{l}\n")).collect();
+        let path = zoom_file();
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+        let _ = std::fs::write(path, text);
+    }
+}
+
+fn zoom_file() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let data = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
+    std::path::PathBuf::from(data).join("rembrowser/zoom")
+}
+
+fn zoom_levels() -> Vec<(String, f64)> {
+    std::fs::read_to_string(zoom_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (h, z) = l.split_once('\t')?;
+            Some((h.to_string(), z.parse().ok()?))
+        })
+        .collect()
+}
+
+fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .and_then(|r| r.split(['/', '?', '#']).next())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Real (trusted) left click at CSS-pixel coordinates from page.js.
@@ -765,6 +804,10 @@ wrap_display_handler! {
 
         fn on_address_change(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
             let main = frame.is_some_and(|f| f.is_main() != 0);
+            if let Some(b) = browser.as_ref().filter(|b| main && apps::is_app(b)) {
+                ui::set_url_for(popup::Owner::App(b.identifier()), &url.map(|u| u.to_string()).unwrap_or_default());
+                return;
+            }
             if main && browser.is_some_and(|b| is_active(b)) {
                 ui::set_url(&url.map(|u| u.to_string()).unwrap_or_default());
             }
@@ -830,9 +873,14 @@ wrap_load_handler! {
     impl LoadHandler {
         // Cosmetic adblock: site CSS before the page paints; page.js starts reporting
         // class/id names for the generic rules.
-        fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+        fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
             let url = CefString::from(&f.url()).to_string();
+            // This site's remembered zoom.
+            let host = host_of(&url);
+            if let (Some((_, z)), Some(h)) = (zoom_levels().into_iter().find(|(h, _)| *h == host), browser.and_then(|b| b.host())) {
+                h.set_zoom_level(z);
+            }
             if !url.starts_with("http") {
                 return;
             }
@@ -850,6 +898,7 @@ wrap_load_handler! {
             if let Some(id) = browser.as_ref().filter(|b| apps::is_app(b)).map(|b| b.identifier()) {
                 if let Some(w) = apps::window_of(id) {
                     popup::init(&w, popup::Owner::App(id));
+                    ui::app_bar(&w, id);
                 }
             }
             // Install page.js early so focus → INSERT shows without a key press.

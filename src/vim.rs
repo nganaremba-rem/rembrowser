@@ -202,6 +202,12 @@ const BUILTINS: &[(&str, Act, &str)] = &[
     ("zi", Act::Zoom(0.5), "zoom in"),
     ("zo", Act::Zoom(-0.5), "zoom out"),
     ("zz", Act::ZoomReset, "reset zoom"),
+    ("zI", Act::Zoom(0.5), "zoom in"),
+    ("zO", Act::Zoom(-0.5), "zoom out"),
+    ("<C-=>", Act::Zoom(0.5), "zoom in"),
+    ("<C-+>", Act::Zoom(0.5), "zoom in"),
+    ("<C-->", Act::Zoom(-0.5), "zoom out"),
+    ("<C-0>", Act::ZoomReset, "reset zoom"),
     ("<C-q>", Act::QuitAll, "quit"),
     ("<Esc>", Act::Escape, "normal mode"),
 ];
@@ -366,7 +372,15 @@ pub fn on_key(e: &KeyEvent) -> bool {
 /// Browser keys that mean nothing in a text field, so they work in insert mode too.
 /// (<C-w> stays the field's delete-word, like vim/readline.)
 /// (<C-t> is vimb's input-mode "edit in editor", handled below.)
-const GLOBAL_KEYS: &[&str] = &["<C-Tab>", "<C-S-Tab>", "<C-q>"];
+const GLOBAL_KEYS: &[&str] = &[
+    "<C-Tab>",
+    "<C-S-Tab>",
+    "<C-q>",
+    "<C-=>",
+    "<C-+>",
+    "<C-->",
+    "<C-0>",
+];
 
 fn insert_key(k: &str) -> bool {
     if GLOBAL_KEYS.contains(&k) {
@@ -637,7 +651,7 @@ fn act(a: Act, count: u32) {
         Act::FocusInput => tabs::js("__rem.focusInput()"),
         Act::Pass => set_mode(Mode::Pass),
         Act::Zoom(d) => zoom(d * n as f64),
-        Act::ZoomReset => tabs::set_zoom(0.0),
+        Act::ZoomReset => zoom(0.0),
         Act::QuitAll => tabs::quit_all(),
         Act::Escape => {
             tabs::stop_find();
@@ -646,10 +660,38 @@ fn act(a: Act, count: u32) {
     }
 }
 
+/// Chrome's zoom steps (%).
+const ZOOM_STEPS: &[f64] = &[
+    25.0, 33.0, 50.0, 67.0, 75.0, 80.0, 90.0, 100.0, 110.0, 125.0, 150.0, 175.0, 200.0, 250.0,
+    300.0, 400.0, 500.0,
+];
+
+/// Next step up (`delta` > 0) or down from `pct`; 0 = back to 100%.
+fn zoom_step(pct: f64, delta: f64) -> f64 {
+    if delta > 0.0 {
+        ZOOM_STEPS
+            .iter()
+            .copied()
+            .find(|&s| s > pct + 0.5)
+            .unwrap_or(500.0)
+    } else if delta < 0.0 {
+        ZOOM_STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|&s| s < pct - 0.5)
+            .unwrap_or(25.0)
+    } else {
+        100.0
+    }
+}
+
+/// Chromium zoom level ↔ percent: 100% · 1.2^level.
 pub fn zoom(delta: f64) {
-    let level = tabs::zoom() + delta;
-    tabs::set_zoom(level);
-    ui::message(&format!("zoom {:.0}%", 1.2f64.powf(level) * 100.0), false);
+    let pct = 1.2f64.powf(tabs::zoom()) * 100.0;
+    let next = zoom_step(pct, delta);
+    tabs::set_zoom((next / 100.0).ln() / 1.2f64.ln());
+    ui::message(&format!("zoom {next:.0}%"), false);
 }
 
 fn yank(text: &str) {
@@ -854,6 +896,16 @@ fn edit_field(text: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_steps() {
+        assert_eq!(zoom_step(100.0, 1.0), 110.0);
+        assert_eq!(zoom_step(110.0, 1.0), 125.0);
+        assert_eq!(zoom_step(100.0, -1.0), 90.0);
+        assert_eq!(zoom_step(119.0, -1.0), 110.0);
+        assert_eq!(zoom_step(500.0, 1.0), 500.0);
+        assert_eq!(zoom_step(140.0, 0.0), 100.0);
+    }
 
     #[test]
     fn url_navigation() {

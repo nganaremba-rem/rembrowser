@@ -152,6 +152,11 @@ wrap_window_delegate! {
         fn preferred_size(&self, _view: Option<&mut View>) -> Size {
             Size { width: 1100, height: 800 }
         }
+
+        // Resize / fullscreen: its status line follows the bottom edge.
+        fn on_layout_changed(&self, _view: Option<&mut View>, _new_bounds: Option<&Rect>) {
+            crate::ui::place();
+        }
     }
 
     impl PanelDelegate {}
@@ -184,6 +189,13 @@ wrap_window_delegate! {
             APPS.with_borrow_mut(|a| a.push((w.clone(), self.view.clone(), self.app_id.clone())));
         }
 
+        // Same colours as the browser window's bars.
+        fn on_theme_colors_changed(&self, window: Option<&mut Window>, _chrome_theme: i32) {
+            if let Some(w) = window {
+                crate::ui::theme(w);
+            }
+        }
+
         // vim keys act on whichever window has focus.
         fn on_window_activation_changed(&self, _window: Option<&mut Window>, active: i32) {
             if active != 0 {
@@ -195,6 +207,7 @@ wrap_window_delegate! {
             let Some(w) = window else { return };
             if let Some(b) = self.view.browser() {
                 crate::popup::forget(crate::popup::Owner::App(b.identifier()));
+                crate::ui::forget(crate::popup::Owner::App(b.identifier()));
             }
             tabs::set_app_focus(None);
             APPS.with_borrow_mut(|a| a.retain(|(x, ..)| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));

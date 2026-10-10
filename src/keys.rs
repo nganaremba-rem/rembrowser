@@ -59,6 +59,15 @@ pub fn from_event(e: &KeyEvent) -> Option<Key> {
     if alt {
         prefix.push_str("M-");
     }
+    // Same rule with Ctrl/Alt: the key's character (Ctrl+= is "=") beats the keycode,
+    // which remappers and wtype reassign (Ctrl+= arrived as keycode "Escape").
+    if ctrl || alt {
+        if let Some(c) =
+            char::from_u32(e.unmodified_character as u32).filter(|c| !c.is_control() && *c != ' ')
+        {
+            return Some(format!("<{prefix}{}>", c.to_ascii_lowercase()));
+        }
+    }
     if let Some(name) = special_name(code) {
         // Shift only matters on non-printables (<S-Tab>); on letters it's already in the char.
         let s = if shift { "S-" } else { "" };
@@ -69,6 +78,8 @@ pub fn from_event(e: &KeyEvent) -> Option<Key> {
         let c = match code {
             65..=90 => (code as u8 + 32) as char,
             48..=57 => code as u8 as char,
+            187 => '=', // VK_OEM_PLUS
+            189 => '-', // VK_OEM_MINUS
             _ => char::from_u32(e.unmodified_character as u32).filter(|c| !c.is_control())?,
         };
         return Some(format!("<{prefix}{c}>"));
@@ -162,6 +173,48 @@ pub fn text(k: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev(code: i32, ch: u16, unmod: u16, mods: u32) -> KeyEvent {
+        KeyEvent {
+            size: std::mem::size_of::<KeyEvent>(),
+            type_: cef::KeyEventType::RAWKEYDOWN,
+            modifiers: mods,
+            windows_key_code: code,
+            native_key_code: 0,
+            is_system_key: 0,
+            character: ch,
+            unmodified_character: unmod,
+            focus_on_editable_field: 0,
+        }
+    }
+
+    #[test]
+    fn ctrl_keys_are_named_by_character() {
+        // A real keyboard: Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+D / Ctrl+Tab / Esc.
+        assert_eq!(
+            from_event(&ev(187, 0x3d, 0x3d, CTRL)).as_deref(),
+            Some("<C-=>")
+        );
+        assert_eq!(
+            from_event(&ev(189, 0x1f, 0x2d, CTRL)).as_deref(),
+            Some("<C-->")
+        );
+        assert_eq!(
+            from_event(&ev(48, 0x30, 0x30, CTRL)).as_deref(),
+            Some("<C-0>")
+        );
+        assert_eq!(
+            from_event(&ev(68, 0x04, 0x64, CTRL)).as_deref(),
+            Some("<C-d>")
+        );
+        assert_eq!(
+            from_event(&ev(9, 0x09, 0x09, CTRL)).as_deref(),
+            Some("<C-Tab>")
+        );
+        assert_eq!(from_event(&ev(27, 0x1b, 0x1b, 0)).as_deref(), Some("<Esc>"));
+        // Character known only through the keycode (control char): still <C-=>.
+        assert_eq!(from_event(&ev(187, 0, 0, CTRL)).as_deref(), Some("<C-=>"));
+    }
 
     #[test]
     fn parses_vim_notation() {
