@@ -1,5 +1,5 @@
 //! Native chrome (CEF Views widgets): tab bar, bookmark bar, status bar. No extra
-//! renderer process, no page CSS to fight. Catppuccin Mocha, like the vimb config.
+//! renderer process, no page CSS to fight. Catppuccin Mocha.
 //! The command line is the popup (popup.rs).
 //!
 //! tab bar:      [ 1 GitHub × ][ 2 Arch Wiki ][ 3 … ]     (pill = active, × closes)

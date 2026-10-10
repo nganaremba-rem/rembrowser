@@ -740,7 +740,7 @@ fn on_tab_closed(browser: &mut Browser) {
     }
     content.remove_child_view(Some(&mut View::from(&removed)));
     if n == 0 {
-        // Last tab gone: close the window (the last window quits, vimb `:q`).
+        // Last tab gone: close the window (the last window quits).
         // Next tick: we may be inside can_close's loop right now (closing a tab
         // re-entering can_close crashes CEF on the half-closed popup).
         ui::run_on_ui(0, move || close_window(win));

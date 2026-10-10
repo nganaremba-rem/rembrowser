@@ -96,7 +96,7 @@ pub fn apply_switches(cl: &mut CommandLine) {
         let dirs = if user.is_empty() { ours } else { format!("{user},{ours}") };
         set("load-extension", &dirs);
     }
-    // vimb `set dark-mode=on`: sites see prefers-color-scheme: dark.
+    // dark-mode: sites see prefers-color-scheme: dark.
     if crate::commands::opt_bool("dark-mode", false) {
         cl.append_switch(Some(&"force-dark-mode".into()));
     }
@@ -136,7 +136,7 @@ const PREFS: &[(&str, Pref)] = &[
         "webrtc.ip_handling_policy",
         Pref::Str("default_public_interface_only"),
     ),
-    // vimb: geolocation=never (2 = block). Notifications stay "ask" (default).
+    // geolocation=never (2 = block). Notifications stay "ask" (default).
     (
         "profile.default_content_setting_values.geolocation",
         Pref::Int(2),

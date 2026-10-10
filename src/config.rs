@@ -1,7 +1,6 @@
 //! ~/.config/rembrowser/config.yaml — the user config. Applied on top of the built-in
 //! defaults; saved edits apply live (no restart). `rembrowser config` / `:config` open it.
 //!
-//!   source:   [~/.config/vimb/config]      # vimb-syntax files, loaded first
 //!   settings: { home-page: home, status-bar: false, ... }   # = :set
 //!   search:   { default: dd, engines: { aw: "https://...$0" } }
 //!   keys:     { normal: { "<Space>sb": ":tabs<CR>" }, insert: {}, command: {} }
@@ -23,10 +22,6 @@ pub fn path() -> PathBuf {
 
 const TEMPLATE: &str = r#"# rembrowser config — saved changes apply immediately.
 # Built-in defaults load first; everything here overrides them.
-
-# vimb-style config files to load first (optional), e.g. a shared vimb config:
-source: []
-#  - ~/.config/vimb/config
 
 settings:
   home-page: home          # "home" = the homescreen, or any URL
@@ -102,11 +97,6 @@ pub fn load() -> Result<(), String> {
     let Some(doc) = docs.first() else {
         return Ok(());
     };
-    if let Some(files) = doc["source"].as_vec() {
-        for f in files.iter().filter_map(Yaml::as_str) {
-            commands::exec(&format!("source {f}"));
-        }
-    }
     if let Some(settings) = doc["settings"].as_hash() {
         for (k, v) in settings {
             if let (Some(k), Some(v)) = (k.as_str(), scalar(v)) {

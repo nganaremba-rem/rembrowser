@@ -219,7 +219,7 @@ wrap_permission_handler! {
             callback: Option<&mut PermissionPromptCallback>,
         ) -> i32 {
             let Some(cb) = callback else { return 0 };
-            // vimb geolocation=never: refuse location without asking.
+            // geolocation=never: refuse location without asking.
             if requested_permissions == 256 && crate::commands::opt("geolocation").as_deref() == Some("never") {
                 cb.cont(PermissionRequestResult::DENY);
                 return 1;

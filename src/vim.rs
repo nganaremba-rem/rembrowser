@@ -88,7 +88,7 @@ enum Act {
     Pip,
 }
 
-/// vimb's default normal-mode keys (`man vimb`), plus Ctrl-T/W/Tab for muscle memory.
+/// The default normal-mode keys, plus Ctrl-T/W/Tab for muscle memory.
 /// (keys, action, description for the :keys cheatsheet)
 const BUILTINS: &[(&str, Act, &str)] = &[
     ("j", Act::Scroll(0, 1), "scroll down"),
@@ -402,7 +402,7 @@ pub fn on_key(e: &KeyEvent) -> bool {
 
 /// Browser keys that mean nothing in a text field, so they work in insert mode too.
 /// (<C-w> stays the field's delete-word, like vim/readline.)
-/// (<C-t> is vimb's input-mode "edit in editor", handled below.)
+/// (<C-t> in a field is "edit in editor", handled below.)
 const GLOBAL_KEYS: &[&str] = &[
     "<C-Tab>",
     "<C-S-Tab>",
@@ -437,7 +437,7 @@ fn insert_key(k: &str) -> bool {
             set_mode(Mode::Pass);
             true
         }
-        // vimb: edit the field in editor-command (nvim popup).
+        // Edit the field in editor-command (nvim popup).
         "<C-t>" => {
             EDIT_WANTED.set(Some(std::time::Instant::now()));
             tabs::js("__rem.editGet()");
@@ -637,7 +637,7 @@ fn act(a: Act, count: u32) {
             "__rem.smooth=false;__rem.scroll('page',0,{})",
             p * n as f32
         )),
-        // 50G = 50% (vimb), plain G = bottom.
+        // 50G = 50%, plain G = bottom.
         Act::Top if count > 1 => scroll("percent", 0, n.min(100)),
         Act::Bottom if count > 1 => scroll("percent", 0, n.min(100)),
         Act::Top => scroll("top", 0, 0),

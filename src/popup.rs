@@ -197,7 +197,7 @@ fn js_list<T>(xs: &[T], f: impl Fn(&T) -> String) -> String {
     format!("[{}]", xs.iter().map(f).collect::<Vec<_>>().join(","))
 }
 
-/// History (newest first, deduped) then bookmarks, from vimb's data files.
+/// History (newest first, deduped) then bookmarks.
 pub fn urls() -> Vec<(&'static str, String, String)> {
     let read = |f: &str| std::fs::read_to_string(commands::data_dir().join(f)).unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
@@ -529,10 +529,10 @@ fn parse_kind(kind: &str, forward: &str) -> CmdKind {
     }
 }
 
-/// Ctrl-F / Ctrl-T: vim's command-line window. Edit the line in the nvim-vimb popup
-/// (niri rule ^vimb-cmdedit$ floats it); write = run it, :q = cancel.
+/// Ctrl-F / Ctrl-T: vim's command-line window. Edit the line in the nvim popup
+/// (app-id rembrowser-cmdedit, for a window rule that floats it); write = run it, :q = cancel.
 fn edit_in_nvim(kind: CmdKind, text: &str) {
-    let cmd = "foot --app-id vimb-cmdedit env NVIM_APPNAME=nvim-vimb VIMB_POPUP=cmdline nvim %s";
+    let cmd = "foot --app-id rembrowser-cmdedit env NVIM_APPNAME=nvim-rembrowser REMBROWSER_POPUP=cmdline nvim %s";
     editor::edit(&format!("{text}\n"), cmd, move |text| {
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
             vim::cmdline_submit(kind, line);

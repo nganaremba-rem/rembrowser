@@ -289,13 +289,13 @@ fn uninstall(purge: bool) -> i32 {
         .unwrap_or_default();
     let dirs = [data.join("rembrowser"), cache.join("rembrowser"), conf];
     if purge {
-        println!("\nAlso delete (logins, cookies, permissions, settings):");
+        println!("\nAlso delete (logins, cookies, history, bookmarks, permissions, settings):");
         dirs.iter().for_each(|d| println!("  {}", d.display()));
         if confirm("Delete these?") {
             dirs.iter().for_each(|d| {
                 let _ = std::fs::remove_dir_all(d);
             });
-            println!("deleted. (vimb's shared history/bookmarks in ~/.local/share/vimb are kept)");
+            println!("deleted.");
         }
     } else {
         println!(

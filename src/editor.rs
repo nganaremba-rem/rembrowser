@@ -42,10 +42,10 @@ pub fn edit(text: &str, cmd: &str, done: impl FnOnce(String) + Send + 'static) {
     });
 }
 
-/// The field editor: vimb's `editor-command` (`%s` = file).
+/// The field editor: `editor-command` (`%s` = file).
 pub fn field_command() -> String {
     commands::opt("editor-command").unwrap_or_else(|| {
-        "foot --app-id vimb-editor env NVIM_APPNAME=nvim-vimb VIMB_POPUP=field nvim %s".into()
+        "foot --app-id rembrowser-editor env NVIM_APPNAME=nvim-rembrowser REMBROWSER_POPUP=field nvim %s".into()
     })
 }
 

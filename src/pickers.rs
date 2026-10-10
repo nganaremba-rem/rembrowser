@@ -1,7 +1,6 @@
-//! Built-in pickers in the popup (no fuzzel / vimb-pick needed): tabs, history,
-//! bookmarks, harpoon pins, read-later queue, site permissions, keys. Same data files
-//! as vimb-pick (~/.local/share/vimb/{history,bookmark,harpoon,queue}), so both keep
-//! working. Rows can be edited / deleted where that makes sense (popup::pick_with).
+//! Built-in pickers in the popup (no external picker needed): tabs, history,
+//! bookmarks, harpoon pins, read-later queue, site permissions, keys. The lists are
+//! files in ~/.local/share/rembrowser ({history,bookmark,harpoon,queue}). Rows can be edited / deleted where that makes sense (popup::pick_with).
 
 use crate::{commands, popup, tabs, ui, vim};
 
@@ -256,7 +255,7 @@ pub fn pin(slot: &str) {
         if n == 0 {
             return;
         }
-        // Pad gaps so slot numbers stay stable (vimb-pick does the same).
+        // Pad gaps so slot numbers stay stable.
         while pins.len() < n {
             pins.push(("about:blank".into(), "(empty)".into()));
         }

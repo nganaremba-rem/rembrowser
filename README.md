@@ -174,8 +174,8 @@ rembrowser uninstall --purge   # removes everything
 | `:mpv [URL]` | play this page (or URL) in mpv |
 | `:settings` `:extensions` `:chrome [URL]` | Chromium settings · extensions · a page in a Chromium window |
 | `:ext-install [URL\|id]` `:ext-remove` | install an extension from the Web Store · remove one |
-| `:app` / `:app-install` | turn this page into a web app / add it to your launcher |
 | `:ext-popup` | open an extension's popup in its own window |
+| `:app` / `:app-install` | turn this page into a web app / add it to your launcher |
 | `:pip` | picture-in-picture |
 | `:set dark-mode!` | toggle any setting |
 | `:config` | edit your config (`config.yaml`) |
@@ -209,8 +209,6 @@ keys:
     L: gt
     "<Space>sb": { run: ":tabs<CR>", desc: tabs picker }
 ```
-
-🔄 Coming from **vimb**? Add `source: [~/.config/vimb/config]` — your vimb config just works.
 
 ### 🪶 Light or full
 Everything that adds weight is a switch in `settings:` (read at startup — restart after changing one):
