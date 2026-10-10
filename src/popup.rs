@@ -40,12 +40,21 @@ struct Pop {
 
 type OnPick = Box<dyn FnOnce(usize)>;
 type OnConfirm = Box<dyn FnOnce(bool)>;
+type OnAct = Box<dyn Fn(&str, usize)>;
+type OnForm = Box<dyn FnOnce(Vec<String>)>;
+
+/// A picker row action: (key in popup notation, label, name handed to `on_act`).
+pub type Action = (&'static str, &'static str, &'static str);
+pub const EDIT: Action = ("C-e", "edit", "edit");
+pub const DELETE: Action = ("C-x", "delete", "delete");
 
 thread_local! {
     /// One popup per window (browser window + each web app that used one).
     static POPS: RefCell<Vec<Pop>> = const { RefCell::new(Vec::new()) };
     static ON_PICK: RefCell<Option<OnPick>> = const { RefCell::new(None) };
     static ON_CONFIRM: RefCell<Option<OnConfirm>> = const { RefCell::new(None) };
+    static ON_ACT: RefCell<Option<OnAct>> = const { RefCell::new(None) };
+    static ON_FORM: RefCell<Option<OnForm>> = const { RefCell::new(None) };
     static HISTORY: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -73,12 +82,16 @@ const COMMANDS: &[(&str, &str)] = &[
     ("source", "run a config file"),
     ("zoom", "zoom by N steps"),
     ("echo", "show a message"),
-    ("history", "recent pages"),
-    ("bookmarks", "bookmarks"),
+    ("history", "recent pages (open, delete)"),
+    ("bookmarks", "bookmarks (open, edit, delete)"),
     ("keys", "keymap cheatsheet"),
     ("pins", "harpoon pins"),
     ("pin", "pin page: add | N"),
-    ("downloads", "this session's downloads"),
+    ("downloads", "downloads (open, show folder, remove)"),
+    ("downloads-clear", "forget the download list"),
+    ("queue", "read-later list"),
+    ("history-clear", "forget all history"),
+    ("permissions", "site permissions you always allow / never allow"),
     ("pip", "picture-in-picture"),
     ("mpv", "play this page (or URL) in mpv"),
     ("app", "open this page (or URL) as a web app"),
@@ -262,17 +275,45 @@ pub fn open(kind: CmdKind, text: &str) {
 
 /// Fuzzy picker: rows are (kind icon, title, detail); `on_pick` gets the row index.
 pub fn pick(title: &str, rows: &[(&str, String, String)], on_pick: impl FnOnce(usize) + 'static) {
+    pick_with(title, rows, &[], on_pick, |_, _| {});
+}
+
+/// A picker whose rows can also be edited, deleted, ...: `on_act` gets the action's
+/// name and the row index (keys, and buttons on the row under the mouse).
+pub fn pick_with(
+    title: &str,
+    rows: &[(&str, String, String)],
+    actions: &[Action],
+    on_pick: impl FnOnce(usize) + 'static,
+    on_act: impl Fn(&str, usize) + 'static,
+) {
     if rows.is_empty() {
-        ui::message(&format!("{title}: nothing to pick"), true);
+        ui::message(&format!("{title}: nothing here"), true);
         return;
     }
     ON_PICK.with_borrow_mut(|p| *p = Some(Box::new(on_pick)));
+    ON_ACT.with_borrow_mut(|p| *p = Some(Box::new(on_act)));
     let items = js_list(rows, |(k, t, u)| {
         format!("[{},{},{}]", js_str(k), js_str(t), js_str(u))
     });
+    let actions = js_list(actions, |(key, label, name)| {
+        format!("[{},{},{}]", js_str(key), js_str(label), js_str(name))
+    });
     let js = format!(
-        "rem.open({{kind:'pick',title:{},items:{items},text:'',history:[]}})",
+        "rem.open({{kind:'pick',title:{},items:{items},actions:{actions},text:'',history:[]}})",
         js_str(title)
+    );
+    ui::run_on_ui(0, move || show(js));
+}
+
+/// A few labelled text fields (label, current value); Enter hands back the values
+/// in the same order, with tabs and newlines turned into spaces.
+pub fn form(title: &str, fields: &[(&str, &str)], on_submit: impl FnOnce(Vec<String>) + 'static) {
+    ON_FORM.with_borrow_mut(|f| *f = Some(Box::new(on_submit)));
+    let js = format!(
+        "rem.open({{kind:'form',title:{},fields:{}}})",
+        js_str(title),
+        js_list(fields, |(l, v)| format!("[{},{}]", js_str(l), js_str(v)))
     );
     ui::run_on_ui(0, move || show(js));
 }
@@ -426,6 +467,20 @@ fn on_message(b: &Browser, fields: &[&str]) {
             let cb = ON_PICK.with_borrow_mut(Option::take);
             if let (Some(cb), Ok(i)) = (cb, i.parse::<usize>()) {
                 cb(i);
+            }
+        }
+        ["act", name, i] => {
+            hide(b);
+            // Taken out while it runs: an action usually opens the picker again.
+            let cb = ON_ACT.with_borrow_mut(Option::take);
+            if let (Some(cb), Ok(i)) = (cb, i.parse::<usize>()) {
+                cb(name, i);
+            }
+        }
+        ["form", values @ ..] => {
+            hide(b);
+            if let Some(cb) = ON_FORM.with_borrow_mut(Option::take) {
+                cb(values.iter().map(|v| v.to_string()).collect());
             }
         }
         ["cancel", kind] => {

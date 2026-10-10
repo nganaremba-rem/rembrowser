@@ -171,6 +171,10 @@ fn exec_one(line: &str) {
         "jump" => pickers::jump(args),
         "keys" | "map" => pickers::keys(),
         "downloads" | "dl" => crate::downloads::picker(),
+        "downloads-clear" => crate::downloads::clear(),
+        "queue" => pickers::queue(),
+        "history-clear" => pickers::history_clear(),
+        "permissions" => pickers::permissions(),
         "pip" => tabs::pip(),
         "mpv" => mpv(args),
         "config" | "settings" => crate::config::open_in_editor(false),
@@ -494,6 +498,24 @@ fn append_line(file: &str, line: &str) {
     }
 }
 
+/// Rewrite a line file: `keep` gets (index among the non-blank lines, line) and
+/// returns the line to store (None drops it). Temp file + rename, so a crash can't
+/// leave half a file.
+pub fn edit_lines(path: &std::path::Path, mut keep: impl FnMut(usize, &str) -> Option<String>) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let out: String = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .filter_map(|(i, l)| keep(i, l))
+        .map(|l| l + "\n")
+        .collect();
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
 /// vimb history format: "uri\ttitle", oldest first.
 pub fn record_history(url: &str, title: &str) {
     if url.starts_with("http") && !crate::home::is_home(url) {
@@ -503,14 +525,15 @@ pub fn record_history(url: &str, title: &str) {
 
 /// (url, title, tags) of every bookmark, in file order (vimb's format).
 pub fn bookmarks() -> Vec<(String, String, String)> {
+    // Entry n is the n-th non-blank line: the index edit_lines() works with.
     std::fs::read_to_string(data_dir().join("bookmark"))
         .unwrap_or_default()
         .lines()
-        .filter_map(|l| {
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
             let mut p = l.split('\t');
-            let url = p.next().filter(|u| !u.is_empty())?;
             let mut field = || p.next().unwrap_or("").to_string();
-            Some((url.to_string(), field(), field()))
+            (field(), field(), field())
         })
         .collect()
 }
@@ -588,6 +611,20 @@ mod tests {
         assert_eq!(resolve_url("aw"), "https://duckduckgo.com/?q=aw");
         assert_eq!(resolve_url("about:blank"), "about:blank");
         assert_eq!(resolve_url("c++"), "https://duckduckgo.com/?q=c%2B%2B");
+    }
+
+    #[test]
+    fn edit_lines_rewrites_entries() {
+        let path = std::env::temp_dir().join(format!("rembrowser-test-{}", std::process::id()));
+        std::fs::write(&path, "a\n\nb\nc\n").unwrap();
+        // Entries are the non-blank lines: drop "b" (entry 1), change "c".
+        edit_lines(&path, |i, l| match i {
+            1 => None,
+            2 => Some(format!("{l}!")),
+            _ => Some(l.to_string()),
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nc!\n");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

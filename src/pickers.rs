@@ -1,6 +1,7 @@
 //! Built-in pickers in the popup (no fuzzel / vimb-pick needed): tabs, history,
-//! bookmarks, harpoon pins, keys. Same data files as vimb-pick
-//! (~/.local/share/vimb/{history,bookmark,harpoon}), so both keep working.
+//! bookmarks, harpoon pins, read-later queue, site permissions, keys. Same data files
+//! as vimb-pick (~/.local/share/vimb/{history,bookmark,harpoon,queue}), so both keep
+//! working. Rows can be edited / deleted where that makes sense (popup::pick_with).
 
 use crate::{commands, popup, tabs, ui, vim};
 
@@ -19,22 +20,157 @@ pub fn tabs() {
     popup::pick("\u{f04e9} Tabs", &rows, tabs::select);
 }
 
-fn open_rows(title: &str, kind: &str) {
-    let rows: Vec<_> = popup::urls()
-        .into_iter()
-        .filter(|(k, ..)| *k == kind)
-        .map(|(k, t, u)| (k, if t.is_empty() { u.clone() } else { t }, u))
-        .collect();
-    let urls: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
-    popup::pick(title, &rows, move |i| commands::open(&urls[i], false));
+/// A copy of `line`, unless it is entry `drop` (for commands::edit_lines).
+fn unless(drop: usize) -> impl FnMut(usize, &str) -> Option<String> {
+    move |i, line| (i != drop).then(|| line.to_string())
+}
+
+/// Recent pages, newest first, each URL once: (url, title).
+fn history_entries() -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(commands::data_dir().join("history")).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    text.lines()
+        .rev()
+        .filter_map(|l| {
+            let (u, t) = l.split_once('\t').unwrap_or((l, ""));
+            (!u.is_empty() && seen.insert(u)).then(|| (u.to_string(), t.to_string()))
+        })
+        // ponytail: cap keeps the payload small; page the file if history grows huge.
+        .take(3000)
+        .collect()
 }
 
 pub fn history() {
-    open_rows("\u{f02da} History", "history");
+    let hist = history_entries();
+    let rows: Vec<_> = hist
+        .iter()
+        .map(|(u, t)| ("history", if t.is_empty() { u.clone() } else { t.clone() }, u.clone()))
+        .collect();
+    let urls: Vec<String> = hist.into_iter().map(|(u, _)| u).collect();
+    let open = urls.clone();
+    popup::pick_with(
+        "\u{f02da} History",
+        &rows,
+        &[popup::DELETE],
+        move |i| commands::open(&open[i], false),
+        move |_, i| {
+            // Every visit of that page.
+            let url = urls[i].as_str();
+            commands::edit_lines(&commands::data_dir().join("history"), |_, l| {
+                (l.split('\t').next() != Some(url)).then(|| l.to_string())
+            });
+            history();
+        },
+    );
+}
+
+pub fn history_clear() {
+    popup::confirm("Forget all history?", "Clear", |yes| {
+        if yes {
+            let _ = std::fs::write(commands::data_dir().join("history"), "");
+            ui::message("history cleared", false);
+        }
+    });
 }
 
 pub fn bookmarks() {
-    open_rows("\u{f00c0} Bookmarks", "bookmark");
+    let marks = commands::bookmarks();
+    let n = marks.len();
+    // Newest first: row i is file entry n-1-i.
+    let rows: Vec<_> = marks
+        .iter()
+        .rev()
+        .map(|(u, t, tags)| {
+            let name = if t.is_empty() { u } else { t };
+            let name = match tags.is_empty() {
+                true => name.clone(),
+                false => format!("{name}  [{tags}]"),
+            };
+            ("bookmark", name, u.clone())
+        })
+        .collect();
+    let urls: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+    popup::pick_with(
+        "\u{f00c0} Bookmarks",
+        &rows,
+        &[popup::EDIT, popup::DELETE],
+        move |i| commands::open(&urls[i], false),
+        move |act, i| {
+            let entry = n - 1 - i;
+            if act == "edit" {
+                bookmark_edit(entry, &marks[entry]);
+            } else {
+                commands::edit_lines(&commands::data_dir().join("bookmark"), unless(entry));
+                ui::refresh_bookmarks();
+                bookmarks();
+            }
+        },
+    );
+}
+
+fn bookmark_edit(entry: usize, (url, title, tags): &(String, String, String)) {
+    let fields = [("Title", title.as_str()), ("URL", url.as_str()), ("Tags", tags.as_str())];
+    popup::form("\u{f00c0} Edit bookmark", &fields, move |v| {
+        if let [title, url, tags] = v.as_slice() {
+            if !url.trim().is_empty() {
+                let line = format!("{}\t{title}\t{tags}", url.trim());
+                commands::edit_lines(&commands::data_dir().join("bookmark"), |i, l| {
+                    Some(if i == entry { line.clone() } else { l.to_string() })
+                });
+                ui::refresh_bookmarks();
+            }
+        }
+        bookmarks();
+    });
+}
+
+/// `:queue`: the read-later list. Opening an entry takes it off the list.
+pub fn queue() {
+    let path = commands::data_dir().join("queue");
+    let urls: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(String::from)
+        .collect();
+    let rows: Vec<_> = urls.iter().map(|u| ("history", u.clone(), String::new())).collect();
+    let del = path.clone();
+    popup::pick_with(
+        "\u{f02da} Read later",
+        &rows,
+        &[popup::DELETE],
+        move |i| {
+            commands::edit_lines(&path, unless(i));
+            commands::open(&urls[i], false);
+        },
+        move |_, i| {
+            commands::edit_lines(&del, unless(i));
+            queue();
+        },
+    );
+}
+
+/// `:permissions`: what sites may always / never do; delete = ask again next time.
+pub fn permissions() {
+    let list = crate::permissions::remembered();
+    let rows: Vec<_> = list
+        .iter()
+        .map(|(origin, _, allow, what)| {
+            let verdict = if *allow { "always allow" } else { "never allow" };
+            ("setting", origin.clone(), format!("{verdict}: {what}"))
+        })
+        .collect();
+    let open: Vec<String> = list.iter().map(|l| l.0.clone()).collect();
+    popup::pick_with(
+        "\u{f0483} Permissions",
+        &rows,
+        &[popup::DELETE],
+        move |i| commands::open(&open[i], false),
+        move |_, i| {
+            crate::permissions::forget(&list[i].0, &list[i].1);
+            permissions();
+        },
+    );
 }
 
 // ── harpoon: numbered pins, one "url\ttitle" per line ─────────────
@@ -73,9 +209,32 @@ pub fn pins() {
             )
         })
         .collect();
-    popup::pick("\u{f0403} Harpoon", &rows, move |i| {
-        commands::open(&pins[i].0, false)
-    });
+    let open = pins.clone();
+    popup::pick_with(
+        "\u{f0403} Harpoon",
+        &rows,
+        &[popup::EDIT, popup::DELETE],
+        move |i| commands::open(&open[i].0, false),
+        move |act, i| {
+            let mut pins = pins.clone();
+            if act == "edit" {
+                let (url, title) = pins[i].clone();
+                popup::form("\u{f0403} Edit pin", &[("Title", &title), ("URL", &url)], move |v| {
+                    if let [title, url] = v.as_slice() {
+                        if !url.trim().is_empty() {
+                            pins[i] = (url.trim().to_string(), title.clone());
+                            pins_write(&pins);
+                        }
+                    }
+                    self::pins();
+                });
+            } else {
+                pins.remove(i);
+                pins_write(&pins);
+                self::pins();
+            }
+        },
+    );
 }
 
 /// `:pin add` appends the page (moving it if pinned), `:pin N` sets slot N.

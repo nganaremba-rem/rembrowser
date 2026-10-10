@@ -84,6 +84,34 @@ fn stored(origin: &str, key: &str) -> Option<bool> {
     })
 }
 
+/// Every remembered decision, latest answer per (origin, permission):
+/// (origin, key, allow, what it is in words).
+pub fn remembered() -> Vec<(String, String, bool, String)> {
+    let text = std::fs::read_to_string(store_path()).unwrap_or_default();
+    let mut out: Vec<(String, String, bool, String)> = Vec::new();
+    for l in text.lines() {
+        let mut p = l.split('\t');
+        let (Some(origin), Some(key), Some(verdict)) = (p.next(), p.next(), p.next()) else {
+            continue;
+        };
+        let what = key
+            .split_once(':')
+            .and_then(|(kind, bits)| Some(describe(kind == "media", bits.parse().ok()?)))
+            .unwrap_or_else(|| key.to_string());
+        out.retain(|x| !(x.0 == origin && x.1 == key));
+        out.push((origin.into(), key.into(), verdict == "allow", what));
+    }
+    out
+}
+
+/// Drop a remembered decision: the site gets asked again.
+pub fn forget(origin: &str, key: &str) {
+    crate::commands::edit_lines(&store_path(), |_, l| {
+        let mut p = l.split('\t');
+        (!(p.next() == Some(origin) && p.next() == Some(key))).then(|| l.to_string())
+    });
+}
+
 fn remember(origin: &str, key: &str, allow: bool) {
     use std::io::Write;
     let path = store_path();

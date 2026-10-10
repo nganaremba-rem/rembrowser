@@ -1,15 +1,19 @@
 //! Downloads: Alloy refuses every download unless a handler says yes.
 //! Files go to download-path (default ~/Downloads) and never overwrite.
-//! Progress shows in a toast (ui::toast); `:downloads` lists this session's.
+//! Progress shows in a toast (ui::toast). Finished ones are kept in
+//! ~/.local/share/rembrowser/downloads ("done|failed\tpath\turl", oldest first);
+//! `:downloads` lists the running ones and that history.
 
 use crate::{commands, popup, ui};
 use cef::*;
 use std::cell::RefCell;
 
+/// A running download.
 struct Dl {
     id: u32,
     name: String,
     path: String,
+    url: String,
     pct: i32,
     speed: i64,
     state: State,
@@ -62,37 +66,89 @@ fn summary(name: &str, state: State) -> (String, bool) {
     })
 }
 
-/// `:downloads`: this session's downloads; picking a finished one opens it.
+fn log_file() -> std::path::PathBuf {
+    std::path::PathBuf::from(crate::data_dir()).join("downloads")
+}
+
+fn log_line(ok: bool, path: &str, url: &str) -> String {
+    format!("{}\t{path}\t{url}", if ok { "done" } else { "failed" })
+}
+
+/// Finished downloads, oldest first: (ok, path, url).
+fn parse_log(text: &str) -> Vec<(bool, String, String)> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut p = l.split('\t');
+            let mut field = || p.next().unwrap_or("").to_string();
+            (field() == "done", field(), field())
+        })
+        .collect()
+}
+
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// `:downloads`: running downloads, then the history (newest first). Enter opens
+/// the file; the row actions show its folder, forget the entry or delete the file.
 pub fn picker() {
-    let rows: Vec<(&str, String, String, String, bool)> = DLS.with_borrow(|d| {
+    let running: Vec<(String, String, i32)> = DLS.with_borrow(|d| {
         d.iter()
             .rev()
-            .map(|x| {
-                let status = match x.state {
-                    State::Running => format!("{}%", x.pct.max(0)),
-                    State::Done => "done".into(),
-                    State::Failed => "failed".into(),
-                };
-                (
-                    "download",
-                    x.name.clone(),
-                    format!("{status}  {}", x.path),
-                    x.path.clone(),
-                    x.state == State::Done,
-                )
-            })
+            .map(|x| (x.name.clone(), x.path.clone(), x.pct.max(0)))
             .collect()
     });
-    let picks: Vec<(String, bool)> = rows.iter().map(|r| (r.3.clone(), r.4)).collect();
-    let rows: Vec<_> = rows.into_iter().map(|(k, t, u, ..)| (k, t, u)).collect();
-    popup::pick("\u{f019} Downloads", &rows, move |i| {
-        let (path, done) = &picks[i];
-        if *done {
-            let _ = commands::command("xdg-open").arg(path).spawn();
-        } else {
-            ui::message("still downloading", false);
-        }
-    });
+    let past = parse_log(&std::fs::read_to_string(log_file()).unwrap_or_default());
+    let (r, n) = (running.len(), past.len());
+    let mut rows: Vec<(&str, String, String)> = running
+        .iter()
+        .map(|(name, path, pct)| ("download", name.clone(), format!("{pct}%  {path}")))
+        .collect();
+    rows.extend(past.iter().rev().map(|(ok, path, _)| {
+        let status = if *ok { "done" } else { "failed" };
+        ("download", file_name(path), format!("{status}  {path}"))
+    }));
+    // Row i: a running download (i < r), else history entry n-1-(i-r).
+    let entry = move |i: usize| (i >= r).then(|| n - 1 - (i - r));
+    let open = past.clone();
+    popup::pick_with(
+        "\u{f019} Downloads",
+        &rows,
+        &[("C-o", "folder", "folder"), ("C-x", "forget", "forget"), ("C-d", "delete file", "delete")],
+        move |i| match entry(i).map(|e| &open[e]) {
+            None => ui::message("still downloading", false),
+            Some((true, path, _)) if std::path::Path::new(path).exists() => {
+                let _ = commands::command("xdg-open").arg(path).spawn();
+            }
+            Some((true, ..)) => ui::message("that file is gone", true),
+            Some((false, ..)) => ui::message("that download failed", true),
+        },
+        move |act, i| {
+            let Some(e) = entry(i) else {
+                ui::message("still downloading", false);
+                return;
+            };
+            let path = std::path::Path::new(&past[e].1);
+            if act == "folder" {
+                let _ = commands::command("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
+                return;
+            }
+            if act == "delete" {
+                let _ = std::fs::remove_file(path);
+            }
+            commands::edit_lines(&log_file(), |k, l| (k != e).then(|| l.to_string()));
+            picker();
+        },
+    );
+}
+
+/// `:downloads-clear`: forget the list (the files stay).
+pub fn clear() {
+    let _ = std::fs::write(log_file(), "");
+    ui::message("download list cleared", false);
 }
 
 wrap_download_handler! {
@@ -122,6 +178,7 @@ wrap_download_handler! {
             if let Some(item) = download_item {
                 DLS.with_borrow_mut(|d| {
                     d.push(Dl {
+                        url: CefString::from(&item.url()).to_string(),
                         id: item.id(),
                         name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                         path: path.to_string_lossy().into_owned(),
@@ -149,14 +206,22 @@ wrap_download_handler! {
             } else {
                 State::Running
             };
-            let name = DLS.with_borrow_mut(|d| {
-                let x = d.iter_mut().find(|x| x.id == item.id())?;
-                x.pct = item.percent_complete();
-                x.speed = item.current_speed();
-                x.state = state;
-                Some(x.name.clone())
+            // A finished download leaves the running list for the history file.
+            let dl = DLS.with_borrow_mut(|d| {
+                let i = d.iter().position(|x| x.id == item.id())?;
+                d[i].pct = item.percent_complete();
+                d[i].speed = item.current_speed();
+                d[i].state = state;
+                Some(if state == State::Running { (d[i].name.clone(), None) } else { (d[i].name.clone(), Some(d.remove(i))) })
             });
-            let Some(name) = name else { return };
+            let Some((name, finished)) = dl else { return };
+            if let Some(x) = finished {
+                use std::io::Write;
+                let _ = std::fs::create_dir_all(crate::data_dir());
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file()) {
+                    let _ = writeln!(f, "{}", log_line(state == State::Done, &x.path, &x.url));
+                }
+            }
             let (text, running) = summary(&name, state);
             ui::toast(&text, running);
         }
@@ -198,7 +263,23 @@ fn download_path(name: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::download_path;
+    use super::{download_path, log_line, parse_log};
+
+    #[test]
+    fn download_history_round_trips() {
+        let text = format!(
+            "{}\n\n{}\n",
+            log_line(true, "/home/u/Downloads/a b.pdf", "https://x.org/a%20b.pdf"),
+            log_line(false, "/tmp/c.zip", "")
+        );
+        assert_eq!(
+            parse_log(&text),
+            vec![
+                (true, "/home/u/Downloads/a b.pdf".into(), "https://x.org/a%20b.pdf".into()),
+                (false, "/tmp/c.zip".into(), String::new()),
+            ]
+        );
+    }
 
     #[test]
     fn download_names_are_sanitized() {

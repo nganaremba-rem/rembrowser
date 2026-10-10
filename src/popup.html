@@ -49,6 +49,19 @@
   .row b { color: var(--peach); font-weight: bold; }
   .k.history { color: var(--mauve); } .k.bookmark { color: var(--yellow); } .k.tab { color: var(--teal); }
   .k.command, .k.key { color: var(--blue); } .k.pin { color: var(--peach); } .k.download { color: var(--green); } .k.setting { color: var(--green); } .k.cmdhist { color: var(--overlay0); }
+  /* Row actions (edit, delete, ...): buttons on the hovered / selected row. */
+  .row .acts { display: none; gap: 4px; flex: none; }
+  .row:hover .acts, .row.sel .acts { display: flex; }
+  .acts span { padding: 0 7px; border-radius: 5px; background: var(--surface1); color: var(--subtext); font-size: 12px; }
+  .acts span:hover { background: var(--accent); color: var(--crust); }
+  #form { padding: 2px 14px 12px; display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center; }
+  #form.hidden { display: none; }
+  #form label { color: var(--subtext); font-size: 13px; }
+  #form input {
+    background: var(--mantle); border: 1px solid var(--surface1); border-radius: 6px; outline: 0;
+    color: var(--text); font: inherit; padding: 4px 8px; caret-color: var(--accent);
+  }
+  #form input:focus { border-color: var(--accent); }
   #foot { display: flex; gap: 14px; justify-content: flex-end; padding: 6px 10px 2px; color: var(--overlay0); font-size: 12px; }
   #foot kbd { color: var(--subtext); font: inherit; background: var(--surface0); padding: 0 5px; border-radius: 4px; }
   #prompt { padding: 0 14px 14px; }
@@ -67,18 +80,20 @@
 <div id="wrap" class="hidden">
   <div id="cmd"><span id="title"></span><input id="in" spellcheck="false" autocomplete="off"><span id="count"></span></div>
   <div id="prompt" class="hidden"><div id="pmsg"></div><div id="pbtns"></div></div>
+  <div id="form" class="hidden"></div>
   <div id="menu" class="hidden">
     <div id="list"></div>
-    <div id="foot"><span><kbd>Tab</kbd> select</span><span><kbd>↵</kbd> run</span><span><kbd>C-f</kbd> nvim</span><span><kbd>Esc</kbd> close</span></div>
+    <div id="foot"></div>
   </div>
 </div>
 <script>
 'use strict';
-// Rust → here: rem.open(state) / rem.count(text) / rem.close() / rem.prompt(p).
+// Rust → here: rem.open(state) / rem.count(text) / rem.close().
+// state.kind: ex | search | pick (list + row actions) | prompt | form (labelled fields).
 // Here → Rust: console.debug("\x01pop\t<type>\t<fields>").
 const send = (...f) => console.debug('\x01pop\t' + f.map((x) => String(x ?? '').replace(/[\t\n]/g, ' ')).join('\t'));
 const $ = (id) => document.getElementById(id);
-const wrap = $('wrap'), input = $('in'), list = $('list'), menu = $('menu');
+const wrap = $('wrap'), input = $('in'), list = $('list'), menu = $('menu'), form = $('form');
 
 const MODES = {
   ex:       { title: ' Cmdline', accent: '--blue' },
@@ -101,7 +116,7 @@ let hist = -1;        // position in command history (Up/Down)
 let regPending = false;
 
 function mode() {
-  if (S.kind === 'pick') return 'pick';
+  if (S.kind === 'pick' || S.kind === 'form') return 'pick';
   if (S.kind === 'search') return S.forward ? 'searchf' : 'searchb';
   if (S.kind === 'prompt') return 'prompt';
   const c = input.value.trimStart().split(/\s/)[0];
@@ -200,11 +215,41 @@ function renderMenu() {
     // Highlight positions past the title belong to the url part ("title url").
     u.append(it.kind === 'command' || it.kind === 'setting' || it.kind === 'cmdhist' ? it.u : hl(it.u, it.pos || [], it.t.length + 1));
     row.append(k, t, u);
+    if (S.kind === 'pick' && S.actions?.length) {
+      const acts = document.createElement('span'); acts.className = 'acts';
+      for (const [, label, name] of S.actions) {
+        const b = document.createElement('span'); b.textContent = label;
+        b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); sel = n; act(name); };
+        acts.append(b);
+      }
+      row.append(acts);
+    }
     row.onmousedown = (e) => { e.preventDefault(); sel = n; if (S.kind !== 'pick') input.value = it.fill; submit(); };
     list.append(row);
   });
   menu.classList.toggle('hidden', items.length === 0);
   list.children[sel]?.scrollIntoView({ block: 'nearest' });
+}
+
+// Key hints under the list; a picker adds its row actions.
+function paintFoot() {
+  const hints = S.kind === 'pick'
+    ? [['Tab', 'select'], ['↵', 'open'], ...(S.actions ?? []).map(([key, label]) => [key, label]), ['Esc', 'close']]
+    : [['Tab', 'select'], ['↵', 'run'], ['C-f', 'nvim'], ['Esc', 'close']];
+  $('foot').replaceChildren(...hints.map(([key, what]) => {
+    const s = document.createElement('span'), kb = document.createElement('kbd');
+    kb.textContent = key;
+    s.append(kb, ' ' + what);
+    return s;
+  }));
+}
+
+// A row action of a picker (S.actions: [key, label, name]) on the selected row.
+function act(name) {
+  const it = items[Math.max(sel, 0)];
+  if (!it) return;
+  hide();
+  send('act', name, it.i);
 }
 
 function refresh() {
@@ -254,6 +299,8 @@ input.addEventListener('keydown', (e) => {
     e.preventDefault();
     return;
   }
+  const action = S.kind === 'pick' && S.actions?.find(([key]) => key === k);
+  if (action) { e.preventDefault(); act(action[2]); return; }
   const at = input.selectionStart;
   switch (k) {
     case 'Enter': submit(); break;
@@ -274,7 +321,16 @@ input.addEventListener('keydown', (e) => {
   e.preventDefault();
 });
 // Clicking the page (or another window) takes focus away = cancel, like vim's cmdline.
-input.addEventListener('blur', () => { if (S?.kind !== 'prompt' && !wrap.classList.contains('hidden')) cancel(); });
+input.addEventListener('blur', () => { if (S?.kind !== 'prompt' && S?.kind !== 'form' && !wrap.classList.contains('hidden')) cancel(); });
+// ── form: labelled fields (edit a bookmark, ...). Enter saves, Esc cancels. ──
+form.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); hide(); send('form', ...[...form.querySelectorAll('input')].map((i) => i.value)); }
+  else if (e.key === 'Escape' || (e.ctrlKey && (e.key === 'c' || e.key === '['))) { e.preventDefault(); cancel(); }
+});
+// Focus left the form (a click on the page) = cancel; moving between fields is not.
+form.addEventListener('focusout', () => setTimeout(() => {
+  if (S?.kind === 'form' && !wrap.classList.contains('hidden') && !form.contains(document.activeElement)) cancel();
+}));
 // Rust sizes the overlay to the box.
 new ResizeObserver(() => { if (!wrap.classList.contains('hidden')) send('size', Math.ceil(wrap.getBoundingClientRect().height)); }).observe(wrap);
 
@@ -293,10 +349,26 @@ window.rem = {
     S = state;
     hist = -1;
     regPending = false;
-    const prompt = S.kind === 'prompt';
-    input.style.display = prompt ? 'none' : '';
+    const prompt = S.kind === 'prompt', isForm = S.kind === 'form';
+    input.style.display = prompt || isForm ? 'none' : '';
     $('prompt').classList.toggle('hidden', !prompt);
+    form.classList.toggle('hidden', !isForm);
     $('count').textContent = '';
+    if (isForm) {
+      form.replaceChildren(...S.fields.flatMap(([label, value]) => {
+        const l = document.createElement('label'), i = document.createElement('input');
+        l.textContent = label;
+        i.value = value; i.spellcheck = false; i.autocomplete = 'off';
+        return [l, i];
+      }));
+      items = [];
+      renderMenu();
+      paintMode();
+      wrap.classList.remove('hidden');
+      form.querySelector('input')?.focus();
+      return;
+    }
+    paintFoot();
     if (prompt) {
       const m = $('pmsg'); m.replaceChildren();
       if (S.msg) m.append(S.msg);
