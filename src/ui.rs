@@ -1,13 +1,14 @@
-//! Native chrome (CEF Views widgets): status bar + tab bar. No extra renderer process,
-//! no page CSS to fight. Catppuccin Mocha, like the vimb config.
+//! Native chrome (CEF Views widgets): tab bar, bookmark bar, status bar. No extra
+//! renderer process, no page CSS to fight. Catppuccin Mocha, like the vimb config.
 //! The command line is the popup (popup.rs).
 //!
-//! tab bar:    [ 1 GitHub ][ 2 Arch Wiki ][ 3 … ]        (pill = active)
-//! status bar: [ MODE ][ url / message                        ][ 3/10 [2/5] 42% ]
+//! tab bar:      [ 1 GitHub × ][ 2 Arch Wiki ][ 3 … ]     (pill = active, × closes)
+//! bookmark bar: [ Arch Wiki ][ GitHub ][ … ]             (only with `set bookmark-bar`)
+//! status bar:   [ MODE ][ url / message                      ][ 3/10 [2/5] 42% ]
 //!
-//! Zen by default: both float over the page and only appear when something happens
-//! (mode change, message, navigation, tab switch). `set status-bar` / `set tab-bar`
-//! pin them.
+//! Zen by default: tab bar and status bar float over the page and only appear when
+//! something happens (mode change, message, navigation, tab switch). `set status-bar` /
+//! `set tab-bar` pin them. Every browser window has its own set.
 
 use crate::popup::Owner;
 use crate::{commands, tabs};
@@ -38,7 +39,7 @@ pub const PEACH: u32 = 0xFFFA_B387;
 /// Longest tab title shown (chars).
 const TAB_TITLE: usize = 22;
 
-/// A status line. The browser window's lives in Chrome (tab-bar aware); each web app
+/// A status line. A browser window's lives in its Chrome (tab-bar aware); each web app
 /// window gets its own overlay.
 struct Bar {
     owner: Owner,
@@ -54,21 +55,28 @@ struct Bar {
     mode_color: u32,
 }
 
-/// The bars float over the page as overlays, so showing one never resizes the
-/// page. When pinned (`set status-bar` / `set tab-bar`) a same-height spacer slot
-/// in the window layout keeps the page clear of it.
+/// One browser window's bars. They float over the page as overlays, so showing one
+/// never resizes the page. Pinned bars (`set status-bar` / `set tab-bar` /
+/// `set bookmark-bar`) get a spacer slot of their height in the window layout, which
+/// keeps the page clear of them.
 struct Chrome {
-    tab_slot: Panel,
+    win: u32,
+    window: Window,
+    top_slot: Panel,
     status_slot: Panel,
     tabbar: Panel,
+    bookbar: Panel,
     status: Panel,
     tab_ctl: Option<OverlayController>,
+    book_ctl: Option<OverlayController>,
     status_ctl: Option<OverlayController>,
 }
 
 thread_local! {
     static BARS: RefCell<Vec<Bar>> = const { RefCell::new(Vec::new()) };
-    static CHROME: RefCell<Option<Chrome>> = const { RefCell::new(None) };
+    static CHROME: RefCell<Vec<Chrome>> = const { RefCell::new(Vec::new()) };
+    /// Slot heights (top, bottom) the window layouts were last told about.
+    static SLOTS: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// Unpinned bars stay up until these instants.
     static STATUS_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
     static TABS_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -78,7 +86,11 @@ thread_local! {
 }
 
 const TABBAR_H: i32 = 30;
+const BOOKBAR_H: i32 = 26;
 const STATUS_H: i32 = 28;
+/// Bookmarks shown in the bar.
+/// ponytail: the rest is clipped; add an overflow menu if someone keeps more up there.
+const BOOKBAR_MAX: usize = 40;
 /// How long an unpinned bar stays after something happened.
 const SHOW_MS: u64 = 1500;
 
@@ -101,13 +113,40 @@ fn set_color(l: &LabelButton, color: u32) {
     }
 }
 
-fn label(text: &str, color: u32, font: &str, on_press: Option<usize>) -> LabelButton {
-    let mut d = TabButton::new(on_press.unwrap_or(usize::MAX));
+fn pinned(key: &str) -> bool {
+    commands::opt_bool(key, false)
+}
+
+/// Height the pinned bars need above the page (top) or below it.
+fn slot_height(top: bool) -> i32 {
+    if top {
+        pinned("tab-bar") as i32 * TABBAR_H + pinned("bookmark-bar") as i32 * BOOKBAR_H
+    } else {
+        pinned("status-bar") as i32 * STATUS_H
+    }
+}
+
+fn with_chrome<R>(win: u32, f: impl FnOnce(&mut Chrome) -> R) -> Option<R> {
+    CHROME.with_borrow_mut(|c| c.iter_mut().find(|c| c.win == win).map(f))
+}
+
+fn button(
+    text: &str,
+    color: u32,
+    font: &str,
+    press: Press,
+    reveal: Option<(LabelButton, u32)>,
+) -> LabelButton {
+    let mut d = BarButton::new(press, reveal);
     let l = label_button_create(Some(&mut d), Some(&text.into())).expect("label");
     l.set_font_list(Some(&font.into()));
     set_color(&l, color);
     View::from(&l).set_focusable(0);
     l
+}
+
+fn label(text: &str, color: u32, font: &str) -> LabelButton {
+    button(text, color, font, Press::None, None)
 }
 
 fn bar_panel(bg: u32, spacing: i32, insets: Insets, min_h: i32) -> Panel {
@@ -124,10 +163,10 @@ fn bar_panel(bg: u32, spacing: i32, insets: Insets, min_h: i32) -> Panel {
     p
 }
 
-/// The browser window closed (web apps may live on): forget its widgets.
-pub fn reset() {
-    forget(Owner::Main);
-    CHROME.with_borrow_mut(|c| c.take());
+/// A browser window closed: forget its widgets.
+pub fn forget_window(win: u32) {
+    forget(Owner::Win(win));
+    CHROME.with_borrow_mut(|c| c.retain(|c| c.win != win));
 }
 
 /// That window closed: drop its status line (and the toast if it was there).
@@ -140,16 +179,21 @@ pub fn forget(owner: Owner) {
     });
 }
 
-pub fn is_built() -> bool {
-    with_owner(Owner::Main, |_| ()).is_some()
+pub fn is_built(win: u32) -> bool {
+    with_owner(Owner::Win(win), |_| ()).is_some()
+}
+
+/// Some window can show a message (false while the startup config is read).
+pub fn is_up() -> bool {
+    BARS.with_borrow(|b| !b.is_empty())
 }
 
 /// Mode pill, URL/message, right-hand info: the three labels of a status line.
 fn labels(panel: &Panel) -> (LabelButton, LabelButton, LabelButton) {
-    let mode = label(" NORMAL ", TABBAR_BG, FONT_BOLD, None);
-    let url = label("", TEXT, FONT, None);
+    let mode = label(" NORMAL ", TABBAR_BG, FONT_BOLD);
+    let url = label("", TEXT, FONT);
     url.set_horizontal_alignment(HorizontalAlignment::LEFT);
-    let right = label("", SUBTEXT, FONT, None);
+    let right = label("", SUBTEXT, FONT);
     for v in [View::from(&mode), View::from(&url), View::from(&right)] {
         panel.add_child_view(Some(&mut v.clone()));
     }
@@ -204,15 +248,15 @@ pub fn focus_changed() {
     update();
 }
 
-/// (tab bar slot, status bar slot) for the window layout: empty spacers, visible only
-/// while that bar is pinned. Cheap — the labels (~100 ms of UI thread) come in
-/// build(), after the first page has loaded.
-pub fn frame() -> (Panel, Panel) {
-    let tab_slot = bar_panel(TABBAR_BG, 0, Insets::default(), TABBAR_H);
-    let status_slot = bar_panel(BAR_BG, 0, Insets::default(), STATUS_H);
+/// (top slot, status bar slot) for a new window's layout: spacers as tall as the
+/// pinned bars. Cheap — the labels (~100 ms of UI thread) come in build(), after the
+/// first page has loaded.
+pub fn frame(win: u32, window: &Window) -> (Panel, Panel) {
+    let slot = |top| panel_create(Some(&mut Slot::new(top))).expect("panel");
+    let (top_slot, status_slot) = (slot(true), slot(false));
     let tabbar = bar_panel(
         TABBAR_BG,
-        2,
+        0,
         Insets {
             top: 3,
             left: 6,
@@ -220,6 +264,17 @@ pub fn frame() -> (Panel, Panel) {
             right: 6,
         },
         TABBAR_H - 3,
+    );
+    let bookbar = bar_panel(
+        BAR_BG,
+        2,
+        Insets {
+            top: 0,
+            left: 6,
+            bottom: 0,
+            right: 6,
+        },
+        BOOKBAR_H,
     );
     let status = bar_panel(
         BAR_BG,
@@ -233,24 +288,33 @@ pub fn frame() -> (Panel, Panel) {
         STATUS_H,
     );
     CHROME.with_borrow_mut(|c| {
-        *c = Some(Chrome {
-            tab_slot: tab_slot.clone(),
+        c.push(Chrome {
+            win,
+            window: window.clone(),
+            top_slot: top_slot.clone(),
             status_slot: status_slot.clone(),
             tabbar,
+            bookbar,
             status,
             tab_ctl: None,
+            book_ctl: None,
             status_ctl: None,
         })
     });
-    (tab_slot, status_slot)
+    (top_slot, status_slot)
 }
 
 /// Float the bars over the window (after frame()); hidden until needed.
-pub fn attach(w: &Window) {
-    CHROME.with_borrow_mut(|c| {
-        let Some(c) = c else { return };
-        c.tab_ctl = w.add_overlay_view(Some(&mut View::from(&c.tabbar)), DockingMode::CUSTOM, 0);
-        c.status_ctl = w.add_overlay_view(Some(&mut View::from(&c.status)), DockingMode::CUSTOM, 0);
+pub fn attach(win: u32) {
+    with_chrome(win, |c| {
+        let over = |p: &Panel| {
+            c.window
+                .add_overlay_view(Some(&mut View::from(p)), DockingMode::CUSTOM, 0)
+        };
+        // The tab bar last: when it pops up unpinned it covers the bookmark bar.
+        c.book_ctl = over(&c.bookbar);
+        c.tab_ctl = over(&c.tabbar);
+        c.status_ctl = over(&c.status);
     });
     place();
     update();
@@ -280,8 +344,8 @@ pub fn place() {
             .unwrap_or_default();
         let width = pref.width.min(size.width - 24);
         // Below a pinned tab bar (browser window); 12px from the edges.
-        let top = if *owner == Owner::Main && commands::opt_bool("tab-bar", false) {
-            TABBAR_H
+        let top = if matches!(owner, Owner::Win(_)) {
+            slot_height(true)
         } else {
             0
         } + 12;
@@ -292,25 +356,23 @@ pub fn place() {
             height: STATUS_H + 4,
         }));
     });
-    let Some(w) = tabs::window() else { return };
-    let size = View::from(&w).size();
-    CHROME.with_borrow(|c| {
-        let Some(c) = c else { return };
-        if let Some(t) = &c.tab_ctl {
-            t.set_bounds(Some(&Rect {
-                x: 0,
-                y: 0,
-                width: size.width,
-                height: TABBAR_H,
-            }));
-        }
-        if let Some(s) = &c.status_ctl {
-            s.set_bounds(Some(&Rect {
-                x: 0,
-                y: size.height - STATUS_H,
-                width: size.width,
-                height: STATUS_H,
-            }));
+    let tabs_h = pinned("tab-bar") as i32 * TABBAR_H;
+    CHROME.with_borrow(|cs| {
+        for c in cs {
+            let size = View::from(&c.window).size();
+            let bar = |ctl: &Option<OverlayController>, y, height| {
+                if let Some(ctl) = ctl {
+                    ctl.set_bounds(Some(&Rect {
+                        x: 0,
+                        y,
+                        width: size.width,
+                        height,
+                    }));
+                }
+            };
+            bar(&c.tab_ctl, 0, TABBAR_H);
+            bar(&c.book_ctl, tabs_h, BOOKBAR_H);
+            bar(&c.status_ctl, size.height - STATUS_H, STATUS_H);
         }
     });
 }
@@ -340,7 +402,7 @@ pub fn toast(text: &str, sticky: bool) {
             },
             STATUS_H + 4,
         );
-        let l = label("", TEXT, FONT, None);
+        let l = label("", TEXT, FONT);
         View::from(&l).set_background_color(SURFACE);
         panel.add_child_view(Some(&mut View::from(&l)));
         let Some(ctl) = w.add_overlay_view(Some(&mut View::from(&panel)), DockingMode::CUSTOM, 0)
@@ -382,34 +444,62 @@ fn live(until: &'static std::thread::LocalKey<Cell<Option<Instant>>>) -> bool {
 
 /// Apply pinned / held / recently-revealed state to slots and overlays.
 fn update() {
-    let pin_tabs = commands::opt_bool("tab-bar", false);
-    let pin_status = commands::opt_bool("status-bar", false);
-    let tabs_on = pin_tabs || live(&TABS_UNTIL);
+    let (pin_tabs, pin_books, pin_status) =
+        (pinned("tab-bar"), pinned("bookmark-bar"), pinned("status-bar"));
     let cur = tabs::current_owner();
     let shown = |b: &Bar| pin_status || (b.owner == cur && (b.hold || live(&STATUS_UNTIL)));
-    let status_on = with_owner(Owner::Main, |b| shown(b)).unwrap_or(pin_status);
-    BARS.with_borrow(|bars| {
-        for b in bars {
-            if let Some((ctl, _)) = &b.app {
-                ctl.set_visible(shown(b) as i32);
+    let status: Vec<(Owner, bool)> = BARS.with_borrow(|bars| {
+        bars.iter()
+            .map(|b| {
+                let on = shown(b);
+                if let Some((ctl, _)) = &b.app {
+                    ctl.set_visible(on as i32);
+                }
+                (b.owner, on)
+            })
+            .collect()
+    });
+    // The page is laid out around pinned bars: tell the layouts when that changes.
+    let slots = (slot_height(true), slot_height(false));
+    let relayout = SLOTS.replace(slots) != slots;
+    // Bars that just appeared: they aren't rebuilt while hidden, so catch up.
+    let (mut tabs_new, mut books_new) = (Vec::new(), false);
+    CHROME.with_borrow(|cs| {
+        for c in cs {
+            let owner = Owner::Win(c.win);
+            let tabs_on = pin_tabs || (owner == cur && live(&TABS_UNTIL));
+            let status_on = status
+                .iter()
+                .find(|(o, _)| *o == owner)
+                .map_or(pin_status, |(_, on)| *on);
+            View::from(&c.top_slot).set_visible((slots.0 > 0) as i32);
+            View::from(&c.status_slot).set_visible((slots.1 > 0) as i32);
+            if relayout {
+                View::from(&c.top_slot).invalidate_layout();
+                View::from(&c.status_slot).invalidate_layout();
+                View::from(&c.window).invalidate_layout();
+            }
+            if let Some(s) = &c.status_ctl {
+                s.set_visible(status_on as i32);
+            }
+            if let Some(b) = &c.book_ctl {
+                books_new |= pin_books && b.is_visible() == 0;
+                b.set_visible(pin_books as i32);
+            }
+            if let Some(t) = &c.tab_ctl {
+                if tabs_on && t.is_visible() == 0 {
+                    tabs_new.push(c.win);
+                }
+                t.set_visible(tabs_on as i32);
             }
         }
     });
-    let tabs_was = CHROME.with_borrow(|c| {
-        let c = c.as_ref()?;
-        View::from(&c.tab_slot).set_visible(pin_tabs as i32);
-        View::from(&c.status_slot).set_visible(pin_status as i32);
-        if let Some(s) = &c.status_ctl {
-            s.set_visible(status_on as i32);
-        }
-        let t = c.tab_ctl.as_ref()?;
-        let was = t.is_visible() != 0;
-        t.set_visible(tabs_on as i32);
-        Some(was)
-    });
-    // A hidden tab bar isn't rebuilt on title changes; catch up when it appears.
-    if tabs_on && tabs_was == Some(false) {
-        tabs::refresh_tabbar();
+    if relayout {
+        place();
+    }
+    tabs_new.into_iter().for_each(tabs::refresh_tabbar);
+    if books_new {
+        refresh_bookmarks();
     }
 }
 
@@ -424,15 +514,16 @@ pub fn reveal_tabs() {
     reveal(&TABS_UNTIL, SHOW_MS);
 }
 
-pub fn build() {
-    let Some(panel) = CHROME.with_borrow(|c| c.as_ref().map(|c| c.status.clone())) else {
+pub fn build(win: u32) {
+    let Some(panel) = with_chrome(win, |c| c.status.clone()) else {
         return;
     };
+    let owner = Owner::Win(win);
     let (mode, url, right) = labels(&panel);
     BARS.with_borrow_mut(|b| {
-        b.retain(|b| b.owner != Owner::Main);
+        b.retain(|b| b.owner != owner);
         b.push(Bar {
-            owner: Owner::Main,
+            owner,
             app: None,
             hold: false,
             mode,
@@ -463,7 +554,8 @@ pub fn recolor() {
         bars.iter()
             .for_each(|b| View::from(&b.mode).set_background_color(b.mode_color))
     });
-    tabs::refresh_tabbar();
+    tabs::refresh_tabbars();
+    refresh_bookmarks();
 }
 
 pub fn set_mode(name: &str, color: u32) {
@@ -507,11 +599,6 @@ fn show_url(b: &mut Bar, url: &str) {
     b.url.set_text(Some(&url.into()));
 }
 
-/// The active tab's URL; a new one (navigation, tab switch) flashes the status bar.
-pub fn set_url(url: &str) {
-    set_url_for(Owner::Main, url);
-}
-
 /// A window's page URL (the browser's active tab, or a web app's page).
 pub fn set_url_for(owner: Owner, url: &str) {
     let changed = with_owner(owner, |b| {
@@ -541,62 +628,100 @@ pub fn clear_message() {
     });
 }
 
-/// Tab count / search / loading info — the browser window's status line.
-pub fn set_right(text: &str) {
-    with_owner(Owner::Main, |b| b.right.set_text(Some(&text.into())));
+/// Tab count / search / loading info — a browser window's status line.
+pub fn set_right(win: u32, text: &str) {
+    with_owner(Owner::Win(win), |b| b.right.set_text(Some(&text.into())));
 }
 
-/// `set status-bar` / `set tab-bar` changed: pin or unpin.
-pub fn set_bar_visible(_on: bool) {
+/// `set status-bar` / `set tab-bar` / `set bookmark-bar` changed: pin or unpin.
+pub fn bars_changed() {
     update();
 }
 
-pub fn set_tabbar_visible(_on: bool) {
-    update();
-}
-
-fn short(title: &str) -> String {
+fn short(title: &str, max: usize) -> String {
     let t = title.trim();
-    if t.chars().count() <= TAB_TITLE {
+    if t.chars().count() <= max {
         return t.to_string();
     }
-    let cut: String = t.chars().take(TAB_TITLE - 1).collect();
+    let cut: String = t.chars().take(max - 1).collect();
     format!("{}…", cut.trim_end())
 }
 
-/// Rebuild the tab bar: one clickable label per tab, active one bold + underlined.
+/// Rebuild a window's tab bar: per tab a clickable label and a close button (always
+/// there on the active tab, on the others only while the mouse is over the tab).
 /// ponytail: full rebuild per change; diff the labels if hundreds of tabs ever lag.
-pub fn set_tabs(titles: &[String], active: usize) {
-    let Some((bar, shown)) = CHROME.with_borrow(|c| {
-        let c = c.as_ref()?;
-        Some((
+pub fn set_tabs(win: u32, titles: &[String], active: usize) {
+    let Some((bar, shown, width)) = with_chrome(win, |c| {
+        (
             c.tabbar.clone(),
             c.tab_ctl.as_ref().is_some_and(|t| t.is_visible() != 0),
-        ))
+            View::from(&c.window).size().width,
+        )
     }) else {
         return;
     };
-    if !shown || !is_built() {
+    if !shown || !is_built(win) {
         return;
     }
+    // Titles shrink so every tab stays reachable (~8px a character, 6 for " 1 " + "× ").
+    let room = (width - 12) / titles.len().max(1) as i32 / 8 - 6;
+    let room = room.clamp(3, TAB_TITLE as i32) as usize;
     bar.remove_all_child_views();
     for (i, t) in titles.iter().enumerate() {
         let on = i == active;
-        let text = format!(
-            " {} {} ",
-            i + 1,
-            short(if t.is_empty() { "New tab" } else { t })
+        let bg = if on { SURFACE } else { TABBAR_BG };
+        let title = if t.is_empty() { "New tab" } else { t };
+        let x = button(
+            "× ",
+            if on { OVERLAY } else { bg },
+            TAB_FONT_BOLD,
+            Press::Close(win, i),
+            None,
         );
-        let l = label(
-            &text,
+        x.set_text_color(ButtonState::HOVERED, RED);
+        x.set_text_color(ButtonState::PRESSED, RED);
+        let l = button(
+            &format!(" {} {} ", i + 1, short(title, room)),
             if on { TEXT } else { OVERLAY },
             if on { TAB_FONT_BOLD } else { TAB_FONT },
-            Some(i),
+            Press::Tab(win, i),
+            (!on).then(|| (x.clone(), bg)),
         );
-        bar.add_child_view(Some(&mut View::from(&l)));
-        View::from(&l).set_background_color(if on { SURFACE } else { TABBAR_BG });
+        l.set_tooltip_text(Some(&title.into()));
+        x.set_tooltip_text(Some(&"Close tab".into()));
+        for b in [&l, &x] {
+            bar.add_child_view(Some(&mut View::from(b)));
+            View::from(b).set_background_color(bg);
+        }
     }
     View::from(&bar).invalidate_layout();
+}
+
+/// Rebuild the bookmark bars (`set bookmark-bar` turned on, or the bookmarks changed).
+pub fn refresh_bookmarks() {
+    if !pinned("bookmark-bar") {
+        return;
+    }
+    let marks = commands::bookmarks();
+    let bars: Vec<Panel> = CHROME.with_borrow(|cs| cs.iter().map(|c| c.bookbar.clone()).collect());
+    for bar in bars {
+        bar.remove_all_child_views();
+        for (url, title, _) in marks.iter().take(BOOKBAR_MAX) {
+            let name = if title.is_empty() { url } else { title };
+            let l = button(
+                &format!(" {} ", short(name, 18)),
+                SUBTEXT,
+                TAB_FONT,
+                Press::Open(url.clone()),
+                None,
+            );
+            l.set_text_color(ButtonState::HOVERED, TEXT);
+            l.set_tooltip_text(Some(&url.as_str().into()));
+            bar.add_child_view(Some(&mut View::from(&l)));
+            View::from(&l).set_background_color(BAR_BG);
+        }
+        View::from(&bar).invalidate_layout();
+    }
 }
 
 // A panel with its own background: CEF re-applies theme colours (on add, show, OS
@@ -617,21 +742,67 @@ wrap_panel_delegate! {
     impl PanelDelegate {}
 }
 
-// Status-bar labels pass usize::MAX; tab labels pass their index.
+// The spacer under pinned bars: as tall as they are right now.
+wrap_panel_delegate! {
+    struct Slot {
+        top: bool,
+    }
+
+    impl ViewDelegate {
+        fn preferred_size(&self, _view: Option<&mut View>) -> Size {
+            Size { width: 1, height: slot_height(self.top) }
+        }
+
+        fn height_for_width(&self, _view: Option<&mut View>, _width: i32) -> i32 {
+            slot_height(self.top)
+        }
+
+        fn on_theme_changed(&self, view: Option<&mut View>) {
+            if let Some(v) = view {
+                v.set_background_color(BAR_BG);
+            }
+        }
+    }
+
+    impl PanelDelegate {}
+}
+
+/// What a click on a bar button does.
+#[derive(Clone)]
+enum Press {
+    None,
+    /// (window, tab index)
+    Tab(u32, usize),
+    Close(u32, usize),
+    Open(String),
+}
+
 wrap_button_delegate! {
-    struct TabButton {
-        tab: usize,
+    struct BarButton {
+        press: Press,
+        // A tab label's close button and the colour that hides it: shown while the
+        // mouse is over the label (over the button itself, its hover colour shows).
+        reveal: Option<(LabelButton, u32)>,
     }
 
     impl ViewDelegate {}
 
     impl ButtonDelegate {
         fn on_button_pressed(&self, _button: Option<&mut Button>) {
-            if self.tab != usize::MAX {
-                let i = self.tab;
-                // Not inside the click handler: select() rebuilds the tab bar (this button).
-                run_on_ui(0, move || tabs::select(i));
+            // Next tick, not inside the click handler: these rebuild the bar the
+            // pressed button lives in.
+            match self.press.clone() {
+                Press::None => {}
+                Press::Tab(win, i) => run_on_ui(0, move || tabs::select_in(win, i)),
+                Press::Close(win, i) => run_on_ui(0, move || tabs::close_tab(win, i)),
+                Press::Open(url) => run_on_ui(0, move || commands::open(&url, false)),
             }
+        }
+
+        fn on_button_state_changed(&self, button: Option<&mut Button>) {
+            let (Some((x, hidden)), Some(b)) = (&self.reveal, button) else { return };
+            let over = b.state() != ButtonState::NORMAL;
+            x.set_text_color(ButtonState::NORMAL, if over { SUBTEXT } else { *hidden });
         }
     }
 }

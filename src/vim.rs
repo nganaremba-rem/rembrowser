@@ -588,17 +588,21 @@ pub fn run_keys(rhs: &str, noremap: bool) {
 fn act(a: Act, count: u32) {
     let n = count as i32;
     let step = opt_num("scroll-step", 60);
+    let smooth = commands::opt_bool("smooth-scrolling", true);
     let scroll = |kind: &str, dx: i32, dy: i32| {
-        let smooth = commands::opt_bool("smooth-scrolling", true);
         tabs::js(&format!(
             "__rem.smooth={smooth};__rem.scroll('{kind}',{dx},{dy})"
         ));
     };
     match a {
+        // Relative scrolling is a wheel tick (no page JS on the key path).
+        Act::Scroll(dx, dy) if smooth => tabs::wheel(dx * step * n, dy * step * n),
+        Act::Pages(p) if smooth => {
+            tabs::wheel(0, (p * n as f32 * tabs::page_height() as f32) as i32)
+        }
         Act::Scroll(dx, dy) => scroll("by", dx * step * n, dy * step * n),
         Act::Pages(p) => tabs::js(&format!(
-            "__rem.smooth={};__rem.scroll('page',0,{})",
-            commands::opt_bool("smooth-scrolling", true),
+            "__rem.smooth=false;__rem.scroll('page',0,{})",
             p * n as f32
         )),
         // 50G = 50% (vimb), plain G = bottom.

@@ -91,7 +91,7 @@ const MODES = {
   prompt:   { title: '󰒃 Permission', accent: '--peach' },
 };
 const KIND_ICON = { history: '󰋚', bookmark: '󰃀', tab: '󰓩', pin: '󰐃', key: '', download: '', command: '', setting: '', cmdhist: '󰘳' };
-const OPEN_CMDS = ['open', 'o', 'tabopen', 't', 'tabnew'];
+const OPEN_CMDS = ['open', 'o', 'tabopen', 't', 'tabnew', 'winopen', 'window'];
 
 let S = null;         // state from Rust
 let items = [];       // current completion rows
@@ -115,7 +115,8 @@ function mode() {
 }
 
 function paintMode() {
-  const m = mode() === 'pick' ? { title: S.title, accent: '--mauve' } : MODES[mode()];
+  const m = mode() === 'pick' ? { title: S.title, accent: '--mauve' }
+    : S.confirm ? { title: 'Confirm', accent: '--red' } : MODES[mode()];
   document.documentElement.style.setProperty('--accent', `var(${m.accent})`);
   $('title').textContent = m.title;
 }
@@ -277,12 +278,14 @@ input.addEventListener('blur', () => { if (S?.kind !== 'prompt' && !wrap.classLi
 // Rust sizes the overlay to the box.
 new ResizeObserver(() => { if (!wrap.classList.contains('hidden')) send('size', Math.ceil(wrap.getBoundingClientRect().height)); }).observe(wrap);
 
-// ── permission prompt ─────────────────────────────────────────────────
-function answer(choice) { hide(); send('answer', S.id, choice); }
+// ── prompts: a permission question, or a yes/no confirm (S.confirm) ─────
+const PERMISSION = [['y', 'Allow once', 'allow'], ['a', 'Always allow', 'always'], ['n', 'Deny', 'deny'], ['N', 'Never', 'never']];
+function answer(choice) { hide(); S.confirm ? send('confirm', choice) : send('answer', S.id, choice); }
 document.addEventListener('keydown', (e) => {
   if (S?.kind !== 'prompt' || wrap.classList.contains('hidden')) return;
-  const map = { y: 'allow', a: 'always', n: 'deny', N: 'never', Escape: 'dismiss' };
-  if (map[e.key]) { e.preventDefault(); answer(map[e.key]); }
+  const choice = (S.buttons ?? PERMISSION).find(([key]) => key === e.key)?.[2]
+    ?? (e.key === 'Escape' ? (S.confirm ? 'no' : 'dismiss') : e.key === 'Enter' && S.confirm ? 'yes' : null);
+  if (choice) { e.preventDefault(); answer(choice); }
 });
 
 window.rem = {
@@ -296,10 +299,13 @@ window.rem = {
     $('count').textContent = '';
     if (prompt) {
       const m = $('pmsg'); m.replaceChildren();
-      const o = document.createElement('span'); o.className = 'o'; o.textContent = S.origin;
-      m.append(o, ` wants to use your ${S.what}.`);
+      if (S.msg) m.append(S.msg);
+      else {
+        const o = document.createElement('span'); o.className = 'o'; o.textContent = S.origin;
+        m.append(o, ` wants to use your ${S.what}.`);
+      }
       const b = $('pbtns'); b.replaceChildren();
-      for (const [key, label, choice] of [['y', 'Allow once', 'allow'], ['a', 'Always allow', 'always'], ['n', 'Deny', 'deny'], ['N', 'Never', 'never']]) {
+      for (const [key, label, choice] of S.buttons ?? PERMISSION) {
         const btn = document.createElement('button');
         const kb = document.createElement('kbd'); kb.textContent = key;
         btn.append(kb, label);

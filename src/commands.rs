@@ -89,7 +89,7 @@ fn source(path: &std::path::Path) {
     match std::fs::read_to_string(path) {
         Ok(text) => source_text(&text),
         // Startup config runs before CEF exists: no UI to show it in yet.
-        Err(_) if !ui::is_built() => eprintln!("rembrowser: can't read {}", path.display()),
+        Err(_) if !ui::is_up() => eprintln!("rembrowser: can't read {}", path.display()),
         Err(_) => ui::message(&format!("can't read {}", path.display()), true),
     }
 }
@@ -147,6 +147,7 @@ fn exec_one(line: &str) {
     match name {
         "o" | "open" => open(args, false),
         "t" | "tabopen" | "tabnew" => open(args, true),
+        "winopen" | "window" => tabs::create_window(resolve_url(args)),
         "q" | "quit" | "close" | "tabclose" => tabs::close_active(),
         "qa" | "qall" | "quitall" | "wqa" => tabs::quit_all(),
         "back" => tabs::with_active(|b| b.go_back()),
@@ -263,20 +264,21 @@ fn set(args: &str) {
     };
     OPTS.with_borrow_mut(|o| o.set.insert(key.clone(), val.clone()));
     match key.as_str() {
-        "status-bar" => ui::set_bar_visible(opt_bool("status-bar", true)),
+        "status-bar" | "tab-bar" | "bookmark-bar" => ui::bars_changed(),
         "fullscreen" => tabs::set_fullscreen(opt_bool("fullscreen", false)),
-        "tab-bar" => ui::set_tabbar_visible(opt_bool("tab-bar", true)),
         _ => {}
     }
 }
 
 fn default_on(key: &str) -> bool {
-    matches!(key, "smooth-scrolling" | "incsearch")
+    matches!(key, "smooth-scrolling" | "incsearch" | "confirm-quit")
 }
 
 /// Options rembrowser acts on, with their current value (for :set completion).
 pub fn settings() -> Vec<(String, String)> {
     const KNOWN: &[&str] = &[
+        "bookmark-bar",
+        "confirm-quit",
         "dark-mode",
         "editor-command",
         "fullscreen",
@@ -499,12 +501,27 @@ pub fn record_history(url: &str, title: &str) {
     }
 }
 
+/// (url, title, tags) of every bookmark, in file order (vimb's format).
+pub fn bookmarks() -> Vec<(String, String, String)> {
+    std::fs::read_to_string(data_dir().join("bookmark"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.split('\t');
+            let url = p.next().filter(|u| !u.is_empty())?;
+            let mut field = || p.next().unwrap_or("").to_string();
+            Some((url.to_string(), field(), field()))
+        })
+        .collect()
+}
+
 fn bookmark_add(tags: &str) {
     let url = tabs::active_url();
     append_line(
         "bookmark",
         &format!("{url}\t{}\t{tags}", tabs::active_title().replace('\t', " ")),
     );
+    ui::refresh_bookmarks();
     ui::message(&format!("bookmarked {url}"), false);
 }
 

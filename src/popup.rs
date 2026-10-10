@@ -20,7 +20,8 @@ pub enum CmdKind {
 /// Which window a popup floats over.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Owner {
-    Main,
+    /// A browser window, by its id (tabs.rs).
+    Win(u32),
     /// A web-app window, by its page's browser id.
     App(i32),
 }
@@ -38,11 +39,13 @@ struct Pop {
 }
 
 type OnPick = Box<dyn FnOnce(usize)>;
+type OnConfirm = Box<dyn FnOnce(bool)>;
 
 thread_local! {
     /// One popup per window (browser window + each web app that used one).
     static POPS: RefCell<Vec<Pop>> = const { RefCell::new(Vec::new()) };
     static ON_PICK: RefCell<Option<OnPick>> = const { RefCell::new(None) };
+    static ON_CONFIRM: RefCell<Option<OnConfirm>> = const { RefCell::new(None) };
     static HISTORY: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -50,6 +53,7 @@ thread_local! {
 const COMMANDS: &[(&str, &str)] = &[
     ("open", "open URL or search"),
     ("tabopen", "open in new tab"),
+    ("winopen", "open in new window"),
     ("quit", "close tab"),
     ("quitall", "quit browser"),
     ("tabs", "pick a tab"),
@@ -283,6 +287,20 @@ pub fn ask(id: u64, origin: &str, what: &str) {
     ui::run_on_ui(0, move || show(js));
 }
 
+/// A yes/no question (y / Enter = yes; n / Esc = no). `yes` labels the yes button.
+pub fn confirm(text: &str, yes: &str, on_answer: impl FnOnce(bool) + 'static) {
+    // A question still open is answered "no" by the new one.
+    if let Some(old) = ON_CONFIRM.with_borrow_mut(|c| c.replace(Box::new(on_answer))) {
+        old(false);
+    }
+    let js = format!(
+        "rem.open({{kind:'prompt',confirm:true,msg:{},buttons:[['y',{},'yes'],['n','Cancel','no']]}})",
+        js_str(text),
+        js_str(yes)
+    );
+    ui::run_on_ui(0, move || show(js));
+}
+
 /// Centred horizontally, upper fifth of the window, as tall as the box.
 fn place(p: &Pop) {
     let size = View::from(&p.win).size();
@@ -363,7 +381,7 @@ pub fn set_count(text: &str) {
 fn on_message(b: &Browser, fields: &[&str]) {
     match fields {
         ["ready"] => {
-            let (owner, pending) = with_from(b, |p| {
+            let Some((owner, pending)) = with_from(b, |p| {
                 p.ready = true;
                 let pending = p.pending.take();
                 if pending.is_none() {
@@ -373,8 +391,9 @@ fn on_message(b: &Browser, fields: &[&str]) {
                     p.bv.request_focus();
                 }
                 (p.owner, pending)
-            })
-            .unwrap_or((Owner::Main, None));
+            }) else {
+                return;
+            };
             match pending {
                 Some(js) => run_js(owner, &js),
                 // Loading it took the keyboard from the page; give it back.
@@ -422,6 +441,12 @@ fn on_message(b: &Browser, fields: &[&str]) {
             hide(b);
             if let Ok(id) = id.parse() {
                 permissions::answer(id, choice);
+            }
+        }
+        ["confirm", choice] => {
+            hide(b);
+            if let Some(cb) = ON_CONFIRM.with_borrow_mut(Option::take) {
+                cb(*choice == "yes");
             }
         }
         _ => {}
@@ -492,7 +517,8 @@ wrap_life_span_handler! {
             // Retry closing that window, which now finds its popup gone.
             match owner {
                 Some(Owner::App(id)) => ui::run_on_ui(0, move || crate::apps::close(id)),
-                _ => ui::run_on_ui(0, tabs::quit_all),
+                Some(Owner::Win(id)) => ui::run_on_ui(0, move || tabs::close_window(id)),
+                None => {}
             }
             1
         }

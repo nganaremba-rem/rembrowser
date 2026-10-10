@@ -1,9 +1,10 @@
-//! Window + tabs. Every tab is a CEF BrowserView in the content panel (fill layout);
-//! only the active one is visible. The status bar (ui.rs) sits underneath.
+//! Windows + tabs. Every tab is a CEF BrowserView in its window's content panel (fill
+//! layout); only the active one is visible. The bars (ui.rs) float above.
 //!
 //! All CEF Views calls happen on the UI thread, so tab state lives in thread_locals
 //! (no locks). Rule: never call into vim/ui while holding a borrow here.
 
+use crate::popup::Owner;
 use crate::{adblock, apps, commands, downloads, home, permissions, popup, ui, userscripts, vim};
 use cef::*;
 use std::cell::{Cell, RefCell};
@@ -14,24 +15,37 @@ const DEVTOOLS_APP_ID: &str = "rembrowser-devtools";
 pub const BG: u32 = 0xFF1E_1E2E;
 const PAGE_JS: &str = include_str!("page.js");
 
+/// A browser window and its tabs.
+struct Win {
+    id: u32,
+    window: Window,
+    content: Panel,
+    tabs: Vec<BrowserView>,
+    active: usize,
+    /// Status bar right side: find count + load progress of the active tab.
+    find: String,
+    progress: u8,
+    /// The quit question (confirm-quit) was answered yes.
+    /// ponytail: stays set if a page's beforeunload then cancels the close, so the
+    /// next close of this window doesn't ask again.
+    confirmed: bool,
+}
+
 thread_local! {
-    static WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
-    static CONTENT: RefCell<Option<Panel>> = const { RefCell::new(None) };
-    static TABS: RefCell<Vec<BrowserView>> = const { RefCell::new(Vec::new()) };
-    static ACTIVE: Cell<usize> = const { Cell::new(0) };
+    static WINS: RefCell<Vec<Win>> = const { RefCell::new(Vec::new()) };
+    /// The browser window that last had focus: commands and new tabs go there.
+    static CUR: Cell<u32> = const { Cell::new(0) };
+    static NEXT_WIN: Cell<u32> = const { Cell::new(1) };
     /// Disposition seen in on_before_popup, consumed by on_popup_browser_view_created.
     static NEXT_POPUP_BACKGROUND: Cell<bool> = const { Cell::new(false) };
     /// URLs of closed tabs, for `u` / `U`.
     static CLOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    /// Status bar right side: find count + load progress.
-    static FIND: RefCell<String> = const { RefCell::new(String::new()) };
-    static PROGRESS: Cell<u8> = const { Cell::new(100) };
     static FAVICONS: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
-    /// The web-app window with keyboard focus (None = the browser window).
+    /// The web-app window with keyboard focus (None = a browser window).
     static APP_FOCUS: RefCell<Option<BrowserView>> = const { RefCell::new(None) };
-    /// Open DevTools windows: the main window waits for them before closing.
+    /// Open DevTools windows: the last browser window waits for them before closing.
     static DEVTOOLS: RefCell<Vec<Window>> = const { RefCell::new(Vec::new()) };
-    /// The main window was asked to close (quit_all / WM close).
+    /// The last browser window was asked to close (quit_all / WM close).
     /// ponytail: never reset; if a beforeunload cancels the quit, closing DevTools
     /// later re-asks the tabs. Reset on cancel if that ever matters.
     static CLOSING: Cell<bool> = const { Cell::new(false) };
@@ -40,7 +54,7 @@ thread_local! {
 /// cef-rs bug (152.3): when an out-struct is written back to C, an *owned* CefString
 /// (e.g. `"x".into()`) becomes zeroed, so CEF sees "". A *borrowed* one survives,
 /// so point it at a static UTF-16 buffer (CEF copies it).
-/// ponytail: leaks the UTF-16 copy; called once per window (main + each DevTools).
+/// ponytail: leaks the UTF-16 copy; called once per window.
 pub fn static_str(s: &str) -> CefString {
     let buf: &'static [u16] = Vec::leak(s.encode_utf16().collect());
     sys::_cef_string_utf16_t {
@@ -51,24 +65,51 @@ pub fn static_str(s: &str) -> CefString {
     .into()
 }
 
+fn with_win<R>(id: u32, f: impl FnOnce(&mut Win) -> R) -> Option<R> {
+    WINS.with_borrow_mut(|w| w.iter_mut().find(|w| w.id == id).map(f))
+}
+
+fn win_ids() -> Vec<u32> {
+    WINS.with_borrow(|w| w.iter().map(|w| w.id).collect())
+}
+
+/// The browser window commands act on: the last focused one (0 = none open).
+pub fn cur() -> u32 {
+    let cur = CUR.get();
+    WINS.with_borrow(|w| match w.iter().any(|w| w.id == cur) {
+        true => cur,
+        false => w.last().map_or(0, |w| w.id),
+    })
+}
+
+/// A new browser window showing `url`.
 pub fn create_window(url: String) {
     CLOSING.set(false);
-    let mut delegate = RemWindowDelegate::new(url);
+    let id = NEXT_WIN.replace(NEXT_WIN.get() + 1);
+    let mut delegate = RemWindowDelegate::new(id, url);
     window_create_top_level(Some(&mut delegate));
 }
 
+pub fn window_of(id: u32) -> Option<Window> {
+    with_win(id, |w| w.window.clone())
+}
+
 pub fn window() -> Option<Window> {
-    WINDOW.with_borrow(|w| w.clone())
+    window_of(cur())
+}
+
+fn active_of(win: u32) -> Option<BrowserView> {
+    with_win(win, |w| w.tabs.get(w.active).cloned()).flatten()
 }
 
 /// What vim keys act on: the focused web app's view, else the active tab.
 fn active() -> Option<BrowserView> {
     APP_FOCUS
         .with_borrow(|a| a.clone())
-        .or_else(|| TABS.with_borrow(|t| t.get(ACTIVE.get()).cloned()))
+        .or_else(|| active_of(cur()))
 }
 
-/// A web-app window got focus (Some) or the browser window did (None).
+/// A web-app window got focus (Some) or a browser window did (None).
 pub fn set_app_focus(view: Option<BrowserView>) {
     let changed = APP_FOCUS.with_borrow(|a| match (a, &view) {
         (Some(x), Some(y)) => View::from(x).is_same(Some(&mut View::from(y))) == 0,
@@ -82,17 +123,26 @@ pub fn set_app_focus(view: Option<BrowserView>) {
     }
 }
 
-/// The window keys go to: the focused web app's, else the browser window.
-pub fn current_owner() -> popup::Owner {
+/// Browser window `id` has the keyboard now.
+fn set_cur(id: u32) {
+    set_app_focus(None);
+    if CUR.replace(id) != id {
+        vim::reset();
+        ui::focus_changed();
+    }
+}
+
+/// The window keys go to: the focused web app's, else the current browser window.
+pub fn current_owner() -> Owner {
     APP_FOCUS
         .with_borrow(|a| a.as_ref().and_then(|v| v.browser()))
-        .map_or(popup::Owner::Main, |b| popup::Owner::App(b.identifier()))
+        .map_or_else(|| Owner::Win(cur()), |b| Owner::App(b.identifier()))
 }
 
 pub fn current_window() -> Option<Window> {
     match current_owner() {
-        popup::Owner::App(id) => apps::window_of(id),
-        popup::Owner::Main => window(),
+        Owner::App(id) => apps::window_of(id),
+        Owner::Win(id) => window_of(id),
     }
 }
 
@@ -130,19 +180,21 @@ pub fn new_view(url: &str) -> Option<BrowserView> {
     )
 }
 
+/// A tab in the current browser window.
 pub fn open(url: &str, background: bool) {
     // From a web app with no browser window open: open one.
-    if window().is_none() {
+    let win = cur();
+    if win == 0 {
         create_window(url.to_string());
         return;
     }
     if let Some(bv) = new_view(url) {
-        add(bv, background);
+        add(win, bv, background);
     }
 }
 
-/// From outside (another `rembrowser URL`, a web app's link): a tab in the browser
-/// window, opening that window first if only web apps are running.
+/// From outside (another `rembrowser URL`, a web app's link): a tab in the current
+/// browser window, opening one first if only web apps are running.
 pub fn open_or_create(url: &str) {
     let url = commands::resolve_url(url);
     match window() {
@@ -162,21 +214,23 @@ pub fn load(url: &str) {
     });
 }
 
-fn add(bv: BrowserView, background: bool) {
-    let Some(content) = CONTENT.with_borrow(|c| c.clone()) else {
+fn add(win: u32, bv: BrowserView, background: bool) {
+    let Some(content) = with_win(win, |w| w.content.clone()) else {
         return;
     };
     let mut view = View::from(&bv);
     view.set_visible(0);
     content.add_child_view(Some(&mut view));
-    let i = TABS.with_borrow_mut(|t| {
-        t.push(bv);
-        t.len() - 1
-    });
+    let Some(i) = with_win(win, |w| {
+        w.tabs.push(bv);
+        w.tabs.len() - 1
+    }) else {
+        return;
+    };
     if !background || i == 0 {
-        select(i);
+        select_in(win, i);
     } else {
-        refresh_right();
+        refresh_right(win);
     }
     if i > 0 {
         ui::reveal_tabs();
@@ -185,15 +239,23 @@ fn add(bv: BrowserView, background: bool) {
 
 /// `usize::MAX` = last tab.
 pub fn select(i: usize) {
-    let (bv, old) = TABS.with_borrow(|t| {
-        let i = i.min(t.len().saturating_sub(1));
-        (
-            t.get(i).cloned().map(|bv| (i, bv)),
-            t.get(ACTIVE.get()).cloned(),
-        )
+    select_in(cur(), i);
+}
+
+pub fn select_in(win: u32, i: usize) {
+    let picked = with_win(win, |w| {
+        let i = i.min(w.tabs.len().saturating_sub(1));
+        let bv = w.tabs.get(i).cloned()?;
+        let old = w.tabs.get(w.active).cloned();
+        let switched = i != w.active;
+        w.active = i;
+        w.find.clear();
+        Some((bv, old, switched))
     });
-    let Some((i, bv)) = bv else { return };
-    if i != ACTIVE.get() {
+    let Some((bv, old, switched)) = picked.flatten() else {
+        return;
+    };
+    if switched {
         ui::reveal_tabs();
     }
     if let Some(old) = old {
@@ -201,19 +263,21 @@ pub fn select(i: usize) {
     }
     View::from(&bv).set_visible(1);
     bv.request_focus();
-    ACTIVE.set(i);
-    FIND.with_borrow_mut(String::clear);
-    set_window_title(&bv);
-    ui::set_url(&url_of(&bv));
-    vim::reset();
-    refresh_right();
+    if let Some(w) = window_of(win) {
+        w.set_title(Some(&title_of(&bv).as_str().into()));
+    }
+    ui::set_url_for(Owner::Win(win), &url_of(&bv));
+    if win == cur() {
+        vim::reset();
+    }
+    refresh_right(win);
 }
 
 /// Relative move, wrapping (gt / gT).
 pub fn cycle(delta: isize) {
-    let n = TABS.with_borrow(|t| t.len()) as isize;
+    let (n, active) = with_win(cur(), |w| (w.tabs.len() as isize, w.active as isize)).unwrap_or((0, 0));
     if n > 0 {
-        select((ACTIVE.get() as isize + delta).rem_euclid(n) as usize);
+        select((active + delta).rem_euclid(n) as usize);
     }
 }
 
@@ -225,25 +289,77 @@ pub fn close_active() {
     });
 }
 
-pub fn quit_all() {
-    if let Some(w) = window() {
+/// Close tab `i` of a window (its close button).
+pub fn close_tab(win: u32, i: usize) {
+    let host = with_win(win, |w| w.tabs.get(i).and_then(|bv| bv.browser()?.host()));
+    if let Some(h) = host.flatten() {
+        h.close_browser(0);
+    }
+}
+
+pub fn close_window(id: u32) {
+    if let Some(w) = window_of(id) {
         w.close();
     }
 }
 
+/// "Close?" for these windows; yes closes them without asking again.
+fn ask_quit(ids: Vec<u32>) {
+    let tabs: usize = ids
+        .iter()
+        .filter_map(|id| with_win(*id, |w| w.tabs.len()))
+        .sum();
+    let tabs = format!("{tabs} tab{}", if tabs == 1 { "" } else { "s" });
+    let text = match ids.len() {
+        1 => format!("Close this window? ({tabs})"),
+        n => format!("Quit rembrowser? ({n} windows, {tabs})"),
+    };
+    popup::confirm(&text, "Quit", move |yes| {
+        if yes {
+            for id in ids {
+                with_win(id, |w| w.confirmed = true);
+                close_window(id);
+            }
+        }
+    });
+}
+
+/// Windows that would lose tabs without the user having said yes (confirm-quit).
+fn unconfirmed() -> Vec<u32> {
+    if !commands::opt_bool("confirm-quit", true) {
+        return Vec::new();
+    }
+    WINS.with_borrow(|w| {
+        w.iter()
+            .filter(|w| !w.tabs.is_empty() && !w.confirmed)
+            .map(|w| w.id)
+            .collect()
+    })
+}
+
+/// Close every browser window (asking once), which quits unless web apps are open.
+pub fn quit_all() {
+    if unconfirmed().is_empty() {
+        win_ids().into_iter().for_each(close_window);
+    } else {
+        ask_quit(win_ids());
+    }
+}
+
 pub fn reopen(new_tab: bool) {
+    let empty = active_of(cur()).is_none();
     match CLOSED.with_borrow_mut(|c| c.pop()) {
-        Some(url) if new_tab || TABS.with_borrow(|t| t.is_empty()) => open(&url, false),
+        Some(url) if new_tab || empty => open(&url, false),
         Some(url) => load(&url),
         None => ui::message("no closed tabs", true),
     }
 }
 
 /// Keyboard back to a window's page (after its hidden popup loaded and took focus).
-pub fn focus_owner(owner: popup::Owner) {
+pub fn focus_owner(owner: Owner) {
     let view = match owner {
-        popup::Owner::App(id) => apps::browser(id).and_then(|b| apps::view_of(&b)),
-        popup::Owner::Main => TABS.with_borrow(|t| t.get(ACTIVE.get()).cloned()),
+        Owner::App(id) => apps::browser(id).and_then(|b| apps::view_of(&b)),
+        Owner::Win(id) => active_of(id),
     };
     if let Some(v) = view {
         v.request_focus();
@@ -289,15 +405,15 @@ pub fn active_title() -> String {
     active().map(|bv| title_of(&bv)).unwrap_or_default()
 }
 
-/// (title, url) of every tab, in order.
+/// (title, url) of every tab of the current window, in order.
 pub fn titles() -> Vec<(String, String)> {
-    TABS.with_borrow(|t| t.clone())
+    with_win(cur(), |w| w.tabs.clone())
+        .unwrap_or_default()
         .iter()
         .map(|bv| (title_of(bv), url_of(bv)))
         .collect()
 }
 
-/// Run JS in the active tab's main frame, page.js helpers included.
 /// Browser id of the active tab (stable while the tab lives; Send, unlike Browser).
 pub fn active_id() -> Option<i32> {
     active().and_then(|bv| bv.browser()).map(|b| b.identifier())
@@ -305,9 +421,10 @@ pub fn active_id() -> Option<i32> {
 
 /// Like js(), in the tab or web app with this browser id (if it still exists).
 pub fn js_in(id: i32, code: &str) {
-    let b = TABS
-        .with_borrow(|t| {
-            t.iter()
+    let b = WINS
+        .with_borrow(|w| {
+            w.iter()
+                .flat_map(|w| &w.tabs)
                 .filter_map(|bv| bv.browser())
                 .find(|b| b.identifier() == id)
         })
@@ -374,6 +491,7 @@ pub fn devtools() {
     });
 }
 
+/// Run JS in the active tab's main frame, page.js helpers included.
 pub fn js(code: &str) {
     with_active(|b| {
         if let Some(f) = b.main_frame() {
@@ -384,6 +502,28 @@ pub fn js(code: &str) {
             );
         }
     });
+}
+
+/// Height of the active page's view (for page-wise scrolling).
+pub fn page_height() -> i32 {
+    active().map_or(0, |bv| View::from(&bv).size().height)
+}
+
+/// j/k & co.: a mouse-wheel tick in the middle of the page. Chromium scrolls it on the
+/// compositor thread with its own smooth-scroll animation (which carries the speed
+/// over from tick to tick while a key repeats); no page JavaScript runs.
+/// Positive = down / right, in pixels.
+pub fn wheel(dx: i32, dy: i32) {
+    let Some(bv) = active() else { return };
+    let size = View::from(&bv).size();
+    let ev = MouseEvent {
+        x: size.width / 2,
+        y: size.height / 2,
+        modifiers: 0,
+    };
+    if let Some(h) = bv.browser().and_then(|b| b.host()) {
+        h.send_mouse_wheel_event(Some(&ev), -dx, -dy);
+    }
 }
 
 pub fn zoom() -> f64 {
@@ -466,8 +606,9 @@ pub fn find(text: &str, forward: bool, next: bool) {
 }
 
 pub fn stop_find() {
-    FIND.with_borrow_mut(String::clear);
-    refresh_right();
+    let win = cur();
+    with_win(win, |w| w.find.clear());
+    refresh_right(win);
     with_active(|b| {
         if let Some(h) = b.host() {
             h.stop_finding(1);
@@ -475,94 +616,101 @@ pub fn stop_find() {
     });
 }
 
-pub fn refresh_tabbar() {
-    let titles: Vec<String> = TABS
-        .with_borrow(|t| t.clone())
-        .iter()
-        .map(title_of)
-        .collect();
-    ui::set_tabs(&titles, ACTIVE.get());
+pub fn refresh_tabbar(win: u32) {
+    let Some((tabs, active)) = with_win(win, |w| (w.tabs.clone(), w.active)) else {
+        return;
+    };
+    let titles: Vec<String> = tabs.iter().map(title_of).collect();
+    ui::set_tabs(win, &titles, active);
 }
 
-fn refresh_right() {
-    refresh_tabbar();
-    let n = TABS.with_borrow(|t| t.len());
-    let find = FIND.with_borrow(|f| f.clone());
-    let progress = PROGRESS.get();
+pub fn refresh_tabbars() {
+    win_ids().into_iter().for_each(refresh_tabbar);
+}
+
+fn refresh_right(win: u32) {
+    refresh_tabbar(win);
+    let Some((n, active, find, progress)) =
+        with_win(win, |w| (w.tabs.len(), w.active, w.find.clone(), w.progress))
+    else {
+        return;
+    };
     let load = if progress < 100 {
         format!(" {progress}%")
     } else {
         String::new()
     };
-    ui::set_right(format!("{find} [{}/{n}]{load}", ACTIVE.get() + 1).trim_start());
+    ui::set_right(win, format!("{find} [{}/{n}]{load}", active + 1).trim_start());
 }
 
 /// The status bar is built after the first page loads: creating its widgets costs
 /// ~100 ms of UI thread, which at startup lands exactly when the first page commits
 /// (measured: launch→loaded 0.55 s with it up front, 0.45 s without).
-fn build_bar() {
-    let Some(w) = window() else { return };
-    if ui::is_built() {
+fn build_bar(win: u32) {
+    let Some(w) = window_of(win) else { return };
+    if ui::is_built(win) {
         return;
     }
-    ui::build();
+    ui::build(win);
     ui::recolor();
-    popup::init(&w, popup::Owner::Main);
-    select(ACTIVE.get());
+    popup::init(&w, Owner::Win(win));
+    select_in(win, with_win(win, |w| w.active).unwrap_or(0));
 }
 
-fn index_of(browser: &mut Browser) -> Option<usize> {
-    TABS.with_borrow(|t| {
-        t.iter()
-            .position(|bv| bv.browser().is_some_and(|b| b.is_same(Some(browser)) != 0))
+/// (window, tab index) of a tab's browser.
+fn index_of(browser: &mut Browser) -> Option<(u32, usize)> {
+    WINS.with_borrow(|w| {
+        w.iter().find_map(|w| {
+            let i = w
+                .tabs
+                .iter()
+                .position(|bv| bv.browser().is_some_and(|b| b.is_same(Some(browser)) != 0))?;
+            Some((w.id, i))
+        })
     })
 }
 
-fn is_active(browser: &mut Browser) -> bool {
-    index_of(browser) == Some(ACTIVE.get())
-}
-
-fn set_window_title(bv: &BrowserView) {
-    let title = title_of(bv);
-    if let Some(w) = window() {
-        w.set_title(Some(&title.as_str().into()));
-    }
+/// The window this browser is the visible tab of.
+fn shown_in(browser: &mut Browser) -> Option<u32> {
+    let (win, i) = index_of(browser)?;
+    (with_win(win, |w| w.active) == Some(i)).then_some(win)
 }
 
 fn on_tab_closed(browser: &mut Browser) {
-    let Some(i) = index_of(browser) else { return };
-    let removed = TABS.with_borrow_mut(|t| t.remove(i));
+    let Some((win, i)) = index_of(browser) else { return };
+    let Some((removed, content, n, active)) = with_win(win, |w| {
+        (w.tabs.remove(i), w.content.clone(), w.tabs.len(), w.active)
+    }) else {
+        return;
+    };
     let url = url_of(&removed);
     if !url.is_empty() && url != "about:blank" {
         CLOSED.with_borrow_mut(|c| c.push(url));
     }
-    if let Some(c) = CONTENT.with_borrow(|c| c.clone()) {
-        c.remove_child_view(Some(&mut View::from(&removed)));
-    }
-    let n = TABS.with_borrow(|t| t.len());
+    content.remove_child_view(Some(&mut View::from(&removed)));
     if n == 0 {
-        // Last tab gone: close the window, which quits (vimb `:q` on the last tab).
+        // Last tab gone: close the window (the last window quits, vimb `:q`).
         // Next tick: we may be inside can_close's loop right now (closing a tab
         // re-entering can_close crashes CEF on the half-closed popup).
-        ui::run_on_ui(0, quit_all);
+        ui::run_on_ui(0, move || close_window(win));
         return;
     }
     ui::reveal_tabs();
-    let active = ACTIVE.get();
     if i < active {
-        ACTIVE.set(active - 1);
-        refresh_right();
+        with_win(win, |w| w.active = active - 1);
+        refresh_right(win);
     } else if i == active {
         // Closed the visible tab: show its left neighbour, like vim's bufferline.
-        ACTIVE.set(usize::MAX);
-        select(i.saturating_sub(1).min(n - 1));
+        with_win(win, |w| w.active = usize::MAX);
+        select_in(win, i.saturating_sub(1).min(n - 1));
     } else {
-        refresh_right();
+        refresh_right(win);
     }
 }
 
 wrap_window_delegate! {
     struct RemWindowDelegate {
+        id: u32,
         url: String,
     }
 
@@ -615,59 +763,80 @@ wrap_window_delegate! {
                 cross_axis_alignment: AxisAlignment::STRETCH,
                 ..Default::default()
             }));
-            let (tabbar, status) = ui::frame();
+            let id = self.id;
+            let (top, status) = ui::frame(id, window);
             let content = panel_create(None).expect("panel");
             content.set_to_fill_layout();
-            window.add_child_view(Some(&mut View::from(&tabbar)));
+            window.add_child_view(Some(&mut View::from(&top)));
             window.add_child_view(Some(&mut View::from(&content)));
             window.add_child_view(Some(&mut View::from(&status)));
             if let Some(l) = layout {
                 l.set_flex_for_view(Some(&mut View::from(&content)), 1);
             }
             View::from(&*window).set_background_color(BG);
-            WINDOW.with_borrow_mut(|w| *w = Some(window.clone()));
-            CONTENT.with_borrow_mut(|c| *c = Some(content));
-            ui::attach(window);
-            open(&self.url, false);
+            WINS.with_borrow_mut(|w| w.push(Win {
+                id,
+                window: window.clone(),
+                content,
+                tabs: Vec::new(),
+                active: 0,
+                find: String::new(),
+                progress: 100,
+                confirmed: false,
+            }));
+            CUR.set(id);
+            ui::attach(id);
+            if let Some(bv) = new_view(&self.url) {
+                add(id, bv, false);
+            }
             window.show();
             // Fallback for slow first pages; normally the first load_end builds it.
-            ui::run_on_ui(1000, build_bar);
+            ui::run_on_ui(1000, move || build_bar(id));
         }
 
         fn on_window_activation_changed(&self, _window: Option<&mut Window>, active: i32) {
             if active != 0 {
-                set_app_focus(None);
+                set_cur(self.id);
             }
         }
 
         fn on_window_destroyed(&self, _window: Option<&mut Window>) {
-            WINDOW.with_borrow_mut(|w| w.take());
-            CONTENT.with_borrow_mut(|c| c.take());
-            TABS.with_borrow_mut(Vec::clear);
-            ACTIVE.set(0);
-            // The bars and popup belonged to this window; a new one builds its own.
-            ui::reset();
-            popup::forget(popup::Owner::Main);
+            WINS.with_borrow_mut(|w| w.retain(|w| w.id != self.id));
+            // The bars and popup belonged to this window.
+            ui::forget_window(self.id);
+            popup::forget(Owner::Win(self.id));
             // Web apps keep running on their own; quit with the last window.
-            if apps::is_empty() {
+            if cur() == 0 && apps::is_empty() {
                 quit_message_loop();
             }
         }
 
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
-            // DevTools windows first: one still open keeps CEF from shutting down.
-            // Each one's on_window_destroyed retries this close.
-            CLOSING.set(true);
-            let devtools = DEVTOOLS.with_borrow(|d| d.clone());
-            if !devtools.is_empty() {
-                devtools.iter().for_each(|w| w.close());
+            let id = self.id;
+            // "Close this window?" first; yes comes back here with `confirmed` set.
+            if unconfirmed().contains(&id) {
+                ui::run_on_ui(0, move || {
+                    // The question shows in the current window: this one.
+                    set_cur(id);
+                    ask_quit(vec![id]);
+                });
                 return 0;
+            }
+            // The last window takes the DevTools windows with it: one still open
+            // keeps CEF from shutting down. Each one's on_window_destroyed retries.
+            if win_ids() == [id] {
+                CLOSING.set(true);
+                let devtools = DEVTOOLS.with_borrow(|d| d.clone());
+                if !devtools.is_empty() {
+                    devtools.iter().for_each(|w| w.close());
+                    return 0;
+                }
             }
             // Ask every tab (runs beforeunload). Each closed tab hits on_tab_closed;
             // the last one closes the window again, which then passes.
             // The popup overlay too: a browser left open at shutdown trips a CHECK.
-            let mut hosts: Vec<_> = TABS.with_borrow(|t| t.iter().filter_map(|bv| bv.browser()?.host()).collect());
-            hosts.extend(popup::host(popup::Owner::Main));
+            let mut hosts: Vec<_> = with_win(id, |w| w.tabs.iter().filter_map(|bv| bv.browser()?.host()).collect()).unwrap_or_default();
+            hosts.extend(popup::host(Owner::Win(id)));
             hosts.iter().fold(1, |all, h| all & h.try_close_browser())
         }
 
@@ -728,10 +897,14 @@ wrap_browser_view_delegate! {
                 window_create_top_level(Some(&mut d));
                 return 1;
             }
-            // Popups (target=_blank, window.open) become tabs. Keeps window.opener,
-            // so OAuth "Sign in with X" popups still work.
+            // Popups (target=_blank, window.open) become tabs next to their opener.
+            // Keeps window.opener, so OAuth "Sign in with X" popups still work.
             let Some(bv) = popup_browser_view else { return 0 };
-            add(bv.clone(), NEXT_POPUP_BACKGROUND.replace(false));
+            let win = browser_view
+                .and_then(|v| v.browser())
+                .and_then(|mut b| index_of(&mut b))
+                .map_or_else(cur, |(win, _)| win);
+            add(win, bv.clone(), NEXT_POPUP_BACKGROUND.replace(false));
             1
         }
     }
@@ -784,12 +957,12 @@ wrap_display_handler! {
                 apps::set_title(b, title);
                 return;
             }
-            if browser.is_some_and(|b| is_active(b)) {
-                if let Some(w) = window() {
-                    w.set_title(title);
-                }
+            let Some(b) = browser else { return };
+            let Some((win, _)) = index_of(b) else { return };
+            if let Some(w) = shown_in(b).and_then(window_of) {
+                w.set_title(title);
             }
-            refresh_tabbar();
+            refresh_tabbar(win);
         }
 
         // Remembered for :app-install (launcher icon). Prefer png/svg over .ico.
@@ -805,18 +978,18 @@ wrap_display_handler! {
         fn on_address_change(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
             let main = frame.is_some_and(|f| f.is_main() != 0);
             if let Some(b) = browser.as_ref().filter(|b| main && apps::is_app(b)) {
-                ui::set_url_for(popup::Owner::App(b.identifier()), &url.map(|u| u.to_string()).unwrap_or_default());
+                ui::set_url_for(Owner::App(b.identifier()), &url.map(|u| u.to_string()).unwrap_or_default());
                 return;
             }
-            if main && browser.is_some_and(|b| is_active(b)) {
-                ui::set_url(&url.map(|u| u.to_string()).unwrap_or_default());
+            if let Some(win) = browser.filter(|_| main).and_then(shown_in) {
+                ui::set_url_for(Owner::Win(win), &url.map(|u| u.to_string()).unwrap_or_default());
             }
         }
 
         fn on_loading_progress_change(&self, browser: Option<&mut Browser>, progress: f64) {
-            if browser.is_some_and(|b| is_active(b)) {
-                PROGRESS.set((progress * 100.0) as u8);
-                refresh_right();
+            if let Some(win) = browser.and_then(shown_in) {
+                with_win(win, |w| w.progress = (progress * 100.0) as u8);
+                refresh_right(win);
             }
         }
 
@@ -897,7 +1070,7 @@ wrap_load_handler! {
             // A web app's command popup, ready before its first `:` (like the browser's).
             if let Some(id) = browser.as_ref().filter(|b| apps::is_app(b)).map(|b| b.identifier()) {
                 if let Some(w) = apps::window_of(id) {
-                    popup::init(&w, popup::Owner::App(id));
+                    popup::init(&w, Owner::App(id));
                     ui::app_bar(&w, id);
                 }
             }
@@ -908,12 +1081,13 @@ wrap_load_handler! {
             }
             let url = CefString::from(&f.url()).to_string();
             let title = browser
+                .as_ref()
                 .and_then(|b| b.host()?.visible_navigation_entry())
                 .map(|e| CefString::from(&e.title()).to_string())
                 .unwrap_or_default();
             commands::record_history(&url, &title);
-            if !ui::is_built() {
-                ui::run_on_ui(0, build_bar);
+            if let Some((win, _)) = browser.and_then(index_of).filter(|(win, _)| !ui::is_built(*win)) {
+                ui::run_on_ui(0, move || build_bar(win));
             }
         }
     }
@@ -939,8 +1113,9 @@ wrap_find_handler! {
                     // Chromium reports ordinal 0 for a fresh (incsearch) session though match 1 is active.
                     format!("{}/{count}", active_match_ordinal.max(1)) };
                 popup::set_count(&text);
-                FIND.with_borrow_mut(|f| *f = text);
-                refresh_right();
+                let win = cur();
+                with_win(win, |w| w.find = text);
+                refresh_right(win);
             }
         }
     }
@@ -1006,8 +1181,11 @@ wrap_keyboard_handler! {
             _is_keyboard_shortcut: Option<&mut i32>,
         ) -> i32 {
             let Some(e) = event else { return 0 };
-            // Keys act on the window they came from (a web app or the browser).
-            set_app_focus(browser.as_ref().and_then(|b| apps::view_of(b)));
+            // Keys act on the window they came from (a web app or a browser window).
+            match browser.as_ref().and_then(|b| apps::view_of(b)) {
+                Some(app) => set_app_focus(Some(app)),
+                None => set_cur(browser.and_then(index_of).map_or_else(cur, |(win, _)| win)),
+            }
             (e.type_ == KeyEventType::RAWKEYDOWN && vim::on_key(e)) as i32
         }
     }

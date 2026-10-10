@@ -11,6 +11,8 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Req {
     Open(String),
+    /// `--new-window [URL]`, or a second launch without a URL.
+    Window(String),
     App(String),
     /// `rembrowser ':tabopen x'`: an ex command for the running browser (scripts, WM keybinds).
     Cmd(String),
@@ -20,14 +22,18 @@ impl Req {
     fn line(&self) -> String {
         match self {
             Req::Open(u) => format!("open\t{u}\n"),
+            Req::Window(u) => format!("window\t{u}\n"),
             Req::App(u) => format!("app\t{u}\n"),
             Req::Cmd(c) => format!("cmd\t{c}\n"),
         }
     }
 
     fn parse(line: &str) -> Option<Req> {
-        match line.trim_end().split_once('\t')? {
+        // Only the newline: trim_end() would also eat the tab of an empty URL
+        // ("open\t\n", a bare `rembrowser`), and the request would be dropped.
+        match line.trim_end_matches(['\n', '\r']).split_once('\t')? {
             ("open", u) => Some(Req::Open(u.into())),
+            ("window", u) => Some(Req::Window(u.into())),
             ("app", u) => Some(Req::App(u.into())),
             ("cmd", c) => Some(Req::Cmd(c.into())),
             _ => None,
@@ -78,13 +84,19 @@ pub fn listen() {
 
 pub fn handle(req: Req) {
     match req {
-        Req::Open(url) => tabs::open_or_create(&url),
+        // Like Chrome: a URL becomes a tab in the window last used, a bare launch
+        // a new window.
+        Req::Open(url) if !url.is_empty() => tabs::open_or_create(&url),
+        Req::Open(url) | Req::Window(url) => {
+            tabs::create_window(crate::commands::resolve_url(&url))
+        }
         Req::App(url) => apps::open(&url),
         Req::Cmd(cmd) => crate::commands::exec(&cmd),
     }
 }
 
-/// argv → request: `--app=URL` / `--app URL` / `:command` / `URL` / nothing (home page).
+/// argv → request: `--app=URL` / `--app URL` / `--new-window [URL]` / `:command` /
+/// `URL` / nothing (home page).
 pub fn from_args(args: &[String]) -> Req {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -98,6 +110,9 @@ pub fn from_args(args: &[String]) -> Req {
     let arg = args.iter().find(|a| !a.starts_with("--"));
     match arg.and_then(|a| a.strip_prefix(':')) {
         Some(cmd) => Req::Cmd(cmd.into()),
+        None if args.iter().any(|a| a == "--new-window") => {
+            Req::Window(arg.cloned().unwrap_or_default())
+        }
         None => Req::Open(arg.cloned().unwrap_or_default()),
     }
 }
@@ -117,7 +132,10 @@ mod tests {
         assert_eq!(a(&["https://x.org"]), Req::Open("https://x.org".into()));
         assert_eq!(a(&[]), Req::Open(String::new()));
         assert_eq!(a(&[":tabopen x.org"]), Req::Cmd("tabopen x.org".into()));
-        let r = Req::App("https://a.b/c?d".into());
-        assert_eq!(Req::parse(&r.line()), Some(r));
+        assert_eq!(a(&["--new-window"]), Req::Window(String::new()));
+        assert_eq!(a(&["--new-window", "x.org"]), Req::Window("x.org".into()));
+        for r in [Req::App("https://a.b/c?d".into()), Req::Open(String::new()), Req::Window(String::new())] {
+            assert_eq!(Req::parse(&r.line()), Some(r));
+        }
     }
 }
