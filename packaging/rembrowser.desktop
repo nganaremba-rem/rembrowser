@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=rembrowser
+GenericName=Web Browser
+Comment=Vim-native, privacy-first Chromium browser
+Exec=rembrowser %U
+Icon=rembrowser
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=rembrowser
+StartupNotify=true
+Keywords=browser;web;vim;

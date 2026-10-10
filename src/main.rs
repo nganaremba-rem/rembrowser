@@ -7,17 +7,19 @@ mod adblock;
 mod commands;
 mod downloads;
 mod editor;
+mod home;
 mod keys;
 mod permissions;
+mod pickers;
 mod popup;
 mod privacy;
 mod tabs;
 mod ui;
+mod userscripts;
 mod vim;
+mod widevine;
 
 use cef::*;
-
-const HOME_URL: &str = "https://duckduckgo.com/?kae=d";
 
 fn data_dir() -> String {
     let base = std::env::var("XDG_DATA_HOME")
@@ -37,10 +39,11 @@ fn main() {
     // Browser process only from here on.
     let root = data_dir();
     let profile = format!("{root}/Default");
-    privacy::write_widevine_hint(&profile);
+    widevine::setup(&profile);
     adblock::start();
     // Before CEF reads its switches: the config can turn on dark-mode.
     commands::load_config();
+    userscripts::load();
 
     let url = std::env::args()
         .skip(1)

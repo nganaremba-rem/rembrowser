@@ -26,7 +26,13 @@ pub fn edit(text: &str, cmd: &str, done: impl FnOnce(String) + Send + 'static) {
     let mut c = commands::command("sh");
     c.arg("-c").arg(cmd);
     std::thread::spawn(move || {
-        let ok = c.status().is_ok_and(|s| s.success());
+        let status = c.status();
+        let ok = status.as_ref().is_ok_and(|s| s.success());
+        if !ok {
+            ui::run_on_ui(0, || {
+                ui::message("editor failed — check `set editor-command=... %s`", true)
+            });
+        }
         let saved = std::fs::metadata(&path).and_then(|m| m.modified()).ok() != before;
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);

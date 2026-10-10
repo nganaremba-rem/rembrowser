@@ -82,86 +82,134 @@ enum Act {
     Escape,
     ViewSource,
     Inspector,
+    Pip,
 }
 
 /// vimb's default normal-mode keys (`man vimb`), plus Ctrl-T/W/Tab for muscle memory.
-const BUILTINS: &[(&str, Act)] = &[
-    ("j", Act::Scroll(0, 1)),
-    ("k", Act::Scroll(0, -1)),
-    ("h", Act::Scroll(-1, 0)),
-    ("l", Act::Scroll(1, 0)),
-    ("<C-d>", Act::Pages(0.5)),
-    ("<C-u>", Act::Pages(-0.5)),
-    ("<C-f>", Act::Pages(1.0)),
-    ("<C-b>", Act::Pages(-1.0)),
-    ("<Space>", Act::Pages(0.9)),
-    ("gg", Act::Top),
-    ("G", Act::Bottom),
-    ("0", Act::Left),
-    ("^", Act::Left),
-    ("$", Act::Right),
-    ("f", Act::Hint(HintAct::Click, "all")),
-    ("F", Act::Hint(HintAct::BgTab, "links")),
-    (";o", Act::Hint(HintAct::Click, "all")),
-    (";t", Act::Hint(HintAct::BgTab, "links")),
-    (";y", Act::Hint(HintAct::Yank, "links")),
-    (";Y", Act::Hint(HintAct::YankText, "all")),
-    (";x", Act::Hint(HintAct::XCommand, "links")),
-    (";O", Act::Hint(HintAct::PromptOpen, "links")),
-    (";T", Act::Hint(HintAct::PromptTab, "links")),
-    (";i", Act::Hint(HintAct::OpenImage(false), "images")),
-    (";I", Act::Hint(HintAct::OpenImage(true), "images")),
-    (";s", Act::Hint(HintAct::Save, "links")),
-    (";k", Act::Hint(HintAct::Remove, "all")),
-    (";p", Act::Hint(HintAct::Queue(false), "links")),
-    (";P", Act::Hint(HintAct::Queue(true), "links")),
-    (";e", Act::Hint(HintAct::Edit, "editable")),
-    ("gf", Act::ViewSource),
-    ("gF", Act::Inspector),
-    ("o", Act::Prompt("open ")),
-    ("O", Act::PromptUrl("open ")),
-    ("t", Act::Prompt("tabopen ")),
-    ("T", Act::PromptUrl("tabopen ")),
-    (":", Act::Prompt("")),
-    ("/", Act::Search(true)),
-    ("?", Act::Search(false)),
-    ("n", Act::SearchNext(false)),
-    ("N", Act::SearchNext(true)),
-    ("y", Act::YankUrl),
-    ("p", Act::Paste(false)),
-    ("P", Act::Paste(true)),
-    ("r", Act::Reload),
-    ("R", Act::ReloadNoCache),
-    ("<C-c>", Act::Stop),
-    ("<C-o>", Act::Back),
-    ("<C-i>", Act::Forward),
-    ("u", Act::Reopen(false)),
-    ("U", Act::Reopen(true)),
-    ("gt", Act::TabNext),
-    ("gT", Act::TabPrev),
-    ("g0", Act::TabFirst),
-    ("g$", Act::TabLast),
-    ("<C-Tab>", Act::TabNext),
-    ("<C-S-Tab>", Act::TabPrev),
-    ("<C-t>", Act::NewTab),
-    ("<C-w>", Act::CloseTab),
-    ("gu", Act::UrlUp),
-    ("gU", Act::UrlRoot),
-    ("gh", Act::Home(false)),
-    ("gH", Act::Home(true)),
-    ("gi", Act::FocusInput),
-    ("i", Act::FocusInput),
-    ("<C-z>", Act::Pass),
-    ("zi", Act::Zoom(0.5)),
-    ("zo", Act::Zoom(-0.5)),
-    ("zz", Act::ZoomReset),
-    ("<C-q>", Act::QuitAll),
-    ("<Esc>", Act::Escape),
+/// (keys, action, description for the :keys cheatsheet)
+const BUILTINS: &[(&str, Act, &str)] = &[
+    ("j", Act::Scroll(0, 1), "scroll down"),
+    ("k", Act::Scroll(0, -1), "scroll up"),
+    ("h", Act::Scroll(-1, 0), "scroll left"),
+    ("l", Act::Scroll(1, 0), "scroll right"),
+    ("<C-d>", Act::Pages(0.5), "half page down"),
+    ("<C-u>", Act::Pages(-0.5), "half page up"),
+    ("<C-f>", Act::Pages(1.0), "page down"),
+    ("<C-b>", Act::Pages(-1.0), "page up"),
+    ("<Space>", Act::Pages(0.9), "page down"),
+    ("gg", Act::Top, "top of page"),
+    ("G", Act::Bottom, "bottom of page"),
+    ("0", Act::Left, "scroll far left"),
+    ("^", Act::Left, "scroll far left"),
+    ("$", Act::Right, "scroll far right"),
+    ("f", Act::Hint(HintAct::Click, "all"), "hint: open link"),
+    (
+        "F",
+        Act::Hint(HintAct::BgTab, "links"),
+        "hint: open in new tab",
+    ),
+    (";o", Act::Hint(HintAct::Click, "all"), "hint: open link"),
+    (
+        ";t",
+        Act::Hint(HintAct::BgTab, "links"),
+        "hint: open in new tab",
+    ),
+    (";y", Act::Hint(HintAct::Yank, "links"), "hint: yank link"),
+    (";Y", Act::Hint(HintAct::YankText, "all"), "hint: yank text"),
+    (
+        ";x",
+        Act::Hint(HintAct::XCommand, "links"),
+        "hint: run x-hint-command",
+    ),
+    (
+        ";O",
+        Act::Hint(HintAct::PromptOpen, "links"),
+        "hint: :open with link",
+    ),
+    (
+        ";T",
+        Act::Hint(HintAct::PromptTab, "links"),
+        "hint: :tabopen with link",
+    ),
+    (
+        ";i",
+        Act::Hint(HintAct::OpenImage(false), "images"),
+        "hint: open image",
+    ),
+    (
+        ";I",
+        Act::Hint(HintAct::OpenImage(true), "images"),
+        "hint: open image in new tab",
+    ),
+    (";s", Act::Hint(HintAct::Save, "links"), "hint: save link"),
+    (
+        ";k",
+        Act::Hint(HintAct::Remove, "all"),
+        "hint: remove element",
+    ),
+    (
+        ";p",
+        Act::Hint(HintAct::Queue(false), "links"),
+        "hint: read later",
+    ),
+    (
+        ";P",
+        Act::Hint(HintAct::Queue(true), "links"),
+        "hint: read later (front)",
+    ),
+    (
+        ";e",
+        Act::Hint(HintAct::Edit, "editable"),
+        "hint: edit field in editor",
+    ),
+    ("gf", Act::ViewSource, "view page source"),
+    ("gF", Act::Inspector, "DevTools"),
+    ("gp", Act::Pip, "picture-in-picture (main video)"),
+    ("o", Act::Prompt("open "), ":open"),
+    ("O", Act::PromptUrl("open "), ":open with current URL"),
+    ("t", Act::Prompt("tabopen "), ":tabopen"),
+    ("T", Act::PromptUrl("tabopen "), ":tabopen with current URL"),
+    (":", Act::Prompt(""), "command line"),
+    ("/", Act::Search(true), "search forward"),
+    ("?", Act::Search(false), "search backward"),
+    ("n", Act::SearchNext(false), "next match"),
+    ("N", Act::SearchNext(true), "previous match"),
+    ("y", Act::YankUrl, "yank page URL"),
+    ("p", Act::Paste(false), "open clipboard URL"),
+    ("P", Act::Paste(true), "open clipboard URL in new tab"),
+    ("r", Act::Reload, "reload"),
+    ("R", Act::ReloadNoCache, "reload, no cache"),
+    ("<C-c>", Act::Stop, "stop loading"),
+    ("<C-o>", Act::Back, "back"),
+    ("<C-i>", Act::Forward, "forward"),
+    ("u", Act::Reopen(false), "reopen closed tab"),
+    ("U", Act::Reopen(true), "reopen closed in new tab"),
+    ("gt", Act::TabNext, "next tab"),
+    ("gT", Act::TabPrev, "previous tab"),
+    ("g0", Act::TabFirst, "first tab"),
+    ("g$", Act::TabLast, "last tab"),
+    ("<C-Tab>", Act::TabNext, "next tab"),
+    ("<C-S-Tab>", Act::TabPrev, "previous tab"),
+    ("<C-t>", Act::NewTab, "new tab"),
+    ("<C-w>", Act::CloseTab, "close tab"),
+    ("gu", Act::UrlUp, "go up one URL level"),
+    ("gU", Act::UrlRoot, "go to domain root"),
+    ("gh", Act::Home(false), "home page"),
+    ("gH", Act::Home(true), "home page in new tab"),
+    ("gi", Act::FocusInput, "focus first input"),
+    ("i", Act::FocusInput, "focus input"),
+    ("<C-z>", Act::Pass, "pass-through mode"),
+    ("zi", Act::Zoom(0.5), "zoom in"),
+    ("zo", Act::Zoom(-0.5), "zoom out"),
+    ("zz", Act::ZoomReset, "reset zoom"),
+    ("<C-q>", Act::QuitAll, "quit"),
+    ("<Esc>", Act::Escape, "normal mode"),
 ];
 
 struct Map {
     rhs: String,
     noremap: bool,
+    desc: Option<String>,
 }
 
 struct Vim {
@@ -184,7 +232,7 @@ thread_local! {
         pending: Vec::new(),
         count: None,
         generation: 0,
-        builtins: BUILTINS.iter().map(|(k, a)| (keys::parse(k), *a)).collect(),
+        builtins: BUILTINS.iter().map(|(k, a, _)| (keys::parse(k), *a)).collect(),
         maps: HashMap::new(),
         hint_act: HintAct::Click,
         last_hint: String::new(),
@@ -196,7 +244,7 @@ thread_local! {
 /// vim's timeoutlen: how long an ambiguous prefix (exact map + longer map) waits.
 const TIMEOUT_MS: i64 = 1000;
 
-pub fn map(mode: &str, lhs: &str, rhs: &str, noremap: bool) {
+pub fn map(mode: &str, lhs: &str, rhs: &str, noremap: bool, desc: Option<String>) {
     let m = mode.chars().next().unwrap_or('n');
     VIM.with_borrow_mut(|v| {
         v.maps.entry(m).or_default().insert(
@@ -204,9 +252,30 @@ pub fn map(mode: &str, lhs: &str, rhs: &str, noremap: bool) {
             Map {
                 rhs: rhs.into(),
                 noremap,
+                desc,
             },
         );
     });
+}
+
+/// (keys, description) for the :keys cheatsheet: normal-mode maps, then the
+/// built-ins they don't shadow.
+pub fn cheatsheet() -> Vec<(String, String)> {
+    VIM.with_borrow(|v| {
+        let maps = v.maps.get(&'n');
+        let mut out: Vec<(String, String)> = maps
+            .into_iter()
+            .flatten()
+            .map(|(k, m)| (k.concat(), m.desc.clone().unwrap_or_else(|| m.rhs.clone())))
+            .collect();
+        out.sort();
+        for (k, _, d) in BUILTINS {
+            if !maps.is_some_and(|m| m.contains_key(&keys::parse(k))) {
+                out.push((k.to_string(), d.to_string()));
+            }
+        }
+        out
+    })
 }
 
 pub fn unmap(mode: &str, lhs: &str) {
@@ -260,11 +329,13 @@ pub fn on_key(e: &KeyEvent) -> bool {
         );
     }
     ui::clear_message();
-    let editable = e.focus_on_editable_field != 0;
     let mode = VIM.with_borrow_mut(|v| {
         v.generation += 1;
         v.mode
     });
+    // CEF's flag misses autofocused fields (no focus change after load); page.js's
+    // focus report (mode Insert) catches those.
+    let editable = e.focus_on_editable_field != 0 || mode == Mode::Insert;
     match mode {
         Mode::Pass => {
             if k == "<Esc>" {
@@ -519,6 +590,7 @@ fn act(a: Act, count: u32) {
         Act::Hint(h, filter) => start_hints(h, filter),
         Act::ViewSource => tabs::open(&format!("view-source:{}", tabs::active_url()), false),
         Act::Inspector => ui::run_on_ui(0, tabs::devtools),
+        Act::Pip => tabs::pip(),
         Act::Prompt(p) => popup::open(CmdKind::Ex, p),
         Act::PromptUrl(p) => popup::open(CmdKind::Ex, &format!("{p}{}", tabs::active_url())),
         Act::Search(forward) => popup::open(CmdKind::Search { forward }, ""),
@@ -535,7 +607,15 @@ fn act(a: Act, count: u32) {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
             match clip {
                 Ok(s) if !s.is_empty() => commands::open(&s, new_tab),
-                _ => ui::message("clipboard is empty", true),
+                Ok(_) => ui::message("clipboard is empty", true),
+                // No wl-clipboard: ask the page's clipboard API (answer: "paste" message).
+                Err(_) => {
+                    PASTE_WANTED.set(Some((std::time::Instant::now(), new_tab)));
+                    tabs::js_gesture(
+                        "navigator.clipboard.readText().then((t) => console.debug('\\x01rem\\tpaste\\t' + t.replace(/[\\t\\n]/g, ' ')), \
+                         () => console.debug('\\x01rem\\tpaste\\t'))",
+                    );
+                }
             }
         }
         Act::Reload => tabs::with_active(|b| b.reload()),
@@ -573,11 +653,27 @@ pub fn zoom(delta: f64) {
 }
 
 fn yank(text: &str) {
-    let child = commands::command("wl-copy").arg("--").arg(text).spawn();
-    match child {
-        Ok(_) => ui::message(&format!("yanked {text}"), false),
-        Err(e) => ui::message(&format!("wl-copy: {e}"), true),
+    if commands::command("wl-copy")
+        .arg("--")
+        .arg(text)
+        .spawn()
+        .is_err()
+    {
+        // No wl-clipboard: copy from inside the page, as a user gesture (no permission
+        // needed, works on http pages too), then give focus back.
+        tabs::js_gesture(&format!(
+            "((t) => {{ const a = document.activeElement, d = document.createElement('textarea'); d.value = t; \
+             d.style.cssText = 'position:fixed;opacity:0'; document.documentElement.append(d); d.select(); \
+             document.execCommand('copy'); d.remove(); a?.focus?.(); }})({})",
+            popup::js_str(text)
+        ));
     }
+    ui::message(&format!("yanked {text}"), false);
+}
+
+thread_local! {
+    /// A `p`/`P` waiting for the page's clipboard answer (only without wl-paste).
+    static PASTE_WANTED: std::cell::Cell<Option<(std::time::Instant, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// `https://a.com/b/c/?q` → `https://a.com/b/`.
@@ -687,6 +783,15 @@ pub fn on_page_msg(fields: &[&str]) {
                 });
             }
         }
+        // Only the answer to our own paste request (a page can't open tabs this way).
+        ["paste", text] => match PASTE_WANTED.take() {
+            Some((at, new_tab)) if at.elapsed().as_secs() < 30 && !text.trim().is_empty() => {
+                commands::open(text.trim(), new_tab)
+            }
+            Some(_) => ui::message("clipboard is empty", true),
+            None => {}
+        },
+        ["pip-none"] => ui::message("no video on this page", true),
         ["edit-none"] => ui::message("no text field focused", true),
         ["edit-text", text] => edit_field(editor::percent_decode(text)),
         ["hint-none"] if VIM.with_borrow(|v| v.mode) == Mode::Hint => {
@@ -760,8 +865,8 @@ mod tests {
 
     #[test]
     fn user_map_beats_builtin_and_prefixes_wait() {
-        map("n", "d", ":q<CR>", true);
-        map("n", "<Space>ma", ":bma<CR>", true);
+        map("n", "d", ":q<CR>", true, None);
+        map("n", "<Space>ma", ":bma<CR>", true, None);
         VIM.with_borrow(|v| {
             assert!(matches!(
                 lookup(v, &keys::parse("d"), true),

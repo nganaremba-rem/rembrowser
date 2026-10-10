@@ -24,9 +24,9 @@ k ';k'; k a; sleep 0.3
 check ";k removes element"      "$(ev 'document.querySelectorAll("a").length')" 0
 
 k ' ma'; sleep 1.5
-check "<Space>ma harpoon add (vimb-pick)" "$(tail -1 "$X/vimb/harpoon" | cut -f1)" "https://example.com/"
+check "<Space>ma harpoon add (native)" "$(tail -1 "$X/vimb/harpoon" | cut -f1)" "https://example.com/"
 k ' 1'; sleep 2.5
-check "<Space>1 harpoon jump (vimb-pick)" "$(url)" "https://example.org/"
+check "<Space>1 harpoon jump (native)" "$(url)" "https://example.org/"
 k ' .'; sleep 0.3
 check "<Space>. qpush"          "$(tail -1 "$X/vimb/queue")" "https://example.org/"
 
@@ -47,7 +47,7 @@ check ",d force-dark off"       "$(ev '!!document.getElementById("vimb-dark")')"
 
 nav https://example.com
 k ' s.'; sleep 1; wtype 'Example Org'; sleep 0.5; k -k Return; sleep 2.5
-check "<Space>s. history picker (fuzzel)" "$(url)" "https://example.org/"
+check "<Space>s. history picker (popup)" "$(url)" "https://example.org/"
 k ' sk'; sleep 1; wtype 'force-dark'; sleep 0.5; k -k Return; sleep 1
 check "<Space>sk cheatsheet runs ,d"   "$(ev '!!document.getElementById("vimb-dark")')" true
 

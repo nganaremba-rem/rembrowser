@@ -149,30 +149,3 @@ pub fn apply_prefs() {
         }
     }
 }
-
-/// Chromium on Linux loads a component-updated CDM from this hint file at startup.
-/// Point it at an installed Widevine (Chrome's is newest; Chromium's as fallback).
-pub fn write_widevine_hint(profile: &str) {
-    const CDMS: &[&str] = &[
-        "/opt/google/chrome/WidevineCdm",
-        "/usr/lib/chromium/WidevineCdm",
-    ];
-    let Some(cdm) = CDMS
-        .iter()
-        .find(|p| std::path::Path::new(p).join("manifest.json").exists())
-    else {
-        eprintln!(
-            "rembrowser: no Widevine CDM found (install google-chrome); DRM sites won't play"
-        );
-        return;
-    };
-    let dir = format!("{profile}/WidevineCdm");
-    let hint = format!(r#"{{"Path":"{cdm}"}}"#);
-    let path = format!("{dir}/latest-component-updated-widevine-cdm");
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(hint.as_str()) {
-        let _ = std::fs::create_dir_all(&dir);
-        if let Err(e) = std::fs::write(&path, hint) {
-            eprintln!("rembrowser: widevine hint: {e}");
-        }
-    }
-}

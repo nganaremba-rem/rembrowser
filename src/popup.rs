@@ -27,8 +27,11 @@ struct Pop {
     pending: Option<String>,
 }
 
+type OnPick = Box<dyn FnOnce(usize)>;
+
 thread_local! {
     static POP: RefCell<Option<Pop>> = const { RefCell::new(None) };
+    static ON_PICK: RefCell<Option<OnPick>> = const { RefCell::new(None) };
     static HISTORY: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -127,7 +130,7 @@ fn js_list<T>(xs: &[T], f: impl Fn(&T) -> String) -> String {
 }
 
 /// History (newest first, deduped) then bookmarks, from vimb's data files.
-fn urls() -> Vec<(&'static str, String, String)> {
+pub fn urls() -> Vec<(&'static str, String, String)> {
     let read = |f: &str| std::fs::read_to_string(commands::data_dir().join(f)).unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -205,6 +208,23 @@ fn state_json(kind: CmdKind, text: &str) -> String {
 /// dispatched, and Views would hand that same press to the newly focused popup.
 pub fn open(kind: CmdKind, text: &str) {
     let js = format!("rem.open({})", state_json(kind, text));
+    ui::run_on_ui(0, move || show(js));
+}
+
+/// Fuzzy picker: rows are (kind icon, title, detail); `on_pick` gets the row index.
+pub fn pick(title: &str, rows: &[(&str, String, String)], on_pick: impl FnOnce(usize) + 'static) {
+    if rows.is_empty() {
+        ui::message(&format!("{title}: nothing to pick"), true);
+        return;
+    }
+    ON_PICK.with_borrow_mut(|p| *p = Some(Box::new(on_pick)));
+    let items = js_list(rows, |(k, t, u)| {
+        format!("[{},{},{}]", js_str(k), js_str(t), js_str(u))
+    });
+    let js = format!(
+        "rem.open({{kind:'pick',title:{},items:{items},text:'',history:[]}})",
+        js_str(title)
+    );
     ui::run_on_ui(0, move || show(js));
 }
 
@@ -329,6 +349,13 @@ fn on_message(fields: &[&str]) {
                 });
             }
             vim::cmdline_submit(kind, text);
+        }
+        ["picked", i] => {
+            hide();
+            let cb = ON_PICK.with_borrow_mut(Option::take);
+            if let (Some(cb), Ok(i)) = (cb, i.parse::<usize>()) {
+                cb(i);
+            }
         }
         ["cancel", kind] => {
             hide();

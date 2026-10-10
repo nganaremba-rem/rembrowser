@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#cba6f7"/><stop offset="1" stop-color="#89b4fa"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="#1e1e2e"/>
+  <rect x="6.5" y="6.5" width="115" height="115" rx="27.5" fill="none" stroke="url(#g)" stroke-opacity=".45"/>
+  <!-- a cursor-block "r" on a prompt: vim-native browser -->
+  <path d="M34 44 L54 64 L34 84" fill="none" stroke="url(#g)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M66 84 V60 Q66 48 80 48 H90" fill="none" stroke="url(#g)" stroke-width="10" stroke-linecap="round"/>
+  <rect x="84" y="78" width="14" height="10" rx="2" fill="#a6e3a1"/>
+</svg>

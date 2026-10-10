@@ -241,6 +241,17 @@ pub mod hook {
                     ReturnValue::CONTINUE
                 }
             }
+
+            // The homescreen is served from here, before any network lookup.
+            fn resource_handler(
+                &self,
+                _browser: Option<&mut Browser>,
+                _frame: Option<&mut Frame>,
+                request: Option<&mut Request>,
+            ) -> Option<ResourceHandler> {
+                let url = CefString::from(&request?.url()).to_string();
+                crate::home::is_home(&url).then(crate::home::handler)
+            }
         }
     }
 

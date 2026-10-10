@@ -1,7 +1,7 @@
 //! Ex commands (vimb names) + options. The config file is just ex commands, so it
 //! runs through the same `exec` as the `:` command line.
 
-use crate::{tabs, ui, vim};
+use crate::{pickers, tabs, ui, vim};
 use cef::ImplBrowser;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ fn home() -> String {
     std::env::var("HOME").unwrap_or_default()
 }
 
-fn expand_tilde(p: &str) -> PathBuf {
+pub fn expand_tilde(p: &str) -> PathBuf {
     match p.strip_prefix("~/") {
         Some(rest) => PathBuf::from(home()).join(rest),
         None => PathBuf::from(p),
@@ -65,20 +65,40 @@ pub fn load_config() {
     } else {
         cfg.join("vimb/config")
     };
-    source(&path);
+    source_text(include_str!("default.config"));
+    if path.exists() {
+        source(&path);
+    }
 }
 
 fn source(path: &std::path::Path) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        eprintln!("rembrowser: can't read {}", path.display());
-        return;
-    };
+    match std::fs::read_to_string(path) {
+        Ok(text) => source_text(&text),
+        // Startup config runs before CEF exists: no UI to show it in yet.
+        Err(_) if !ui::is_built() => eprintln!("rembrowser: can't read {}", path.display()),
+        Err(_) => ui::message(&format!("can't read {}", path.display()), true),
+    }
+}
+
+fn source_text(text: &str) {
+    // `#:` above a map = its description in the :keys cheatsheet (vimb-pick format).
+    let mut desc = None;
     for line in text.lines() {
         let line = line.trim();
-        if !line.is_empty() && !line.starts_with('#') && !line.starts_with('"') {
+        if let Some(d) = line.strip_prefix("#:") {
+            desc = Some(d.trim().to_string());
+        } else if line.is_empty() || line.starts_with('#') || line.starts_with('"') {
+            desc = None;
+        } else {
+            MAP_DESC.set(desc.take());
             exec(line);
         }
     }
+    MAP_DESC.set(None);
+}
+
+thread_local! {
+    static MAP_DESC: std::cell::Cell<Option<String>> = const { std::cell::Cell::new(None) };
 }
 
 const MAP_CMDS: &[&str] = &[
@@ -128,7 +148,22 @@ fn exec_one(line: &str) {
             Ok(n) if n > 0 => tabs::select(n - 1),
             _ => ui::message("usage: :buffer N", true),
         },
-        "tabs" => tab_picker(),
+        "tabs" | "ls" => pickers::tabs(),
+        "history" | "hist" => pickers::history(),
+        "bookmarks" | "bmarks" => pickers::bookmarks(),
+        "pins" => pickers::pins(),
+        "pin" => pickers::pin(args),
+        "jump" => pickers::jump(args),
+        "keys" | "map" => pickers::keys(),
+        "downloads" | "dl" => crate::downloads::picker(),
+        "pip" => tabs::pip(),
+        "userscripts" => ui::message(
+            &format!(
+                "{} userscript(s) from ~/.config/rembrowser/userscripts",
+                crate::userscripts::load()
+            ),
+            false,
+        ),
         "set" => set(args),
         "nmap" | "nnoremap" | "imap" | "inoremap" | "cmap" | "cnoremap" => map(name, args),
         "nunmap" | "iunmap" | "cunmap" => vim::unmap(&name[..1], args),
@@ -160,7 +195,13 @@ fn map(cmd: &str, args: &str) {
         ui::message(&format!("usage: {cmd} LHS RHS"), true);
         return;
     };
-    vim::map(&cmd[..1], lhs, rhs.trim_start(), cmd.contains("noremap"));
+    vim::map(
+        &cmd[..1],
+        lhs,
+        rhs.trim_start(),
+        cmd.contains("noremap"),
+        MAP_DESC.take(),
+    );
 }
 
 /// `set k=v`, `set k!` (toggle), `set k` (on), `set nok` (off).
@@ -191,10 +232,7 @@ fn set(args: &str) {
 }
 
 fn default_on(key: &str) -> bool {
-    matches!(
-        key,
-        "status-bar" | "tab-bar" | "smooth-scrolling" | "incsearch"
-    )
+    matches!(key, "smooth-scrolling" | "incsearch")
 }
 
 /// Options rembrowser acts on, with their current value (for :set completion).
@@ -233,7 +271,7 @@ pub fn settings() -> Vec<(String, String)> {
 pub fn resolve_url(arg: &str) -> String {
     let arg = arg.trim();
     if arg.is_empty() {
-        return opt("home-page").unwrap_or_else(|| crate::HOME_URL.into());
+        return crate::home::home_page();
     }
     if arg.contains("://")
         || ["about:", "data:", "file:", "chrome:", "view-source:"]
@@ -377,43 +415,6 @@ fn shellex(cmd: &str) {
     });
 }
 
-/// Fuzzel tab picker (Space Space): titles in, index out.
-fn tab_picker() {
-    let rows: Vec<String> = tabs::titles()
-        .into_iter()
-        .enumerate()
-        .map(|(i, (t, u))| {
-            format!(
-                "{}  {}   —   {u}",
-                i + 1,
-                if t.is_empty() { &u } else { &t }
-            )
-        })
-        .collect();
-    std::thread::spawn(move || {
-        let child = command("fuzzel")
-            .args(["--dmenu", "--index", "--width", "90", "--prompt", "tabs ❯ "])
-            .arg("--lines")
-            .arg(rows.len().clamp(1, 15).to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn();
-        let Ok(mut child) = child else { return };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(rows.join("\n").as_bytes());
-        }
-        let pick = child.wait_with_output().ok().and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<usize>()
-                .ok()
-        });
-        if let Some(i) = pick {
-            ui::run_on_ui(0, move || tabs::select(i));
-        }
-    });
-}
-
 fn append_line(file: &str, line: &str) {
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -428,7 +429,7 @@ fn append_line(file: &str, line: &str) {
 
 /// vimb history format: "uri\ttitle", oldest first.
 pub fn record_history(url: &str, title: &str) {
-    if url.starts_with("http") {
+    if url.starts_with("http") && !crate::home::is_home(url) {
         append_line("history", &format!("{url}\t{}", title.replace('\t', " ")));
     }
 }

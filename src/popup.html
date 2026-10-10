@@ -48,7 +48,7 @@
   .row .u { margin-left: auto; padding-left: 16px; color: var(--overlay0); overflow: hidden; text-overflow: ellipsis; font-size: 13px; flex: 0 1 auto; max-width: 55%; }
   .row b { color: var(--peach); font-weight: bold; }
   .k.history { color: var(--mauve); } .k.bookmark { color: var(--yellow); } .k.tab { color: var(--teal); }
-  .k.command { color: var(--blue); } .k.setting { color: var(--green); } .k.cmdhist { color: var(--overlay0); }
+  .k.command, .k.key { color: var(--blue); } .k.pin { color: var(--peach); } .k.download { color: var(--green); } .k.setting { color: var(--green); } .k.cmdhist { color: var(--overlay0); }
   #foot { display: flex; gap: 14px; justify-content: flex-end; padding: 6px 10px 2px; color: var(--overlay0); font-size: 12px; }
   #foot kbd { color: var(--subtext); font: inherit; background: var(--surface0); padding: 0 5px; border-radius: 4px; }
   #prompt { padding: 0 14px 14px; }
@@ -90,7 +90,7 @@ const MODES = {
   searchb:  { title: ' Search ↑', accent: '--yellow' },
   prompt:   { title: '󰒃 Permission', accent: '--peach' },
 };
-const KIND_ICON = { history: '󰋚', bookmark: '󰃀', tab: '󰓩', command: '', setting: '', cmdhist: '󰘳' };
+const KIND_ICON = { history: '󰋚', bookmark: '󰃀', tab: '󰓩', pin: '󰐃', key: '', download: '', command: '', setting: '', cmdhist: '󰘳' };
 const OPEN_CMDS = ['open', 'o', 'tabopen', 't', 'tabnew'];
 
 let S = null;         // state from Rust
@@ -101,6 +101,7 @@ let hist = -1;        // position in command history (Up/Down)
 let regPending = false;
 
 function mode() {
+  if (S.kind === 'pick') return 'pick';
   if (S.kind === 'search') return S.forward ? 'searchf' : 'searchb';
   if (S.kind === 'prompt') return 'prompt';
   const c = input.value.trimStart().split(/\s/)[0];
@@ -114,7 +115,7 @@ function mode() {
 }
 
 function paintMode() {
-  const m = MODES[mode()];
+  const m = mode() === 'pick' ? { title: S.title, accent: '--mauve' } : MODES[mode()];
   document.documentElement.style.setProperty('--accent', `var(${m.accent})`);
   $('title').textContent = m.title;
 }
@@ -154,6 +155,8 @@ function candidates(value) {
   const sp = value.indexOf(' ');
   const cmd = sp < 0 ? value : value.slice(0, sp);
   const arg = sp < 0 ? '' : value.slice(sp + 1);
+  // Pickers (:tabs, :history, :keys, ...): filter Rust's rows; the pick returns the index.
+  if (S.kind === 'pick') return rank(value, S.items.map(([kind, t, u], i) => ({ kind, t, u, i, fill: value })), (x) => x.t + ' ' + x.u, 300);
   if (S.kind !== 'ex') return [];
   if (sp < 0) {
     if (!cmd) return [];
@@ -196,7 +199,7 @@ function renderMenu() {
     // Highlight positions past the title belong to the url part ("title url").
     u.append(it.kind === 'command' || it.kind === 'setting' || it.kind === 'cmdhist' ? it.u : hl(it.u, it.pos || [], it.t.length + 1));
     row.append(k, t, u);
-    row.onmousedown = (e) => { e.preventDefault(); sel = n; input.value = it.fill; submit(); };
+    row.onmousedown = (e) => { e.preventDefault(); sel = n; if (S.kind !== 'pick') input.value = it.fill; submit(); };
     list.append(row);
   });
   menu.classList.toggle('hidden', items.length === 0);
@@ -217,7 +220,7 @@ function move(d) {
   sel = sel + d;
   if (sel >= items.length) sel = -1;
   if (sel < -1) sel = items.length - 1;
-  input.value = sel < 0 ? typed : items[sel].fill;
+  if (S.kind !== 'pick') input.value = sel < 0 ? typed : items[sel].fill;
   paintMode();
   renderMenu();
 }
@@ -231,7 +234,12 @@ function histMove(d) {
   paintMode();
 }
 
-function submit() { const v = input.value; hide(); send('submit', S.kind, S.forward ? 1 : 0, v); }
+function submit() {
+  const v = input.value;
+  hide();
+  if (S.kind === 'pick') send('picked', items[Math.max(sel, 0)]?.i ?? -1);
+  else send('submit', S.kind, S.forward ? 1 : 0, v);
+}
 function cancel() { hide(); send('cancel', S.kind); }
 function hide() { wrap.classList.add('hidden'); }
 

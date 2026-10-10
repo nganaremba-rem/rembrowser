@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>New Tab</title>
+<style>
+  :root {
+    --base: #1e1e2e; --mantle: #181825; --crust: #11111b;
+    --surface0: #313244; --surface1: #45475a; --overlay0: #6c7086;
+    --text: #cdd6f4; --subtext: #a6adc8;
+    --blue: #89b4fa; --mauve: #cba6f7; --peach: #fab387; --green: #a6e3a1; --red: #f38ba8;
+    --mono: "CaskaydiaMono Nerd Font Mono", "CaskaydiaCove Nerd Font Mono", ui-monospace, monospace;
+    --sans: Inter, "Noto Sans", system-ui, sans-serif;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: radial-gradient(1200px 600px at 50% -10%, #2a2440 0%, transparent 60%),
+                radial-gradient(900px 500px at 100% 110%, #1d2b3a 0%, transparent 60%), var(--crust);
+    color: var(--text); font: 16px/1.5 var(--sans);
+    display: flex; flex-direction: column; align-items: center; padding: 14vh 16px 40px;
+  }
+  #clock { font: 300 72px/1 var(--sans); letter-spacing: -2px; }
+  #date { color: var(--subtext); margin: 8px 0 34px; font-size: 15px; }
+  form { width: min(640px, 100%); position: relative; }
+  #q {
+    width: 100%; padding: 15px 20px 15px 48px; border-radius: 14px; border: 1px solid var(--surface0);
+    background: color-mix(in srgb, var(--mantle) 85%, transparent); color: var(--text);
+    font: 17px var(--sans); outline: none; transition: border-color .15s, box-shadow .15s;
+  }
+  #q:focus { border-color: var(--mauve); box-shadow: 0 0 0 4px #cba6f722; }
+  #q::placeholder { color: var(--overlay0); }
+  form svg { position: absolute; left: 17px; top: 50%; translate: 0 -50%; color: var(--overlay0); }
+  #hint { color: var(--overlay0); font: 12px var(--mono); margin-top: 10px; text-align: center; }
+  #hint kbd { color: var(--subtext); background: var(--surface0); border-radius: 4px; padding: 0 5px; font: inherit; }
+  #tiles {
+    display: grid; grid-template-columns: repeat(auto-fill, 112px); gap: 14px; justify-content: center;
+    width: min(760px, 100%); margin-top: 44px;
+  }
+  .tile {
+    position: relative; height: 104px; border-radius: 16px; background: #1e1e2ecc; border: 1px solid var(--surface0);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    color: var(--text); text-decoration: none; font-size: 13px; transition: transform .12s, border-color .12s, background .12s;
+  }
+  .tile:hover, .tile:focus-visible { transform: translateY(-2px); border-color: var(--mauve); background: var(--base); outline: none; }
+  .icon {
+    width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center;
+    font: 700 18px var(--sans); color: var(--crust); overflow: hidden;
+  }
+  .icon img { width: 28px; height: 28px; }
+  .name { max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .x {
+    position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border-radius: 50%; border: 0;
+    background: var(--surface0); color: var(--subtext); font-size: 14px; line-height: 22px; cursor: pointer;
+    opacity: 0; transition: opacity .12s;
+  }
+  .tile:hover .x { opacity: 1; }
+  .x:hover { background: var(--red); color: var(--crust); }
+  .add { border-style: dashed; color: var(--overlay0); cursor: pointer; background: transparent; font: inherit; }
+  .add .icon { background: var(--surface0); color: var(--subtext); font-weight: 400; font-size: 24px; }
+  dialog {
+    background: var(--base); color: var(--text); border: 1px solid var(--mauve); border-radius: 16px;
+    padding: 22px; width: min(380px, 92vw);
+  }
+  dialog::backdrop { background: #11111bb0; backdrop-filter: blur(3px); }
+  dialog h2 { font: 600 16px var(--sans); margin-bottom: 14px; }
+  dialog input {
+    width: 100%; margin-bottom: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--surface1);
+    background: var(--mantle); color: var(--text); font: 14px var(--sans); outline: none;
+  }
+  dialog input:focus { border-color: var(--mauve); }
+  .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+  .row button { border-radius: 10px; border: 0; padding: 8px 14px; font: 600 13px var(--sans); cursor: pointer; }
+  .ok { background: var(--mauve); color: var(--crust); }
+  .no { background: var(--surface0); color: var(--text); }
+</style>
+</head>
+<body>
+  <div id="clock"></div>
+  <div id="date"></div>
+  <form id="f" autocomplete="off">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    <input id="q" placeholder="Search or type a URL" autofocus spellcheck="false">
+  </form>
+  <div id="hint"><kbd>Esc</kbd> vim keys · <kbd>f</kbd> hint a tile · shortcuts like <kbd>aw niri</kbd> work here</div>
+  <div id="tiles"></div>
+  <dialog id="dlg">
+    <form method="dialog" id="addf">
+      <h2>Add a site</h2>
+      <input id="aname" placeholder="Name (e.g. daily.dev)" required>
+      <input id="aurl" placeholder="URL (e.g. app.daily.dev)" required>
+      <div class="row"><button class="no" value="cancel" formnovalidate>Cancel</button><button class="ok" value="add">Add</button></div>
+    </form>
+  </dialog>
+<script>
+'use strict';
+// Tiles live in this origin's localStorage (rembrowser serves this page itself).
+const DEFAULTS = [
+  ['DuckDuckGo', 'https://duckduckgo.com/'], ['Google', 'https://www.google.com/'],
+  ['daily.dev', 'https://app.daily.dev/'], ['GitHub', 'https://github.com/'],
+  ['YouTube', 'https://www.youtube.com/'], ['Arch Wiki', 'https://wiki.archlinux.org/'],
+];
+const COLORS = ['#cba6f7', '#89b4fa', '#a6e3a1', '#fab387', '#f5c2e7', '#94e2d5', '#f9e2af', '#f38ba8'];
+const load = () => { try { return JSON.parse(localStorage.tiles); } catch { return DEFAULTS; } };
+const save = (t) => { localStorage.tiles = JSON.stringify(t); };
+let tiles = load();
+
+const $ = (id) => document.getElementById(id);
+const normal = (u) => (/^[a-z]+:\/\//i.test(u) ? u : 'https://' + u);
+
+function render() {
+  const box = $('tiles');
+  box.replaceChildren();
+  tiles.forEach(([name, url], i) => {
+    const a = document.createElement('a');
+    a.className = 'tile'; a.href = url; a.title = url;
+    const icon = document.createElement('div');
+    icon.className = 'icon';
+    icon.style.background = COLORS[[...name].reduce((h, c) => h + c.charCodeAt(0), 0) % COLORS.length];
+    const letter = () => { icon.replaceChildren(name.trim()[0]?.toUpperCase() ?? '?'); };
+    const img = new Image();
+    img.onload = () => { icon.style.background = '#cdd6f4'; icon.replaceChildren(img); };
+    img.onerror = letter;
+    letter();
+    try { img.src = new URL('/favicon.ico', url).href; } catch {}
+    const label = document.createElement('div');
+    label.className = 'name'; label.textContent = name;
+    const x = document.createElement('button');
+    x.className = 'x'; x.textContent = '×'; x.title = 'Remove';
+    x.onclick = (e) => { e.preventDefault(); tiles.splice(i, 1); save(tiles); render(); };
+    a.append(icon, label, x);
+    box.append(a);
+  });
+  const add = document.createElement('button');
+  add.className = 'tile add';
+  add.innerHTML = '<div class="icon">+</div><div class="name">Add site</div>';
+  add.onclick = () => { $('addf').reset(); $('dlg').showModal(); };
+  box.append(add);
+}
+
+$('dlg').addEventListener('close', () => {
+  if ($('dlg').returnValue !== 'add') return;
+  const name = $('aname').value.trim(), url = $('aurl').value.trim();
+  if (name && url) { tiles.push([name, normal(url)]); save(tiles); render(); }
+});
+
+// The search box goes through rembrowser's own :open (shortcuts, search engine).
+$('f').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const q = $('q').value.trim();
+  if (q) console.debug('\x01rem\thome-open\t' + q.replace(/[\t\n]/g, ' '));
+});
+
+function tick() {
+  const d = new Date();
+  $('clock').textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  $('date').textContent = d.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' });
+}
+tick(); setInterval(tick, 10000);
+render();
+</script>
+</body>
+</html>

@@ -2,18 +2,23 @@
 //! no page CSS to fight. Catppuccin Mocha, like the vimb config.
 //! The command line is the popup (popup.rs).
 //!
-//! tab bar:    [ 1 GitHub ][ 2 Arch Wiki ][ 3 … ]        (accent underline = active)
+//! tab bar:    [ 1 GitHub ][ 2 Arch Wiki ][ 3 … ]        (pill = active)
 //! status bar: [ MODE ][ url / message                        ][ 3/10 [2/5] 42% ]
+//!
+//! Zen by default: both float over the page and only appear when something happens
+//! (mode change, message, navigation, tab switch). `set status-bar` / `set tab-bar`
+//! pin them.
 
-use crate::tabs;
+use crate::{commands, tabs};
 use cef::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-pub const FONT: &str = "CaskaydiaMono Nerd Font Mono, 15px";
-const FONT_BOLD: &str = "CaskaydiaMono Nerd Font Mono, Bold 15px";
-const TAB_FONT: &str = "CaskaydiaMono Nerd Font Mono, 13px";
-const TAB_FONT_BOLD: &str = "CaskaydiaMono Nerd Font Mono, Bold 13px";
+pub const FONT: &str = "CaskaydiaMono Nerd Font Mono, monospace, 15px";
+const FONT_BOLD: &str = "CaskaydiaMono Nerd Font Mono, monospace, Bold 15px";
+const TAB_FONT: &str = "CaskaydiaMono Nerd Font Mono, monospace, 13px";
+const TAB_FONT_BOLD: &str = "CaskaydiaMono Nerd Font Mono, monospace, Bold 13px";
 const BAR_BG: u32 = 0xFF18_1825;
 const TABBAR_BG: u32 = 0xFF11_111B;
 const TEXT: u32 = 0xFFCD_D6F4;
@@ -37,20 +42,39 @@ struct Bar {
     url: LabelButton,
     right: LabelButton,
     url_text: String,
-    tabbar: Panel,
+    mode_text: String,
     mode_color: u32,
+}
+
+/// The bars float over the page as overlays, so showing one never resizes the
+/// page. When pinned (`set status-bar` / `set tab-bar`) a same-height spacer slot
+/// in the window layout keeps the page clear of it.
+struct Chrome {
+    tab_slot: Panel,
+    status_slot: Panel,
+    tabbar: Panel,
+    status: Panel,
+    tab_ctl: Option<OverlayController>,
+    status_ctl: Option<OverlayController>,
 }
 
 thread_local! {
     static BAR: RefCell<Option<Bar>> = const { RefCell::new(None) };
-    /// (tab bar, status bar) slots, created with the window; filled by build().
-    static FRAME: RefCell<Option<(Panel, Panel)>> = const { RefCell::new(None) };
+    static CHROME: RefCell<Option<Chrome>> = const { RefCell::new(None) };
+    /// Unpinned bars stay up until these instants.
+    static STATUS_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
+    static TABS_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Status bar held up: insert / hint / pass / command / pending keys.
+    static HOLD: Cell<bool> = const { Cell::new(false) };
+    /// Top-right notice (downloads): created on first use.
+    static TOAST: RefCell<Option<(OverlayController, LabelButton)>> = const { RefCell::new(None) };
+    static TOAST_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-/// Minimum bar heights: the empty slots made at window creation are already as tall
-/// as the filled bars (labels are 27-28px), so filling them shifts nothing.
 const TABBAR_H: i32 = 30;
 const STATUS_H: i32 = 28;
+/// How long an unpinned bar stays after something happened.
+const SHOW_MS: u64 = 1500;
 
 fn with<R>(f: impl FnOnce(&mut Bar) -> R) -> Option<R> {
     BAR.with_borrow_mut(|b| b.as_mut().map(f))
@@ -75,49 +99,214 @@ fn label(text: &str, color: u32, font: &str, on_press: Option<usize>) -> LabelBu
     l
 }
 
+fn bar_panel(bg: u32, spacing: i32, insets: Insets, min_h: i32) -> Panel {
+    let mut d = Painted::new(bg);
+    let p = panel_create(Some(&mut d)).expect("panel");
+    p.set_to_box_layout(Some(&BoxLayoutSettings {
+        horizontal: 1,
+        between_child_spacing: spacing,
+        inside_border_insets: insets,
+        minimum_cross_axis_size: min_h,
+        cross_axis_alignment: AxisAlignment::STRETCH,
+        ..Default::default()
+    }));
+    p
+}
+
 pub fn is_built() -> bool {
     BAR.with_borrow(|b| b.is_some())
 }
 
-/// Empty (tab bar, status bar) slots for the window layout. Cheap: no labels, no
-/// fonts. The labels cost ~100 ms of UI thread, so build() fills them in after
-/// the first page has loaded.
+/// (tab bar slot, status bar slot) for the window layout: empty spacers, visible only
+/// while that bar is pinned. Cheap — the labels (~100 ms of UI thread) come in
+/// build(), after the first page has loaded.
 pub fn frame() -> (Panel, Panel) {
-    let mut d = Painted::new(TABBAR_BG);
-    let tabbar = panel_create(Some(&mut d)).expect("panel");
-    tabbar.set_to_box_layout(Some(&BoxLayoutSettings {
-        horizontal: 1,
-        between_child_spacing: 2,
-        inside_border_insets: Insets {
+    let tab_slot = bar_panel(TABBAR_BG, 0, Insets::default(), TABBAR_H);
+    let status_slot = bar_panel(BAR_BG, 0, Insets::default(), STATUS_H);
+    let tabbar = bar_panel(
+        TABBAR_BG,
+        2,
+        Insets {
             top: 3,
             left: 6,
             bottom: 0,
             right: 6,
         },
-        minimum_cross_axis_size: TABBAR_H - 3,
-        cross_axis_alignment: AxisAlignment::STRETCH,
-        ..Default::default()
-    }));
-    let status = panel_create(None).expect("panel");
-    status.set_to_box_layout(Some(&BoxLayoutSettings {
-        horizontal: 1,
-        between_child_spacing: 12,
-        inside_border_insets: Insets {
+        TABBAR_H - 3,
+    );
+    let status = bar_panel(
+        BAR_BG,
+        12,
+        Insets {
             top: 0,
             left: 0,
             bottom: 0,
             right: 8,
         },
-        minimum_cross_axis_size: STATUS_H,
-        cross_axis_alignment: AxisAlignment::STRETCH,
-        ..Default::default()
-    }));
-    FRAME.with_borrow_mut(|f| *f = Some((tabbar.clone(), status.clone())));
-    (tabbar, status)
+        STATUS_H,
+    );
+    CHROME.with_borrow_mut(|c| {
+        *c = Some(Chrome {
+            tab_slot: tab_slot.clone(),
+            status_slot: status_slot.clone(),
+            tabbar,
+            status,
+            tab_ctl: None,
+            status_ctl: None,
+        })
+    });
+    (tab_slot, status_slot)
+}
+
+/// Float the bars over the window (after frame()); hidden until needed.
+pub fn attach(w: &Window) {
+    CHROME.with_borrow_mut(|c| {
+        let Some(c) = c else { return };
+        c.tab_ctl = w.add_overlay_view(Some(&mut View::from(&c.tabbar)), DockingMode::CUSTOM, 0);
+        c.status_ctl = w.add_overlay_view(Some(&mut View::from(&c.status)), DockingMode::CUSTOM, 0);
+    });
+    place();
+    update();
+}
+
+/// Overlay bounds follow the window (resize, fullscreen).
+pub fn place() {
+    let Some(w) = tabs::window() else { return };
+    let size = View::from(&w).size();
+    CHROME.with_borrow(|c| {
+        let Some(c) = c else { return };
+        if let Some(t) = &c.tab_ctl {
+            t.set_bounds(Some(&Rect {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: TABBAR_H,
+            }));
+        }
+        if let Some(s) = &c.status_ctl {
+            s.set_bounds(Some(&Rect {
+                x: 0,
+                y: size.height - STATUS_H,
+                width: size.width,
+                height: STATUS_H,
+            }));
+        }
+    });
+    TOAST.with_borrow(|t| {
+        let Some((ctl, _)) = t else { return };
+        let pref = ctl
+            .contents_view()
+            .map(|v| v.preferred_size())
+            .unwrap_or_default();
+        let width = pref.width.min(size.width - 24);
+        // Below a pinned tab bar; 12px from the edges.
+        let top = if commands::opt_bool("tab-bar", false) {
+            TABBAR_H
+        } else {
+            0
+        } + 12;
+        ctl.set_bounds(Some(&Rect {
+            x: size.width - width - 12,
+            y: top,
+            width,
+            height: STATUS_H + 4,
+        }));
+    });
+}
+
+/// Top-right notice. `sticky` keeps it up (download running); otherwise it fades
+/// after a few seconds.
+pub fn toast(text: &str, sticky: bool) {
+    if TOAST.with_borrow(|t| t.is_none()) {
+        let Some(w) = tabs::window() else { return };
+        let panel = bar_panel(
+            SURFACE,
+            0,
+            Insets {
+                top: 0,
+                left: 12,
+                bottom: 0,
+                right: 12,
+            },
+            STATUS_H + 4,
+        );
+        let l = label("", TEXT, FONT, None);
+        View::from(&l).set_background_color(SURFACE);
+        panel.add_child_view(Some(&mut View::from(&l)));
+        let Some(ctl) = w.add_overlay_view(Some(&mut View::from(&panel)), DockingMode::CUSTOM, 0)
+        else {
+            return;
+        };
+        TOAST.with_borrow_mut(|t| *t = Some((ctl, l)));
+    }
+    TOAST.with_borrow(|t| {
+        if let Some((ctl, l)) = t {
+            l.set_text(Some(&text.into()));
+            set_color(
+                l,
+                if text.starts_with('✗') {
+                    RED
+                } else if sticky {
+                    TEXT
+                } else {
+                    GREEN
+                },
+            );
+            ctl.set_visible(1);
+        }
+    });
+    place();
+    TOAST_UNTIL.set((!sticky).then(|| Instant::now() + Duration::from_millis(4000)));
+    if !sticky {
+        run_on_ui(4030, || {
+            if TOAST_UNTIL.get().is_some_and(|t| Instant::now() >= t) {
+                TOAST.with_borrow(|t| t.as_ref().map(|(c, _)| c.set_visible(0)));
+            }
+        });
+    }
+}
+
+fn live(until: &'static std::thread::LocalKey<Cell<Option<Instant>>>) -> bool {
+    until.get().is_some_and(|t| Instant::now() < t)
+}
+
+/// Apply pinned / held / recently-revealed state to slots and overlays.
+fn update() {
+    let pin_tabs = commands::opt_bool("tab-bar", false);
+    let pin_status = commands::opt_bool("status-bar", false);
+    let tabs_on = pin_tabs || live(&TABS_UNTIL);
+    let status_on = pin_status || HOLD.get() || live(&STATUS_UNTIL);
+    let tabs_was = CHROME.with_borrow(|c| {
+        let c = c.as_ref()?;
+        View::from(&c.tab_slot).set_visible(pin_tabs as i32);
+        View::from(&c.status_slot).set_visible(pin_status as i32);
+        if let Some(s) = &c.status_ctl {
+            s.set_visible(status_on as i32);
+        }
+        let t = c.tab_ctl.as_ref()?;
+        let was = t.is_visible() != 0;
+        t.set_visible(tabs_on as i32);
+        Some(was)
+    });
+    // A hidden tab bar isn't rebuilt on title changes; catch up when it appears.
+    if tabs_on && tabs_was == Some(false) {
+        tabs::refresh_tabbar();
+    }
+}
+
+fn reveal(until: &'static std::thread::LocalKey<Cell<Option<Instant>>>, ms: u64) {
+    until.set(Some(Instant::now() + Duration::from_millis(ms)));
+    update();
+    run_on_ui(ms as i64 + 30, update);
+}
+
+/// Something tab-related happened (switch, open, close): flash the tab bar.
+pub fn reveal_tabs() {
+    reveal(&TABS_UNTIL, SHOW_MS);
 }
 
 pub fn build() {
-    let Some((tabbar, panel)) = FRAME.with_borrow(|f| f.clone()) else {
+    let Some(panel) = CHROME.with_borrow(|c| c.as_ref().map(|c| c.status.clone())) else {
         return;
     };
     let mode = label(" NORMAL ", TABBAR_BG, FONT_BOLD, None);
@@ -130,14 +319,13 @@ pub fn build() {
     if let Some(l) = panel.get_layout().and_then(|l| l.as_box_layout()) {
         l.set_flex_for_view(Some(&mut View::from(&url)), 1);
     }
-
     BAR.with_borrow_mut(|b| {
         *b = Some(Bar {
             mode,
             url,
             right,
             url_text: String::new(),
-            tabbar: tabbar.clone(),
+            mode_text: "NORMAL".into(),
             mode_color: BLUE,
         })
     });
@@ -162,53 +350,86 @@ pub fn recolor() {
 }
 
 pub fn set_mode(name: &str, color: u32) {
-    with(|b| {
+    let changed = with(|b| {
+        if b.mode_text == name && b.mode_color == color {
+            return false;
+        }
         // lualine-style pill: mode colour background, dark text.
         b.mode.set_text(Some(&format!(" {name} ").as_str().into()));
+        b.mode_text = name.into();
         b.mode_color = color;
         View::from(&b.mode).set_background_color(color);
+        true
     });
-}
-
-pub fn set_url(url: &str) {
-    with(|b| {
-        b.url_text = url.to_string();
-        let color = if url.starts_with("https://") {
-            GREEN
-        } else if url.starts_with("http://") {
-            RED
+    if changed == Some(true) {
+        let hold = name != "NORMAL";
+        HOLD.set(hold);
+        // Back to normal: linger briefly instead of vanishing mid-glance.
+        if hold {
+            update()
         } else {
-            TEXT
-        };
-        set_color(&b.url, color);
-        b.url.set_text(Some(&url.into()));
-    });
+            reveal(&STATUS_UNTIL, 700)
+        }
+    }
 }
 
-/// One-shot message in place of the URL; the next key press restores the URL.
+fn show_url(b: &mut Bar, url: &str) {
+    if crate::home::is_home(url) {
+        set_color(&b.url, MAUVE);
+        b.url.set_text(Some(&"home".into()));
+        return;
+    }
+    let color = if url.starts_with("https://") {
+        GREEN
+    } else if url.starts_with("http://") {
+        RED
+    } else {
+        TEXT
+    };
+    set_color(&b.url, color);
+    b.url.set_text(Some(&url.into()));
+}
+
+/// The active tab's URL; a new one (navigation, tab switch) flashes the status bar.
+pub fn set_url(url: &str) {
+    let changed = with(|b| {
+        let changed = b.url_text != url;
+        b.url_text = url.to_string();
+        show_url(b, url);
+        changed
+    });
+    if changed == Some(true) {
+        reveal(&STATUS_UNTIL, SHOW_MS);
+    }
+}
+
+/// Message in place of the URL until the next key press.
 pub fn message(text: &str, error: bool) {
     with(|b| {
         set_color(&b.url, if error { RED } else { YELLOW });
         b.url.set_text(Some(&text.into()));
     });
+    reveal(&STATUS_UNTIL, 2500);
 }
 
 pub fn clear_message() {
-    let url = with(|b| b.url_text.clone()).unwrap_or_default();
-    set_url(&url);
+    with(|b| {
+        let url = b.url_text.clone();
+        show_url(b, &url);
+    });
 }
 
 pub fn set_right(text: &str) {
     with(|b| b.right.set_text(Some(&text.into())));
 }
 
-pub fn set_bar_visible(on: bool) {
-    FRAME.with_borrow(|f| f.as_ref().map(|f| View::from(&f.1).set_visible(on as i32)));
+/// `set status-bar` / `set tab-bar` changed: pin or unpin.
+pub fn set_bar_visible(_on: bool) {
+    update();
 }
 
-pub fn set_tabbar_visible(on: bool) {
-    FRAME.with_borrow(|f| f.as_ref().map(|f| View::from(&f.0).set_visible(on as i32)));
-    tabs::refresh_tabbar();
+pub fn set_tabbar_visible(_on: bool) {
+    update();
 }
 
 fn short(title: &str) -> String {
@@ -223,10 +444,16 @@ fn short(title: &str) -> String {
 /// Rebuild the tab bar: one clickable label per tab, active one bold + underlined.
 /// ponytail: full rebuild per change; diff the labels if hundreds of tabs ever lag.
 pub fn set_tabs(titles: &[String], active: usize) {
-    let Some(bar) = BAR.with_borrow(|b| b.as_ref().map(|b| b.tabbar.clone())) else {
+    let Some((bar, shown)) = CHROME.with_borrow(|c| {
+        let c = c.as_ref()?;
+        Some((
+            c.tabbar.clone(),
+            c.tab_ctl.as_ref().is_some_and(|t| t.is_visible() != 0),
+        ))
+    }) else {
         return;
     };
-    if View::from(&bar).is_visible() == 0 {
+    if !shown || !is_built() {
         return;
     }
     bar.remove_all_child_views();

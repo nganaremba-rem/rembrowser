@@ -4,7 +4,7 @@
 //! All CEF Views calls happen on the UI thread, so tab state lives in thread_locals
 //! (no locks). Rule: never call into vim/ui while holding a borrow here.
 
-use crate::{adblock, commands, downloads, permissions, popup, ui, vim};
+use crate::{adblock, commands, downloads, home, permissions, popup, ui, userscripts, vim};
 use cef::*;
 use std::cell::{Cell, RefCell};
 
@@ -114,6 +114,9 @@ fn add(bv: BrowserView, background: bool) {
     } else {
         refresh_right();
     }
+    if i > 0 {
+        ui::reveal_tabs();
+    }
 }
 
 /// `usize::MAX` = last tab.
@@ -126,6 +129,9 @@ pub fn select(i: usize) {
         )
     });
     let Some((i, bv)) = bv else { return };
+    if i != ACTIVE.get() {
+        ui::reveal_tabs();
+    }
     if let Some(old) = old {
         View::from(&old).set_visible(0);
     }
@@ -231,6 +237,34 @@ pub fn js_in(id: i32, code: &str) {
             0,
         );
     }
+}
+
+/// Run JS in the active tab *as a user gesture* (DevTools protocol, in-process: no
+/// debugging port). For APIs that need one, like requestPictureInPicture.
+pub fn js_gesture(code: &str) {
+    with_active(|b| {
+        let (Some(h), Some(params)) = (b.host(), dictionary_value_create()) else {
+            return;
+        };
+        params.set_string(Some(&"expression".into()), Some(&code.into()));
+        params.set_bool(Some(&"userGesture".into()), 1);
+        h.execute_dev_tools_method(
+            0,
+            Some(&"Runtime.evaluate".into()),
+            Some(&mut params.clone()),
+        );
+    });
+}
+
+/// `gp` / `:pip`: picture-in-picture for the page's main video (toggle).
+pub fn pip() {
+    js_gesture(
+        "(() => { if (document.pictureInPictureElement) return document.exitPictureInPicture();\
+         const vs = [...document.querySelectorAll('video')].filter((v) => v.readyState > 0)\
+           .sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight);\
+         const v = vs.find((v) => !v.paused) ?? vs[0];\
+         v ? v.requestPictureInPicture() : console.debug('\\x01rem\\tpip-none'); })()",
+    );
 }
 
 /// `;s`: save a link through the download handler (~/Downloads).
@@ -391,6 +425,7 @@ fn on_tab_closed(browser: &mut Browser) {
         quit_all();
         return;
     }
+    ui::reveal_tabs();
     let active = ACTIVE.get();
     if i < active {
         ACTIVE.set(active - 1);
@@ -412,6 +447,11 @@ wrap_window_delegate! {
     impl ViewDelegate {
         fn preferred_size(&self, _view: Option<&mut View>) -> Size {
             Size { width: 1280, height: 800 }
+        }
+
+        // Resize / fullscreen: the floating bars follow the window edges.
+        fn on_layout_changed(&self, _view: Option<&mut View>, _new_bounds: Option<&Rect>) {
+            ui::place();
         }
     }
 
@@ -452,8 +492,7 @@ wrap_window_delegate! {
             View::from(&*window).set_background_color(BG);
             WINDOW.with_borrow_mut(|w| *w = Some(window.clone()));
             CONTENT.with_borrow_mut(|c| *c = Some(content));
-            ui::set_bar_visible(commands::opt_bool("status-bar", true));
-            ui::set_tabbar_visible(commands::opt_bool("tab-bar", true));
+            ui::attach(window);
             open(&self.url, false);
             window.show();
             // Fallback for slow first pages; normally the first load_end builds it.
@@ -618,6 +657,14 @@ wrap_display_handler! {
         ) -> i32 {
             let msg = message.map(|m| m.to_string()).unwrap_or_default();
             let Some(body) = msg.strip_prefix("\u{1}rem\t") else { return 0 };
+            // Homescreen search box: only from the homescreen itself.
+            if let Some(text) = body.strip_prefix("home-open\t") {
+                let from_home = browser.as_ref().and_then(|b| b.main_frame()).is_some_and(|f| home::is_home(&CefString::from(&f.url()).to_string()));
+                if from_home {
+                    commands::open(text, false);
+                }
+                return 1;
+            }
             // Cosmetic adblock runs in every tab, not just the visible one.
             if let (Some(rest), Some(f)) = (body.strip_prefix("cls\t"), browser.as_ref().and_then(|b| b.main_frame())) {
                 let (classes, ids) = rest.split_once('\t').unwrap_or((rest, ""));
@@ -652,12 +699,18 @@ wrap_load_handler! {
             let (css, generic) = adblock::page_css(&url);
             let js = format!("{PAGE_JS};__rem.cosmetic({},{generic})", popup::js_str(&css));
             f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://page.js".into()), 0);
+            if let Some(js) = userscripts::for_url(&url, userscripts::RunAt::Start) {
+                f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://userscripts".into()), 0);
+            }
         }
 
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
             // Install page.js early so focus → INSERT shows without a key press.
             f.execute_java_script(Some(&PAGE_JS.into()), Some(&"rembrowser://page.js".into()), 0);
+            if let Some(js) = userscripts::for_url(&CefString::from(&f.url()).to_string(), userscripts::RunAt::End) {
+                f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://userscripts".into()), 0);
+            }
             let url = CefString::from(&f.url()).to_string();
             let title = browser
                 .and_then(|b| b.host()?.visible_navigation_entry())
