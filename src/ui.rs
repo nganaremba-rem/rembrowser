@@ -45,7 +45,7 @@ struct Bar {
     owner: Owner,
     /// Web-app bars: their overlay and window (the browser's are in Chrome).
     app: Option<(OverlayController, Window)>,
-    /// Held up: insert / hint / pass / command / pending keys.
+    /// Held up: hint / command / pending keys (short-lived states).
     hold: bool,
     mode: LabelButton,
     url: LabelButton,
@@ -447,7 +447,10 @@ fn update() {
     let (pin_tabs, pin_books, pin_status) =
         (pinned("tab-bar"), pinned("bookmark-bar"), pinned("status-bar"));
     let cur = tabs::current_owner();
-    let shown = |b: &Bar| pin_status || (b.owner == cur && (b.hold || live(&STATUS_UNTIL)));
+    // A web app window has no spacer for a pinned bar: there it only ever pops up.
+    let shown = |b: &Bar| {
+        (pin_status && b.app.is_none()) || (b.owner == cur && (b.hold || live(&STATUS_UNTIL)))
+    };
     let status: Vec<(Owner, bool)> = BARS.with_borrow(|bars| {
         bars.iter()
             .map(|b| {
@@ -559,7 +562,9 @@ pub fn recolor() {
 }
 
 pub fn set_mode(name: &str, color: u32) {
-    let hold = name != "NORMAL";
+    // INSERT and PASS last as long as you type: a bar held up that long would sit on
+    // the page's bottom edge (a chat's message box). They flash like NORMAL does.
+    let hold = !matches!(name, "NORMAL" | "INSERT" | "PASS");
     let changed = with(|b| {
         b.hold = hold;
         if b.mode_text == name && b.mode_color == color {
@@ -573,11 +578,12 @@ pub fn set_mode(name: &str, color: u32) {
         true
     });
     if changed == Some(true) {
-        // Back to normal: linger briefly instead of vanishing mid-glance.
-        if hold {
-            update()
-        } else {
-            reveal(&STATUS_UNTIL, 700)
+        // Back to normal: linger briefly instead of vanishing mid-glance. Into
+        // insert / pass: long enough to read which mode it is.
+        match name {
+            _ if hold => update(),
+            "NORMAL" => reveal(&STATUS_UNTIL, 700),
+            _ => reveal(&STATUS_UNTIL, SHOW_MS),
         }
     }
 }
