@@ -5,7 +5,7 @@ const [url, expr] = process.argv.slice(2);
 const base = `http://127.0.0.1:${process.env.CDP_PORT ?? 9222}`;
 const t = process.env.NEW_TARGET
   ? await (await fetch(`${base}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' })).json()
-  : (await (await fetch(`${base}/json/list`)).json()).find((x) => x.type === 'page' && !x.url.startsWith('data:text/html;base64,')); // skip the popup overlay
+  : (await (await fetch(`${base}/json/list`)).json()).find((x) => x.type === 'page' && !x.url.startsWith('data:text/html;base64,') && (!process.env.TARGET || x.url.includes(process.env.TARGET))); // skip the popup overlay; TARGET=url-substring picks a page
 const ws = new WebSocket(t.webSocketDebuggerUrl);
 await new Promise((r) => ws.addEventListener('open', r));
 let id = 0;

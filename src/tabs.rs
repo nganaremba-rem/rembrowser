@@ -27,6 +27,8 @@ thread_local! {
     static FIND: RefCell<String> = const { RefCell::new(String::new()) };
     static PROGRESS: Cell<u8> = const { Cell::new(100) };
     static FAVICONS: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
+    /// The web-app window with keyboard focus (None = the browser window).
+    static APP_FOCUS: RefCell<Option<BrowserView>> = const { RefCell::new(None) };
     /// Open DevTools windows: the main window waits for them before closing.
     static DEVTOOLS: RefCell<Vec<Window>> = const { RefCell::new(Vec::new()) };
     /// The main window was asked to close (quit_all / WM close).
@@ -59,8 +61,45 @@ pub fn window() -> Option<Window> {
     WINDOW.with_borrow(|w| w.clone())
 }
 
+/// What vim keys act on: the focused web app's view, else the active tab.
 fn active() -> Option<BrowserView> {
-    TABS.with_borrow(|t| t.get(ACTIVE.get()).cloned())
+    APP_FOCUS
+        .with_borrow(|a| a.clone())
+        .or_else(|| TABS.with_borrow(|t| t.get(ACTIVE.get()).cloned()))
+}
+
+/// A web-app window got focus (Some) or the browser window did (None).
+pub fn set_app_focus(view: Option<BrowserView>) {
+    let changed = APP_FOCUS.with_borrow(|a| match (a, &view) {
+        (Some(x), Some(y)) => View::from(x).is_same(Some(&mut View::from(y))) == 0,
+        (None, None) => false,
+        _ => true,
+    });
+    if changed {
+        APP_FOCUS.with_borrow_mut(|a| *a = view);
+        vim::reset();
+    }
+}
+
+/// The window keys go to: the focused web app's, else the browser window.
+pub fn current_owner() -> popup::Owner {
+    APP_FOCUS
+        .with_borrow(|a| a.as_ref().and_then(|v| v.browser()))
+        .map_or(popup::Owner::Main, |b| popup::Owner::App(b.identifier()))
+}
+
+pub fn current_window() -> Option<Window> {
+    match current_owner() {
+        popup::Owner::App(id) => apps::window_of(id),
+        popup::Owner::Main => window(),
+    }
+}
+
+/// Page messages (focus, hints) count from the active tab or the focused web app.
+fn is_current(browser: &mut Browser) -> bool {
+    active()
+        .and_then(|bv| bv.browser())
+        .is_some_and(|b| b.is_same(Some(browser)) != 0)
 }
 
 pub fn with_active(f: impl FnOnce(&Browser)) {
@@ -91,6 +130,11 @@ pub fn new_view(url: &str) -> Option<BrowserView> {
 }
 
 pub fn open(url: &str, background: bool) {
+    // From a web app with no browser window open: open one.
+    if window().is_none() {
+        create_window(url.to_string());
+        return;
+    }
     if let Some(bv) = new_view(url) {
         add(bv, background);
     }
@@ -191,6 +235,17 @@ pub fn reopen(new_tab: bool) {
         Some(url) if new_tab || TABS.with_borrow(|t| t.is_empty()) => open(&url, false),
         Some(url) => load(&url),
         None => ui::message("no closed tabs", true),
+    }
+}
+
+/// Keyboard back to a window's page (after its hidden popup loaded and took focus).
+pub fn focus_owner(owner: popup::Owner) {
+    let view = match owner {
+        popup::Owner::App(id) => apps::browser(id).and_then(|b| apps::view_of(&b)),
+        popup::Owner::Main => TABS.with_borrow(|t| t.get(ACTIVE.get()).cloned()),
+    };
+    if let Some(v) = view {
+        v.request_focus();
     }
 }
 
@@ -413,7 +468,7 @@ fn build_bar() {
     }
     ui::build();
     ui::recolor();
-    popup::init(&w);
+    popup::init(&w, popup::Owner::Main);
     select(ACTIVE.get());
 }
 
@@ -486,6 +541,19 @@ wrap_window_delegate! {
     impl PanelDelegate {}
 
     impl WindowDelegate {
+        // cef-rs defaults these to 0 (CEF's C++ defaults are true): a fixed-size
+        // window, which niri opens floating.
+        fn can_resize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
+
+        fn can_maximize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
+
+        fn can_minimize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
         // Runs before the first layout and on every OS/GTK theme switch. Views get
         // their theme colours re-applied *after* this (and whenever they are added),
         // overwriting any earlier set_background_color — so per-view colours are
@@ -527,6 +595,12 @@ wrap_window_delegate! {
             ui::run_on_ui(1000, build_bar);
         }
 
+        fn on_window_activation_changed(&self, _window: Option<&mut Window>, active: i32) {
+            if active != 0 {
+                set_app_focus(None);
+            }
+        }
+
         fn on_window_destroyed(&self, _window: Option<&mut Window>) {
             WINDOW.with_borrow_mut(|w| w.take());
             CONTENT.with_borrow_mut(|c| c.take());
@@ -534,7 +608,7 @@ wrap_window_delegate! {
             ACTIVE.set(0);
             // The bars and popup belonged to this window; a new one builds its own.
             ui::reset();
-            popup::reset();
+            popup::forget(popup::Owner::Main);
             // Web apps keep running on their own; quit with the last window.
             if apps::is_empty() {
                 quit_message_loop();
@@ -554,7 +628,7 @@ wrap_window_delegate! {
             // the last one closes the window again, which then passes.
             // The popup overlay too: a browser left open at shutdown trips a CHECK.
             let mut hosts: Vec<_> = TABS.with_borrow(|t| t.iter().filter_map(|bv| bv.browser()?.host()).collect());
-            hosts.extend(popup::host());
+            hosts.extend(popup::host(popup::Owner::Main));
             hosts.iter().fold(1, |all, h| all & h.try_close_browser())
         }
 
@@ -741,7 +815,7 @@ wrap_display_handler! {
                 }
                 return 1;
             }
-            if browser.is_some_and(|b| is_active(b)) {
+            if browser.is_some_and(|b| is_current(b)) {
                 let fields: Vec<&str> = body.split('\t').collect();
                 vim::on_page_msg(&fields);
             }
@@ -772,6 +846,12 @@ wrap_load_handler! {
 
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
+            // A web app's command popup, ready before its first `:` (like the browser's).
+            if let Some(id) = browser.as_ref().filter(|b| apps::is_app(b)).map(|b| b.identifier()) {
+                if let Some(w) = apps::window_of(id) {
+                    popup::init(&w, popup::Owner::App(id));
+                }
+            }
             // Install page.js early so focus → INSERT shows without a key press.
             f.execute_java_script(Some(&PAGE_JS.into()), Some(&"rembrowser://page.js".into()), 0);
             if let Some(js) = userscripts::for_url(&CefString::from(&f.url()).to_string(), userscripts::RunAt::End) {
@@ -803,7 +883,7 @@ wrap_find_handler! {
             active_match_ordinal: i32,
             final_update: i32,
         ) {
-            if final_update != 0 && browser.is_some_and(|b| is_active(b)) {
+            if final_update != 0 && browser.is_some_and(|b| is_current(b)) {
                 let text = if count == 0 {
                     "no match".into()
                 } else {
@@ -877,9 +957,8 @@ wrap_keyboard_handler! {
             _is_keyboard_shortcut: Option<&mut i32>,
         ) -> i32 {
             let Some(e) = event else { return 0 };
-            if let Some(b) = browser.filter(|b| apps::is_app(b)) {
-                return (e.type_ == KeyEventType::RAWKEYDOWN && apps::key(b, e)) as i32;
-            }
+            // Keys act on the window they came from (a web app or the browser).
+            set_app_focus(browser.as_ref().and_then(|b| apps::view_of(b)));
             (e.type_ == KeyEventType::RAWKEYDOWN && vim::on_key(e)) as i32
         }
     }
@@ -933,6 +1012,19 @@ wrap_window_delegate! {
     impl PanelDelegate {}
 
     impl WindowDelegate {
+        // cef-rs defaults these to 0 (CEF's C++ defaults are true): a fixed-size
+        // window, which niri opens floating.
+        fn can_resize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
+
+        fn can_maximize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
+
+        fn can_minimize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
         fn on_window_created(&self, window: Option<&mut Window>) {
             let Some(w) = window else { return };
             w.set_to_fill_layout();

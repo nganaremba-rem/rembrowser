@@ -17,7 +17,17 @@ pub enum CmdKind {
     Search { forward: bool },
 }
 
+/// Which window a popup floats over.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Owner {
+    Main,
+    /// A web-app window, by its page's browser id.
+    App(i32),
+}
+
 struct Pop {
+    owner: Owner,
+    win: Window,
     bv: BrowserView,
     ctl: OverlayController,
     ready: bool,
@@ -30,7 +40,8 @@ struct Pop {
 type OnPick = Box<dyn FnOnce(usize)>;
 
 thread_local! {
-    static POP: RefCell<Option<Pop>> = const { RefCell::new(None) };
+    /// One popup per window (browser window + each web app that used one).
+    static POPS: RefCell<Vec<Pop>> = const { RefCell::new(Vec::new()) };
     static ON_PICK: RefCell<Option<OnPick>> = const { RefCell::new(None) };
     static HISTORY: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
@@ -71,8 +82,28 @@ const COMMANDS: &[(&str, &str)] = &[
     ("userscripts", "reload userscripts"),
 ];
 
-pub fn init(window: &Window) {
-    if POP.with_borrow(|p| p.is_some()) {
+fn with_owner<R>(o: Owner, f: impl FnOnce(&mut Pop) -> R) -> Option<R> {
+    POPS.with_borrow_mut(|p| p.iter_mut().find(|p| p.owner == o).map(f))
+}
+
+/// The popup of the window keys are going to (focused web app, else the browser).
+fn with_cur<R>(f: impl FnOnce(&mut Pop) -> R) -> Option<R> {
+    with_owner(tabs::current_owner(), f)
+}
+
+fn with_from<R>(b: &Browser, f: impl FnOnce(&mut Pop) -> R) -> Option<R> {
+    POPS.with_borrow_mut(|p| {
+        p.iter_mut()
+            .find(|p| {
+                p.bv.browser()
+                    .is_some_and(|x| x.is_same(Some(&mut b.clone())) != 0)
+            })
+            .map(f)
+    })
+}
+
+pub fn init(window: &Window, owner: Owner) {
+    if with_owner(owner, |_| ()).is_some() {
         return;
     }
     let url = format!(
@@ -107,8 +138,10 @@ pub fn init(window: &Window) {
         height: 1,
     }));
     ctl.set_visible(1);
-    POP.with_borrow_mut(|p| {
-        *p = Some(Pop {
+    POPS.with_borrow_mut(|p| {
+        p.push(Pop {
+            owner,
+            win: window.clone(),
             bv,
             ctl,
             ready: false,
@@ -251,8 +284,7 @@ pub fn ask(id: u64, origin: &str, what: &str) {
 
 /// Centred horizontally, upper fifth of the window, as tall as the box.
 fn place(p: &Pop) {
-    let Some(win) = tabs::window() else { return };
-    let size = View::from(&win).size();
+    let size = View::from(&p.win).size();
     let width = (size.width as f32 * 0.6).clamp(420.0, 820.0) as i32;
     let y = (size.height as f32 * 0.18) as i32;
     let height = p.height.clamp(20, (size.height - y - 20).max(20));
@@ -265,98 +297,101 @@ fn place(p: &Pop) {
 }
 
 fn show(js: String) {
-    let Some(win) = tabs::window() else { return };
-    let ready = POP.with_borrow_mut(|p| {
-        let p = p.as_mut()?;
+    let owner = tabs::current_owner();
+    let Some(win) = tabs::current_window() else {
+        return;
+    };
+    let ready = with_owner(owner, |p| {
         place(p);
         p.ctl.set_visible(1);
         p.bv.request_focus();
         if !p.ready {
             p.pending = Some(js.clone());
         }
-        Some(p.ready)
+        p.ready
     });
     match ready {
-        Some(true) => run_js(&js),
+        Some(true) => run_js(owner, &js),
         Some(false) => {}
-        // Not created yet (`:` before the first page finished): create it now.
+        // Not created yet (`:` before the first page finished, or a web app's first):
+        // create it now; it runs `js` once loaded.
         None => {
-            init(&win);
-            POP.with_borrow_mut(|p| {
-                if let Some(p) = p {
-                    p.pending = Some(js);
-                }
-            });
+            init(&win, owner);
+            with_owner(owner, |p| p.pending = Some(js));
         }
     }
     ui::set_mode("COMMAND", ui::PEACH);
 }
 
-fn run_js(js: &str) {
-    let frame = POP.with_borrow(|p| p.as_ref().and_then(|p| p.bv.browser()?.main_frame()));
+fn run_js(owner: Owner, js: &str) {
+    let frame = with_owner(owner, |p| p.bv.browser()?.main_frame()).flatten();
     if let Some(f) = frame {
         f.execute_java_script(Some(&js.into()), Some(&"rembrowser://popup".into()), 0);
     }
 }
 
-/// The browser window closed: its popup went with it.
-pub fn reset() {
-    POP.with_borrow_mut(|p| p.take());
+/// That window closed: its popup went with it.
+pub fn forget(owner: Owner) {
+    POPS.with_borrow_mut(|p| p.retain(|p| p.owner != owner));
 }
 
-pub fn host() -> Option<BrowserHost> {
-    POP.with_borrow(|p| p.as_ref()?.bv.browser()?.host())
+/// The popup browser of a window, for that window's can_close.
+pub fn host(owner: Owner) -> Option<BrowserHost> {
+    with_owner(owner, |p| p.bv.browser()?.host()).flatten()
 }
 
 pub fn is_open() -> bool {
-    POP.with_borrow(|p| {
-        p.as_ref()
-            .is_some_and(|p| p.ctl.is_visible() != 0 && p.ready)
-    })
+    with_cur(|p| p.ctl.is_visible() != 0 && p.ready).unwrap_or(false)
 }
 
-fn hide() {
-    POP.with_borrow(|p| {
-        if let Some(p) = p {
-            p.ctl.set_visible(0);
-        }
-    });
+fn hide(b: &Browser) {
+    with_from(b, |p| p.ctl.set_visible(0));
     tabs::focus_active();
     vim::reset();
 }
 
 pub fn set_count(text: &str) {
     if is_open() {
-        run_js(&format!("rem.count({})", js_str(text)));
+        run_js(
+            tabs::current_owner(),
+            &format!("rem.count({})", js_str(text)),
+        );
     }
 }
 
-fn on_message(fields: &[&str]) {
+fn on_message(b: &Browser, fields: &[&str]) {
     match fields {
         ["ready"] => {
-            let pending = POP.with_borrow_mut(|p| {
-                let p = p.as_mut()?;
+            let (owner, pending) = with_from(b, |p| {
                 p.ready = true;
                 let pending = p.pending.take();
                 if pending.is_none() {
                     p.ctl.set_visible(0);
+                } else {
+                    // Opened while loading: it has the screen, give it the keyboard too.
+                    p.bv.request_focus();
                 }
-                pending
-            });
-            if let Some(js) = pending {
-                run_js(&js);
+                (p.owner, pending)
+            })
+            .unwrap_or((Owner::Main, None));
+            match pending {
+                Some(js) => run_js(owner, &js),
+                // Loading it took the keyboard from the page; give it back.
+                None => tabs::focus_owner(owner),
             }
         }
-        ["size", h] => POP.with_borrow_mut(|p| {
-            if let (Some(p), Ok(h)) = (p.as_mut(), h.parse()) {
-                p.height = h;
-                if p.ctl.is_visible() != 0 {
-                    place(p);
+        ["size", h] => {
+            with_from(b, |p| {
+                if let Ok(h) = h.parse() {
+                    p.height = h;
+                    if p.ctl.is_visible() != 0 {
+                        place(p);
+                    }
                 }
-            }
-        }),
+            });
+        }
         ["submit", kind, forward, text] => {
-            hide();
+            hide(b);
             let kind = parse_kind(kind, forward);
             if kind == CmdKind::Ex && !text.trim().is_empty() {
                 HISTORY.with_borrow_mut(|h| {
@@ -367,23 +402,23 @@ fn on_message(fields: &[&str]) {
             vim::cmdline_submit(kind, text);
         }
         ["picked", i] => {
-            hide();
+            hide(b);
             let cb = ON_PICK.with_borrow_mut(Option::take);
             if let (Some(cb), Ok(i)) = (cb, i.parse::<usize>()) {
                 cb(i);
             }
         }
         ["cancel", kind] => {
-            hide();
+            hide(b);
             vim::cmdline_cancel(parse_kind(kind, "1"));
         }
         ["preview", text, forward] => vim::search_preview(text, *forward == "1"),
         ["edit", kind, text] => {
-            hide();
+            hide(b);
             edit_in_nvim(parse_kind(kind, "1"), text);
         }
         ["answer", id, choice] => {
-            hide();
+            hide(b);
             if let Ok(id) = id.parse() {
                 permissions::answer(id, choice);
             }
@@ -445,11 +480,19 @@ wrap_life_span_handler! {
     struct PopLifeSpanHandler;
 
     impl LifeSpanHandler {
-        fn do_close(&self, _browser: Option<&mut Browser>) -> i32 {
-            if let Some(p) = POP.with_borrow_mut(Option::take) {
+        fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            let Some(b) = browser else { return 1 };
+            let owner = POPS.with_borrow_mut(|pops| {
+                let i = pops.iter().position(|p| p.bv.browser().is_some_and(|x| x.is_same(Some(&mut b.clone())) != 0))?;
+                let p = pops.remove(i);
                 p.ctl.destroy();
+                Some(p.owner)
+            });
+            // Retry closing that window, which now finds its popup gone.
+            match owner {
+                Some(Owner::App(id)) => ui::run_on_ui(0, move || crate::apps::close(id)),
+                _ => ui::run_on_ui(0, tabs::quit_all),
             }
-            ui::run_on_ui(0, tabs::quit_all);
             1
         }
     }
@@ -461,7 +504,7 @@ wrap_display_handler! {
     impl DisplayHandler {
         fn on_console_message(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _level: LogSeverity,
             message: Option<&CefString>,
             _source: Option<&CefString>,
@@ -470,7 +513,9 @@ wrap_display_handler! {
             let msg = message.map(|m| m.to_string()).unwrap_or_default();
             if let Some(body) = msg.strip_prefix("\u{1}pop\t") {
                 let fields: Vec<&str> = body.split('\t').collect();
-                on_message(&fields);
+                if let Some(b) = browser {
+                    on_message(b, &fields);
+                }
                 return 1;
             }
             0

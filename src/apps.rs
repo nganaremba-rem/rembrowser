@@ -84,18 +84,28 @@ pub fn is_empty() -> bool {
     APPS.with_borrow(|a| a.is_empty())
 }
 
-/// The few keys an app window handles itself; everything else goes to the site.
-pub fn key(b: &Browser, e: &KeyEvent) -> bool {
-    const CTRL: u32 = 1 << 2;
-    const ALT: u32 = 1 << 3;
-    let (code, m) = (e.windows_key_code, e.modifiers);
-    match (code, m & (CTRL | ALT)) {
-        (0x74, 0) | (0x52, CTRL) => b.reload(), // F5, Ctrl-R
-        (0x25, ALT) => b.go_back(),             // Alt-Left
-        (0x27, ALT) => b.go_forward(),          // Alt-Right
-        _ => return false,
+pub fn view_of(b: &Browser) -> Option<BrowserView> {
+    find(b, |(_, v, _)| v.clone())
+}
+
+fn by_id<R>(id: i32, f: impl FnOnce(&(Window, BrowserView, String)) -> R) -> Option<R> {
+    APPS.with_borrow(|a| {
+        a.iter()
+            .find(|(_, v, _)| v.browser().is_some_and(|b| b.identifier() == id))
+            .map(f)
+    })
+}
+
+/// The window of the app whose page has this browser id.
+pub fn window_of(id: i32) -> Option<Window> {
+    by_id(id, |(w, ..)| w.clone())
+}
+
+/// Close that app's window (again: after its popup finished closing).
+pub fn close(id: i32) {
+    if let Some(w) = window_of(id) {
+        w.close();
     }
-    true
 }
 
 /// `:app-install [name]`: a launcher entry (menu, fuzzel, dms) for the current page.
@@ -147,6 +157,19 @@ wrap_window_delegate! {
     impl PanelDelegate {}
 
     impl WindowDelegate {
+        // cef-rs defaults these to 0 (CEF's C++ defaults are true): a fixed-size
+        // window, which niri opens floating.
+        fn can_resize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
+
+        fn can_maximize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
+
+        fn can_minimize(&self, _window: Option<&mut Window>) -> i32 {
+            1
+        }
         fn window_runtime_style(&self) -> RuntimeStyle {
             RuntimeStyle::ALLOY
         }
@@ -161,8 +184,19 @@ wrap_window_delegate! {
             APPS.with_borrow_mut(|a| a.push((w.clone(), self.view.clone(), self.app_id.clone())));
         }
 
+        // vim keys act on whichever window has focus.
+        fn on_window_activation_changed(&self, _window: Option<&mut Window>, active: i32) {
+            if active != 0 {
+                tabs::set_app_focus(Some(self.view.clone()));
+            }
+        }
+
         fn on_window_destroyed(&self, window: Option<&mut Window>) {
             let Some(w) = window else { return };
+            if let Some(b) = self.view.browser() {
+                crate::popup::forget(crate::popup::Owner::App(b.identifier()));
+            }
+            tabs::set_app_focus(None);
             APPS.with_borrow_mut(|a| a.retain(|(x, ..)| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));
             // Last window of any kind gone: quit.
             if is_empty() && tabs::window().is_none() {
@@ -170,8 +204,12 @@ wrap_window_delegate! {
             }
         }
 
+        // The page and (if it was used) this window's command popup.
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
-            self.view.browser().and_then(|b| b.host()).map_or(1, |h| h.try_close_browser())
+            let Some(b) = self.view.browser() else { return 1 };
+            let mut hosts: Vec<_> = b.host().into_iter().collect();
+            hosts.extend(crate::popup::host(crate::popup::Owner::App(b.identifier())));
+            hosts.iter().fold(1, |all, h| all & h.try_close_browser())
         }
 
         fn linux_window_properties(
