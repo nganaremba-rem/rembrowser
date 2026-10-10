@@ -188,7 +188,7 @@ settings:
   bookmark-bar: false
   dark-mode: true
   smooth-scrolling: true
-  confirm-quit: true       # ask before closing a window
+  confirm-quit: true       # ask before the last tab closes (d / x) and on Ctrl-q
   download-path: ~/Downloads
 
 search:

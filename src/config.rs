@@ -38,7 +38,7 @@ settings:
   scroll-step: 60          # pixels per j / k
   smooth-scrolling: true   # false = jump instead of glide
   incsearch: true
-  confirm-quit: true       # ask before closing a window
+  confirm-quit: true       # ask before the last tab closes (d, x, :q) and on Ctrl-q
   download-path: ~/Downloads
   geolocation: never
   # editor-command: foot nvim %s     # Ctrl-T in text fields; %s = the file

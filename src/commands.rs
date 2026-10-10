@@ -189,7 +189,7 @@ fn exec_one(line: &str) {
         "app" if args.is_empty() => {
             let url = tabs::active_url();
             crate::apps::open(&url);
-            tabs::close_active();
+            tabs::close_active_now();
         }
         "app" => crate::apps::open(args),
         // :app-install [name] — launcher entry that opens this page as a web app.

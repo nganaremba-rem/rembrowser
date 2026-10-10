@@ -26,10 +26,6 @@ struct Win {
     /// Status bar right side: find count + load progress of the active tab.
     find: String,
     progress: u8,
-    /// The quit question (confirm-quit) was answered yes.
-    /// ponytail: stays set if a page's beforeunload then cancels the close, so the
-    /// next close of this window doesn't ask again.
-    confirmed: bool,
 }
 
 thread_local! {
@@ -283,7 +279,17 @@ pub fn cycle(delta: isize) {
     }
 }
 
+/// `:q` (d, x, Ctrl-w): close the active tab, or the focused web app's page.
 pub fn close_active() {
+    if APP_FOCUS.with_borrow(|a| a.is_some()) {
+        close_active_now();
+    } else if let Some(i) = with_win(cur(), |w| w.active) {
+        close_tab(cur(), i);
+    }
+}
+
+/// Close the active page without the last-tab question (`:app` moves it elsewhere).
+pub fn close_active_now() {
     with_active(|b| {
         if let Some(h) = b.host() {
             h.close_browser(0);
@@ -291,12 +297,30 @@ pub fn close_active() {
     });
 }
 
-/// Close tab `i` of a window (its close button).
+/// Close tab `i` of a window. A window's last tab takes the window with it, and the
+/// last window the browser: that asks first (confirm-quit).
 pub fn close_tab(win: u32, i: usize) {
-    let host = with_win(win, |w| w.tabs.get(i).and_then(|bv| bv.browser()?.host()));
-    if let Some(h) = host.flatten() {
-        h.close_browser(0);
+    let found = with_win(win, |w| {
+        let host = w.tabs.get(i).and_then(|bv| bv.browser()?.host())?;
+        Some((host, w.tabs.len() == 1))
+    });
+    let Some((host, last)) = found.flatten() else {
+        return;
+    };
+    if !last || !commands::opt_bool("confirm-quit", true) {
+        host.close_browser(0);
+        return;
     }
+    let quits = win_ids().len() == 1 && apps::is_empty();
+    let (text, yes) = match quits {
+        true => ("Close the last tab and quit rembrowser?", "Quit"),
+        false => ("Close the last tab and this window?", "Close"),
+    };
+    popup::confirm(text, yes, move |yes| {
+        if yes {
+            host.close_browser(0);
+        }
+    });
 }
 
 pub fn close_window(id: u32) {
@@ -305,47 +329,26 @@ pub fn close_window(id: u32) {
     }
 }
 
-/// "Close?" for these windows; yes closes them without asking again.
-fn ask_quit(ids: Vec<u32>) {
-    let tabs: usize = ids
-        .iter()
-        .filter_map(|id| with_win(*id, |w| w.tabs.len()))
-        .sum();
-    let tabs = format!("{tabs} tab{}", if tabs == 1 { "" } else { "s" });
-    let text = match ids.len() {
-        1 => format!("Close this window? ({tabs})"),
-        n => format!("Quit rembrowser? ({n} windows, {tabs})"),
-    };
-    popup::confirm(&text, "Quit", move |yes| {
+fn close_all() {
+    win_ids().into_iter().for_each(close_window);
+}
+
+/// `:qa` / Ctrl-q: close every browser window, which quits unless web apps are
+/// open. Asks first (confirm-quit); closing a window through the window manager
+/// does not.
+pub fn quit_all() {
+    let (wins, tabs) = WINS.with_borrow(|w| (w.len(), w.iter().map(|w| w.tabs.len()).sum::<usize>()));
+    if tabs == 0 || !commands::opt_bool("confirm-quit", true) {
+        close_all();
+        return;
+    }
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    let text = format!("Quit rembrowser? ({wins} window{}, {tabs} tab{})", s(wins), s(tabs));
+    popup::confirm(&text, "Quit", |yes| {
         if yes {
-            for id in ids {
-                with_win(id, |w| w.confirmed = true);
-                close_window(id);
-            }
+            close_all();
         }
     });
-}
-
-/// Windows that would lose tabs without the user having said yes (confirm-quit).
-fn unconfirmed() -> Vec<u32> {
-    if !commands::opt_bool("confirm-quit", true) {
-        return Vec::new();
-    }
-    WINS.with_borrow(|w| {
-        w.iter()
-            .filter(|w| !w.tabs.is_empty() && !w.confirmed)
-            .map(|w| w.id)
-            .collect()
-    })
-}
-
-/// Close every browser window (asking once), which quits unless web apps are open.
-pub fn quit_all() {
-    if unconfirmed().is_empty() {
-        win_ids().into_iter().for_each(close_window);
-    } else {
-        ask_quit(win_ids());
-    }
 }
 
 pub fn reopen(new_tab: bool) {
@@ -784,7 +787,6 @@ wrap_window_delegate! {
                 active: 0,
                 find: String::new(),
                 progress: 100,
-                confirmed: false,
             }));
             CUR.set(id);
             ui::attach(id);
@@ -815,15 +817,6 @@ wrap_window_delegate! {
 
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
             let id = self.id;
-            // "Close this window?" first; yes comes back here with `confirmed` set.
-            if unconfirmed().contains(&id) {
-                ui::run_on_ui(0, move || {
-                    // The question shows in the current window: this one.
-                    set_cur(id);
-                    ask_quit(vec![id]);
-                });
-                return 0;
-            }
             // The last window takes the Chrome-style windows (DevTools, settings) with
             // it: one still open keeps CEF from shutting down. Each one's
             // on_window_destroyed retries.
@@ -1345,7 +1338,7 @@ wrap_window_delegate! {
             let Some(w) = window else { return };
             CHROME_WINS.with_borrow_mut(|d| d.retain(|x| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));
             if CLOSING.get() {
-                ui::run_on_ui(0, quit_all);
+                ui::run_on_ui(0, close_all);
             }
         }
 
