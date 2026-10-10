@@ -76,6 +76,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("pin", "pin page: add | N"),
     ("downloads", "this session's downloads"),
     ("pip", "picture-in-picture"),
+    ("mpv", "play this page (or URL) in mpv"),
     ("app", "open this page (or URL) as a web app"),
     ("app-install", "add this page to the app launcher"),
     ("config", "edit config.yaml"),

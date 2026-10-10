@@ -49,6 +49,10 @@ fn main() {
     if ipc::forward(&req) {
         std::process::exit(0);
     }
+    if matches!(req, ipc::Req::Cmd(_)) {
+        eprintln!("rembrowser: not running (a :command needs a running browser)");
+        std::process::exit(1);
+    }
     ipc::listen();
     let root = data_dir();
     let profile = format!("{root}/Default");

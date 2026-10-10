@@ -171,6 +171,7 @@ fn exec_one(line: &str) {
         "keys" | "map" => pickers::keys(),
         "downloads" | "dl" => crate::downloads::picker(),
         "pip" => tabs::pip(),
+        "mpv" => mpv(args),
         "config" | "settings" => crate::config::open_in_editor(false),
         // :app [URL] — this page (or URL) as a web app; the tab closes.
         "app" if args.is_empty() => {
@@ -283,6 +284,7 @@ pub fn settings() -> Vec<(String, String)> {
         "hint-keys",
         "home-page",
         "incsearch",
+        "mpv-command",
         "scroll-step",
         "smooth-scrolling",
         "status-bar",
@@ -405,6 +407,31 @@ pub fn command(program: &str) -> Command {
         });
     }
     c
+}
+
+/// `;m` / `:mpv [URL]`: play in mpv (which uses yt-dlp for YouTube & co.). No URL, or
+/// a <video> whose source is a blob: this page.
+pub fn mpv(url: &str) {
+    let url = if url.is_empty() || url.starts_with("blob:") {
+        tabs::active_url()
+    } else {
+        url.to_string()
+    };
+    let cmd = opt("mpv-command").unwrap_or_else(|| "mpv".into());
+    let mut words = cmd.split_whitespace();
+    let prog = words.next().unwrap_or("mpv");
+    let spawned = command(prog)
+        .args(words)
+        .arg("--")
+        .arg(&url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(_) => ui::message(&format!("mpv \u{25b6} {url}"), false),
+        Err(e) => ui::message(&format!("{prog}: {e}"), true),
+    }
 }
 
 fn env_cmd(cmd: &str) -> Command {

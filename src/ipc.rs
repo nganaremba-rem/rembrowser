@@ -12,6 +12,8 @@ use std::path::PathBuf;
 pub enum Req {
     Open(String),
     App(String),
+    /// `rembrowser ':tabopen x'`: an ex command for the running browser (scripts, WM keybinds).
+    Cmd(String),
 }
 
 impl Req {
@@ -19,6 +21,7 @@ impl Req {
         match self {
             Req::Open(u) => format!("open\t{u}\n"),
             Req::App(u) => format!("app\t{u}\n"),
+            Req::Cmd(c) => format!("cmd\t{c}\n"),
         }
     }
 
@@ -26,6 +29,7 @@ impl Req {
         match line.trim_end().split_once('\t')? {
             ("open", u) => Some(Req::Open(u.into())),
             ("app", u) => Some(Req::App(u.into())),
+            ("cmd", c) => Some(Req::Cmd(c.into())),
             _ => None,
         }
     }
@@ -76,10 +80,11 @@ pub fn handle(req: Req) {
     match req {
         Req::Open(url) => tabs::open_or_create(&url),
         Req::App(url) => apps::open(&url),
+        Req::Cmd(cmd) => crate::commands::exec(&cmd),
     }
 }
 
-/// argv → request: `--app=URL` / `--app URL` / `URL` / nothing (home page).
+/// argv → request: `--app=URL` / `--app URL` / `:command` / `URL` / nothing (home page).
 pub fn from_args(args: &[String]) -> Req {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -90,12 +95,11 @@ pub fn from_args(args: &[String]) -> Req {
             return Req::App(it.next().cloned().unwrap_or_default());
         }
     }
-    Req::Open(
-        args.iter()
-            .find(|a| !a.starts_with("--"))
-            .cloned()
-            .unwrap_or_default(),
-    )
+    let arg = args.iter().find(|a| !a.starts_with("--"));
+    match arg.and_then(|a| a.strip_prefix(':')) {
+        Some(cmd) => Req::Cmd(cmd.into()),
+        None => Req::Open(arg.cloned().unwrap_or_default()),
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +116,7 @@ mod tests {
         assert_eq!(a(&["--app", "discord.com"]), Req::App("discord.com".into()));
         assert_eq!(a(&["https://x.org"]), Req::Open("https://x.org".into()));
         assert_eq!(a(&[]), Req::Open(String::new()));
+        assert_eq!(a(&[":tabopen x.org"]), Req::Cmd("tabopen x.org".into()));
         let r = Req::App("https://a.b/c?d".into());
         assert_eq!(Req::parse(&r.line()), Some(r));
     }

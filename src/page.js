@@ -67,7 +67,8 @@ window.__rem ??= (() => {
     '[role=treeitem],[onclick],[contenteditable=""],[contenteditable=true],[tabindex]:not([tabindex="-1"]),video,audio';
   const EDITABLE = 'input:not([type=hidden]),textarea,[contenteditable=""],[contenteditable=true]';
   // vimb hint modes: what each kind of hint may target.
-  const FILTERS = { all: CLICKABLE, links: 'a[href],area[href]', images: 'img', editable: EDITABLE };
+  const FILTERS = { all: CLICKABLE, links: 'a[href],area[href]', images: 'img', editable: EDITABLE,
+    media: 'a[href],area[href],video,audio' };
   const all = (sel, root = document, out = []) => {
     for (const el of root.querySelectorAll(sel)) out.push(el);
     for (const el of root.querySelectorAll('*')) if (el.shadowRoot) all(sel, el.shadowRoot, out);
@@ -99,9 +100,19 @@ window.__rem ??= (() => {
     }
     return out;
   };
+  // Adopted sheet, not innerHTML/<style>: YouTube & Google enforce Trusted Types (an
+  // innerHTML assignment throws there) and CSP can block inline styles.
+  const hintCss = new CSSStyleSheet();
+  hintCss.replaceSync(`b{position:fixed;font:bold 12px/1 "CaskaydiaMono Nerd Font",monospace;padding:2px 4px;border-radius:4px;
+    background:#f9e2af;color:#11111b;box-shadow:0 2px 6px #0008;text-transform:uppercase;letter-spacing:.5px}
+    b i{font-style:normal;color:#7f6a2e} b.off{display:none}`);
   let H = null;
   R.hintsClear = () => { H?.host.remove(); H = null; };
+  // A page that breaks hinting must not leave the browser stuck in HINT mode.
   R.hints = (keys, filter) => {
+    try { hints(keys, filter); } catch (e) { R.hintsClear(); send('hint-none'); console.error(e); }
+  };
+  const hints = (keys, filter) => {
     R.hintsClear();
     const seen = new Set(), items = [];
     for (const el of all(FILTERS[filter] ?? CLICKABLE)) {
@@ -114,10 +125,7 @@ window.__rem ??= (() => {
     const host = document.createElement('rem-hints');
     host.style.cssText = 'all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none';
     const sh = host.attachShadow({ mode: 'closed' });
-    sh.innerHTML = `<style>
-      b{position:fixed;font:bold 12px/1 "CaskaydiaMono Nerd Font",monospace;padding:2px 4px;border-radius:4px;
-        background:#f9e2af;color:#11111b;box-shadow:0 2px 6px #0008;text-transform:uppercase;letter-spacing:.5px}
-      b i{font-style:normal;color:#7f6a2e} b.off{display:none}</style>`;
+    sh.adoptedStyleSheets = [hintCss];
     const ls = labels(items.length, keys);
     items.forEach((it, n) => {
       const b = document.createElement('b');

@@ -41,6 +41,8 @@ enum HintAct {
     Queue(bool),
     /// ;e
     Edit,
+    /// ;m
+    Mpv,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,6 +163,11 @@ const BUILTINS: &[(&str, Act, &str)] = &[
         ";e",
         Act::Hint(HintAct::Edit, "editable"),
         "hint: edit field in editor",
+    ),
+    (
+        ";m",
+        Act::Hint(HintAct::Mpv, "media"),
+        "hint: play in mpv",
     ),
     ("gf", Act::ViewSource, "view page source"),
     ("gF", Act::Inspector, "DevTools"),
@@ -877,6 +884,7 @@ fn hint_picked(href: &str, text: &str, x: f64, y: f64) {
         HintAct::Remove => tabs::js("__rem.picked?.remove()"),
         HintAct::Queue(front) => commands::queue_add(href, front),
         HintAct::Edit => tabs::js("__rem.editGet(__rem.picked)"),
+        HintAct::Mpv => commands::mpv(href),
     }
 }
 
