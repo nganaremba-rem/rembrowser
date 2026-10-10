@@ -97,6 +97,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("app", "open this page (or URL) as a web app"),
     ("app-install", "add this page to the app launcher"),
     ("config", "edit config.yaml"),
+    ("settings", "Chromium settings (own window)"),
+    ("extensions", "Chrome extensions (own window)"),
+    ("chrome", "this page (or URL) in a Chromium window with toolbar"),
     ("userscripts", "reload userscripts"),
 ];
 

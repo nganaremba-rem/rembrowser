@@ -20,11 +20,17 @@
 | 🛡️ **Ad & tracker blocking** | uBlock-style lists built in, plus element hiding |
 | 🕵️ **Private by default** | no Google sign-in, no sync, no telemetry pings, 3rd-party cookies blocked |
 | 🧘 **Zen mode** | no bars — the tab bar and status line pop up only when something happens |
+| 🪟 **Windows** | run `rembrowser` again (or `:winopen`) for another window |
+| 🧈 **Smooth scrolling** | `j` / `k` glide like a mouse wheel, also while the key is held |
+| 🗂️ **Managers** | edit / delete bookmarks, history, pins, downloads and site permissions in the pickers |
+| 🪶 **Light or full** | ad blocking, DRM and Chrome extensions are switches — you pick the weight |
 | 🏠 **Homescreen** | clock, search box and your own site tiles (add / remove) |
 | 📱 **Web apps** | any site as its own window: `rembrowser --app=https://web.whatsapp.com` |
 | 📺 **Picture-in-picture** | `gp` floats the video |
 | ✍️ **Edit fields in nvim** | `Ctrl-T` in any text box |
-| 📜 **Userscripts** | Greasemonkey-style scripts instead of extensions |
+| 📜 **Userscripts** | Greasemonkey-style scripts — no extension needed |
+| 🧩 **Chrome extensions** | optional (`extensions: true`), managed with `:extensions` |
+| ⚙️ **Chromium settings** | `:settings` opens chrome://settings in its own window |
 | ⚙️ **YAML config** | one file, applies the moment you save it |
 
 ---
@@ -80,6 +86,7 @@ rembrowser uninstall --purge   # removes everything
 | `;i` / `;I` | open image / in new tab |
 | `;s` | download link |
 | `;e` | edit field in nvim |
+| `;m` | play the link / video in mpv |
 | `;k` | remove element |
 | `;p` / `;P` | add to read-later queue |
 
@@ -92,6 +99,7 @@ rembrowser uninstall --purge   # removes everything
 | `Ctrl-t` / `Ctrl-w` | new tab / close tab |
 | `u` | reopen closed tab |
 | `<Space><Space>` | tab picker |
+| 🖱️ mouse | click a tab to switch, `×` on a tab to close it |
 
 ### 🔍 Search & clipboard
 | Key | Action |
@@ -113,11 +121,13 @@ rembrowser uninstall --purge   # removes everything
 |---|---|
 | `<Space>s.` | 🕘 history |
 | `<Space>sm` | 🔖 bookmarks (`<Space>ba` adds one) |
-| `<Space>sd` | ⬇️ downloads |
+| `<Space>sd` | ⬇️ downloads (kept across restarts) |
+| `<Space>sq` | 📚 read-later list |
 | `<Space>sk` | ⌨️ all shortcuts |
 | `<Space>ma` / `<Space>mm` / `<Space>1-4` | 📌 harpoon: pin / list / jump |
 | `<Space>.` / `<Space>S` | 📚 read later: add / open oldest |
 | `<Space>ut` / `<Space>ul` | 📌 pin tab bar / status line |
+| `<Space>ub` | 🔖 show / hide the bookmark bar |
 | `<Space>uc` | ⚙️ edit config |
 
 ### 🎛️ Modes & extras
@@ -134,6 +144,16 @@ rembrowser uninstall --purge   # removes everything
 ### 💬 Inside the `:` popup
 `Tab` / `Ctrl-n` next · `Shift-Tab` / `Ctrl-p` previous · `Ctrl-r %` paste URL · `Ctrl-f` edit in nvim · `Esc` close
 
+### 🗂️ Inside a picker (bookmarks, history, pins, downloads, …)
+| Key | Action |
+|---|---|
+| `Enter` | open |
+| `Ctrl-e` | edit (bookmarks, pins) |
+| `Ctrl-x` | delete the entry |
+| `Ctrl-o` / `Ctrl-d` | downloads: show folder / delete the file too |
+
+🖱️ The same actions appear as buttons on the row under the mouse.
+
 ---
 
 ## 💬 Commands
@@ -142,10 +162,15 @@ rembrowser uninstall --purge   # removes everything
 |---|---|
 | `:open aw niri` | search with a shortcut (`dd` `g` `gh` `aw` `yt` `w`) |
 | `:tabs` `:history` `:bookmarks` `:downloads` `:keys` | pickers |
+| `:queue` `:permissions` | read-later list · remembered site permissions |
+| `:history-clear` `:downloads-clear` | forget all history / the download list |
+| `:winopen [URL]` | new window |
+| `:mpv [URL]` | play this page (or URL) in mpv |
+| `:settings` `:extensions` `:chrome [URL]` | Chromium settings · extensions · a page in a Chromium window |
 | `:app` / `:app-install` | turn this page into a web app / add it to your launcher |
 | `:pip` | picture-in-picture |
 | `:set dark-mode!` | toggle any setting |
-| `:config` | edit your config |
+| `:config` | edit your config (`config.yaml`) |
 | `:userscripts` | reload userscripts |
 
 ---
@@ -159,7 +184,10 @@ settings:
   home-page: home          # "home" = the homescreen, or any URL
   status-bar: false        # true = always visible
   tab-bar: false
+  bookmark-bar: false
   dark-mode: true
+  smooth-scrolling: true
+  confirm-quit: true       # ask before closing a window
   download-path: ~/Downloads
 
 search:
@@ -176,6 +204,26 @@ keys:
 
 🔄 Coming from **vimb**? Add `source: [~/.config/vimb/config]` — your vimb config just works.
 
+### 🪶 Light or full
+Everything that adds weight is a switch in `settings:` (read at startup — restart after changing one):
+
+| Setting | Default | What it loads |
+|---|---|---|
+| `adblock` | `true` | filter lists in memory (~13 MB), list downloads |
+| `drm` | `true` | Widevine, for Netflix / Spotify / … |
+| `extensions` | `false` | Chrome extensions |
+| `smooth-scrolling` | `true` | animated `j` / `k` (off = instant jumps) |
+| `tab-bar` `bookmark-bar` `status-bar` | `false` | pinned bars |
+
+🪶 Lightest: `adblock: false`, `drm: false`, `extensions: false`. 🧰 Fullest: all `true`.
+
+### 🧩 Chrome extensions (optional)
+1. Set `extensions: true` in the config and restart.
+2. `:extensions` opens Chromium's extension page; `:chrome https://chromewebstore.google.com` opens the Web Store in a Chromium window where **Add to Chrome** works.
+3. Installed extensions then act on your normal tabs: content scripts, background workers and messaging run.
+
+Limits: tabs are not Chrome tabs, so an extension that lists tabs (`chrome.tabs.query`) sees none, and toolbar buttons / extension popups only exist in `:chrome` windows.
+
 ### 📜 Userscripts
 Drop `*.js` files in `~/.config/rembrowser/userscripts/`:
 
@@ -190,9 +238,13 @@ GM_addStyle('#comments { display: none !important }');
 
 ## ❓ FAQ
 
-**🧩 Chrome extensions?** Not possible with this engine mode (CEF's Alloy runtime) — use userscripts. Ad blocking is built in.
+**🧩 Chrome extensions?** Optional — see *Chrome extensions* above. Ad blocking and userscripts are built in, so most setups need none.
 
-**⚙️ `chrome://settings`?** Doesn't exist here. Use `:config` / `:set`. `chrome://version` and `chrome://gpu` still work.
+**⚙️ `chrome://settings`?** `:settings` opens it in its own window (tabs run without Chromium's UI layer, which is what keeps them light). rembrowser's own options are in `:config` / `:set`.
+
+**🪟 Second window?** Run `rembrowser` again, `rembrowser --new-window URL`, or `:winopen`. `rembrowser URL` adds a tab to the window you used last, and `rembrowser ':tabopen x.org'` runs any command in the running browser.
+
+**🚪 Quit asks every time?** `confirm-quit: false`.
 
 **🎬 DRM didn't play on first launch?** Widevine downloads in the background on first run — restart once.
 

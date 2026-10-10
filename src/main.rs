@@ -56,10 +56,15 @@ fn main() {
     ipc::listen();
     let root = data_dir();
     let profile = format!("{root}/Default");
-    widevine::setup(&profile);
-    adblock::start();
-    // Before CEF reads its switches: the config can turn on dark-mode.
+    // First: the config decides which optional parts start at all (drm, adblock,
+    // extensions) and which switches CEF gets (dark-mode).
     commands::load_config();
+    if commands::opt_bool("drm", true) {
+        widevine::setup(&profile);
+    }
+    if commands::opt_bool("adblock", true) {
+        adblock::start();
+    }
     userscripts::load();
     config::watch();
 

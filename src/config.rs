@@ -32,14 +32,23 @@ settings:
   home-page: home          # "home" = the homescreen, or any URL
   status-bar: false        # true = always show the status line (false = pops up)
   tab-bar: false           # true = always show the tab bar (false = pops up)
-  dark-mode: true          # sites get prefers-color-scheme: dark
+  bookmark-bar: false      # true = show the bookmark bar
+  dark-mode: true          # sites get prefers-color-scheme: dark (restart)
   hint-keys: asdfghjkl
-  scroll-step: 60
-  smooth-scrolling: true
+  scroll-step: 60          # pixels per j / k
+  smooth-scrolling: true   # false = jump instead of glide
   incsearch: true
+  confirm-quit: true       # ask before closing a window
   download-path: ~/Downloads
   geolocation: never
   # editor-command: foot nvim %s     # Ctrl-T in text fields; %s = the file
+  # mpv-command: mpv                 # ;m and :mpv
+
+  # Light or full: each of these loads more into the browser. They are read at
+  # startup, so restart after changing one.
+  adblock: true            # built-in ad & tracker blocking (filter lists in memory)
+  drm: true                # Widevine: Netflix, Spotify, ...
+  extensions: false        # Chrome extensions; manage them with :extensions
 
 search:
   default: dd              # what plain words in :open search with

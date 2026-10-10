@@ -177,7 +177,12 @@ fn exec_one(line: &str) {
         "permissions" => pickers::permissions(),
         "pip" => tabs::pip(),
         "mpv" => mpv(args),
-        "config" | "settings" => crate::config::open_in_editor(false),
+        "config" => crate::config::open_in_editor(false),
+        // Chromium's own pages, in a window with Chromium's UI layer.
+        "settings" => tabs::chrome_window("chrome://settings", false),
+        "extensions" => tabs::chrome_window("chrome://extensions", true),
+        "chrome" if args.is_empty() => tabs::chrome_window(&tabs::active_url(), true),
+        "chrome" => tabs::chrome_window(&resolve_url(args), true),
         // :app [URL] — this page (or URL) as a web app; the tab closes.
         "app" if args.is_empty() => {
             let url = tabs::active_url();
@@ -269,22 +274,32 @@ fn set(args: &str) {
     OPTS.with_borrow_mut(|o| o.set.insert(key.clone(), val.clone()));
     match key.as_str() {
         "status-bar" | "tab-bar" | "bookmark-bar" => ui::bars_changed(),
+        // Read once at startup (they decide what gets loaded into the process).
+        "adblock" | "drm" | "extensions" | "dark-mode" if ui::is_up() => {
+            ui::message(&format!("{key} = {val}: applies after a restart"), false)
+        }
         "fullscreen" => tabs::set_fullscreen(opt_bool("fullscreen", false)),
         _ => {}
     }
 }
 
 fn default_on(key: &str) -> bool {
-    matches!(key, "smooth-scrolling" | "incsearch" | "confirm-quit")
+    matches!(
+        key,
+        "smooth-scrolling" | "incsearch" | "confirm-quit" | "adblock" | "drm"
+    )
 }
 
 /// Options rembrowser acts on, with their current value (for :set completion).
 pub fn settings() -> Vec<(String, String)> {
     const KNOWN: &[&str] = &[
+        "adblock",
         "bookmark-bar",
         "confirm-quit",
         "dark-mode",
+        "drm",
         "editor-command",
+        "extensions",
         "fullscreen",
         "geolocation",
         "hint-keys",
@@ -387,7 +402,9 @@ fn encode(s: &str) -> String {
 
 pub fn open(arg: &str, new_tab: bool) {
     let url = resolve_url(arg);
-    if new_tab {
+    if tabs::needs_chrome(&url) {
+        tabs::chrome_window(&url, true);
+    } else if new_tab {
         tabs::open(&url, false);
     } else {
         tabs::load(&url);

@@ -11,6 +11,7 @@ use std::cell::{Cell, RefCell};
 
 pub const APP_ID: &str = "rembrowser";
 const DEVTOOLS_APP_ID: &str = "rembrowser-devtools";
+const CHROME_APP_ID: &str = "rembrowser-chrome";
 /// Catppuccin Mocha base: no white flash while a tab loads.
 pub const BG: u32 = 0xFF1E_1E2E;
 const PAGE_JS: &str = include_str!("page.js");
@@ -43,8 +44,9 @@ thread_local! {
     static FAVICONS: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
     /// The web-app window with keyboard focus (None = a browser window).
     static APP_FOCUS: RefCell<Option<BrowserView>> = const { RefCell::new(None) };
-    /// Open DevTools windows: the last browser window waits for them before closing.
-    static DEVTOOLS: RefCell<Vec<Window>> = const { RefCell::new(Vec::new()) };
+    /// Open Chrome-style windows (DevTools, chrome://settings, ...): the last browser
+    /// window waits for them before closing.
+    static CHROME_WINS: RefCell<Vec<Window>> = const { RefCell::new(Vec::new()) };
     /// The last browser window was asked to close (quit_all / WM close).
     /// ponytail: never reset; if a beforeunload cancels the quit, closing DevTools
     /// later re-asks the tabs. Reset on cancel if that ever matters.
@@ -822,13 +824,14 @@ wrap_window_delegate! {
                 });
                 return 0;
             }
-            // The last window takes the DevTools windows with it: one still open
-            // keeps CEF from shutting down. Each one's on_window_destroyed retries.
+            // The last window takes the Chrome-style windows (DevTools, settings) with
+            // it: one still open keeps CEF from shutting down. Each one's
+            // on_window_destroyed retries.
             if win_ids() == [id] {
                 CLOSING.set(true);
-                let devtools = DEVTOOLS.with_borrow(|d| d.clone());
-                if !devtools.is_empty() {
-                    devtools.iter().for_each(|w| w.close());
+                let chrome = CHROME_WINS.with_borrow(|d| d.clone());
+                if !chrome.is_empty() {
+                    chrome.iter().for_each(|w| w.close());
                     return 0;
                 }
             }
@@ -893,7 +896,7 @@ wrap_browser_view_delegate! {
             // DevTools (gF): its own window, tiled next to the page by niri.
             if is_devtools != 0 {
                 let Some(bv) = popup_browser_view else { return 0 };
-                let mut d = DevToolsWindowDelegate::new(bv.clone());
+                let mut d = ChromeWindowDelegate::new(bv.clone(), DEVTOOLS_APP_ID.into(), "DevTools — rembrowser".into());
                 window_create_top_level(Some(&mut d));
                 return 1;
             }
@@ -1228,13 +1231,83 @@ wrap_request_handler! {
     }
 }
 
-// DevTools window: just the view, plus an app_id niri rules can match.
-wrap_window_delegate! {
-    struct DevToolsWindowDelegate {
-        view: BrowserView,
+/// What only Chromium's own UI layer can show: these open in a Chrome-style window
+/// (`:settings`, `:extensions`, `:chrome URL`) instead of a tab.
+pub fn needs_chrome(url: &str) -> bool {
+    ["chrome://settings", "chrome://extensions", "chrome://password-manager", "https://chromewebstore.google.com"]
+        .iter()
+        .any(|p| url.starts_with(p))
+}
+
+/// A window with Chromium's own UI layer around `url`: settings and extension pages
+/// only exist there (the tabs are Alloy style: no Chrome UI, much lighter). One page
+/// per window is CEF's limit for this style. `toolbar` adds Chrome's address bar
+/// with the extension buttons and menu.
+pub fn chrome_window(url: &str, toolbar: bool) {
+    let mut client = ChromeClient::new();
+    let mut delegate = ChromeViewDelegate::new(toolbar);
+    let view = browser_view_create(
+        Some(&mut client),
+        Some(&url.into()),
+        Some(&BrowserSettings::default()),
+        None,
+        None,
+        Some(&mut delegate),
+    );
+    if let Some(bv) = view {
+        let mut d = ChromeWindowDelegate::new(bv, CHROME_APP_ID.into(), "Chromium — rembrowser".into());
+        window_create_top_level(Some(&mut d));
+    }
+}
+
+wrap_client! {
+    struct ChromeClient;
+
+    impl Client {}
+}
+
+wrap_browser_view_delegate! {
+    struct ChromeViewDelegate {
+        toolbar: bool,
     }
 
     impl ViewDelegate {}
+
+    impl BrowserViewDelegate {
+        fn browser_runtime_style(&self) -> RuntimeStyle {
+            RuntimeStyle::CHROME
+        }
+
+        fn chrome_toolbar_type(&self, _browser_view: Option<&mut BrowserView>) -> ChromeToolbarType {
+            if self.toolbar { ChromeToolbarType::NORMAL } else { ChromeToolbarType::NONE }
+        }
+
+        // Chrome's toolbar is complete (has a size) once its browser exists: it
+        // goes above the page then.
+        fn on_browser_created(&self, browser_view: Option<&mut BrowserView>, _browser: Option<&mut Browser>) {
+            let Some(bv) = browser_view else { return };
+            if let (Some(mut toolbar), Some(w)) = (bv.chrome_toolbar(), View::from(&*bv).window()) {
+                w.add_child_view_at(Some(&mut toolbar), 0);
+                View::from(&w).invalidate_layout();
+            }
+        }
+    }
+}
+
+// A Chrome-style window (DevTools, settings, extensions): Chrome's toolbar if the view
+// has one, the view, and an app_id niri rules can match.
+wrap_window_delegate! {
+    struct ChromeWindowDelegate {
+        view: BrowserView,
+        app_id: String,
+        title: String,
+    }
+
+    impl ViewDelegate {
+        fn preferred_size(&self, _view: Option<&mut View>) -> Size {
+            Size { width: 1100, height: 800 }
+        }
+    }
 
     impl PanelDelegate {}
 
@@ -1254,22 +1327,29 @@ wrap_window_delegate! {
         }
         fn on_window_created(&self, window: Option<&mut Window>) {
             let Some(w) = window else { return };
-            w.set_to_fill_layout();
+            let layout = w.set_to_box_layout(Some(&BoxLayoutSettings {
+                cross_axis_alignment: AxisAlignment::STRETCH,
+                ..Default::default()
+            }));
             w.add_child_view(Some(&mut View::from(&self.view)));
-            w.set_title(Some(&"DevTools — rembrowser".into()));
+            if let Some(l) = layout {
+                l.set_flex_for_view(Some(&mut View::from(&self.view)), 1);
+            }
+            w.set_title(Some(&self.title.as_str().into()));
             w.show();
-            DEVTOOLS.with_borrow_mut(|d| d.push(w.clone()));
+            self.view.request_focus();
+            CHROME_WINS.with_borrow_mut(|d| d.push(w.clone()));
         }
 
         fn on_window_destroyed(&self, window: Option<&mut Window>) {
             let Some(w) = window else { return };
-            DEVTOOLS.with_borrow_mut(|d| d.retain(|x| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));
+            CHROME_WINS.with_borrow_mut(|d| d.retain(|x| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));
             if CLOSING.get() {
                 ui::run_on_ui(0, quit_all);
             }
         }
 
-        // Closing the window closes DevTools' browser first (like the main window).
+        // Closing the window closes its browser first (like a browser window).
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
             self.view.browser().and_then(|b| b.host()).map_or(1, |h| h.try_close_browser())
         }
@@ -1280,9 +1360,9 @@ wrap_window_delegate! {
             properties: Option<&mut LinuxWindowProperties>,
         ) -> i32 {
             let Some(p) = properties else { return 0 };
-            p.wayland_app_id = static_str(DEVTOOLS_APP_ID);
-            p.wm_class_class = static_str(DEVTOOLS_APP_ID);
-            p.wm_class_name = static_str(DEVTOOLS_APP_ID);
+            p.wayland_app_id = static_str(&self.app_id);
+            p.wm_class_class = static_str(&self.app_id);
+            p.wm_class_name = static_str(&self.app_id);
             1
         }
     }
