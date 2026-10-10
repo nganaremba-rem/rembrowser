@@ -130,6 +130,10 @@ rembrowser uninstall --purge   # removes everything
 | `<Space>ut` / `<Space>ul` | 📌 pin tab bar / status line |
 | `<Space>ub` | 🔖 show / hide the bookmark bar |
 | `<Space>uc` | ⚙️ edit config |
+| `<Space>us` | ⚙️ Chromium settings |
+| `<Space>ee` / `<Space>ep` | 🧩 extensions: manage / open a popup |
+| `<Space>ei` / `<Space>ex` | 🧩 extensions: install from this Web Store page / remove one |
+| `<Space>ec` | 🧩 this page in a Chromium window (toolbar, extension buttons) |
 
 ### 🎛️ Modes & extras
 | Key | Action |
@@ -170,6 +174,7 @@ rembrowser uninstall --purge   # removes everything
 | `:settings` `:extensions` `:chrome [URL]` | Chromium settings · extensions · a page in a Chromium window |
 | `:ext-install [URL\|id]` `:ext-remove` | install an extension from the Web Store · remove one |
 | `:app` / `:app-install` | turn this page into a web app / add it to your launcher |
+| `:ext-popup` | open an extension's popup in its own window |
 | `:pip` | picture-in-picture |
 | `:set dark-mode!` | toggle any setting |
 | `:config` | edit your config (`config.yaml`) |
@@ -224,9 +229,9 @@ Everything that adds weight is a switch in `settings:` (read at startup — rest
 2. Open the extension's [Chrome Web Store](https://chromewebstore.google.com) page and run `:ext-install` (or `:ext-install <store URL or id>` from anywhere). The store's own button only works in Chrome, so rembrowser downloads and unpacks the extension itself.
 3. Restart. The extension now acts on your normal tabs (tested: Dark Reader, uBlock Origin Lite).
 
-`:extensions` opens Chromium's extension page (options, on/off switches) · `:ext-remove` deletes one · `:ext-install` again updates one.
+`:extensions` opens Chromium's extension page (options, on/off switches) · `:ext-popup` opens an extension's popup (the page behind its toolbar button) in its own window · `:ext-remove` deletes one · `:ext-install` again updates one.
 
-Limits: tabs are not Chrome tabs, so an extension that lists tabs (`chrome.tabs.query`) sees none, and toolbar buttons / extension popups only exist in `:chrome` windows. Extensions do not update on their own.
+Limits: tabs are not Chrome tabs, so an extension that lists tabs (`chrome.tabs.query`) sees none, and toolbar buttons only exist in `:chrome` windows (`:ext-popup` opens the popup without one). Extensions do not update on their own.
 
 ### 📜 Userscripts
 Drop `*.js` files in `~/.config/rembrowser/userscripts/`:

@@ -101,6 +101,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("extensions", "Chrome extensions (own window)"),
     ("ext-install", "install an extension: Web Store URL or id (or this store page)"),
     ("ext-remove", "remove an installed extension"),
+    ("ext-popup", "open an extension's popup (own window)"),
     ("chrome", "this page (or URL) in a Chromium window with toolbar"),
     ("userscripts", "reload userscripts"),
 ];

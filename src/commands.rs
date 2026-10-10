@@ -173,6 +173,7 @@ fn exec_one(line: &str) {
         "downloads" | "dl" => crate::downloads::picker(),
         "downloads-clear" => crate::downloads::clear(),
         "queue" => pickers::queue(),
+        "ext-popup" => crate::extensions::popup_picker(),
         "history-clear" => pickers::history_clear(),
         "permissions" => pickers::permissions(),
         "pip" => tabs::pip(),

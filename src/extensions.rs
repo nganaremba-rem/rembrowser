@@ -5,13 +5,16 @@
 //! Chrome would get — and unpacks it to ~/.local/share/rembrowser/extensions/<id>.
 //! Every folder there is handed to Chromium with --load-extension at startup, so
 //! installs and removals apply after a restart. `:extensions` (chrome://extensions)
-//! shows them with their options and on/off switches.
+//! shows them with their options and on/off switches; `:ext-popup` opens the page
+//! behind an extension's toolbar button in its own window.
 //!
-//! ponytail: loaded unpacked, an extension's id comes from its folder path, not from
-//! the store. Write the package's public key into manifest.json ("key") if one ever
-//! needs its store id. No auto-update either: `:ext-install` again fetches the latest.
+//! ponytail: loaded unpacked, an extension without a "key" in its manifest gets its
+//! id from its folder path, not from the store (`runtime_id`). Write the package's
+//! public key into manifest.json if one ever needs its store id. No auto-update
+//! either: `:ext-install` again fetches the latest.
 
 use crate::{commands, popup, tabs, ui, widevine};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 fn dir() -> PathBuf {
@@ -150,9 +153,80 @@ pub fn remove_picker() {
     );
 }
 
+/// The id Chromium runs the unpacked folder under: the store id when the manifest
+/// carries the store's key, else the SHA-256 of the folder's real path, first 16
+/// bytes, each hex digit as a letter a–p.
+fn runtime_id(id: &str) -> String {
+    let folder = dir().join(id);
+    if json(folder.join("manifest.json")).is_some_and(|m| m["key"].is_string()) {
+        return id.into();
+    }
+    let real = folder.canonicalize().unwrap_or(folder);
+    id_for_path(&real.to_string_lossy())
+}
+
+fn id_for_path(path: &str) -> String {
+    Sha256::digest(path.as_bytes())[..16]
+        .iter()
+        .flat_map(|b| [b >> 4, b & 15])
+        .map(|n| (b'a' + n) as char)
+        .collect()
+}
+
+/// The page behind the toolbar button, else the options page.
+fn popup_page(manifest: &serde_json::Value) -> Option<&str> {
+    [
+        &manifest["action"]["default_popup"],
+        &manifest["browser_action"]["default_popup"],
+        &manifest["page_action"]["default_popup"],
+        &manifest["options_ui"]["page"],
+        &manifest["options_page"],
+    ]
+    .into_iter()
+    .find_map(|v| v.as_str().filter(|p| !p.is_empty()))
+}
+
+/// `:ext-popup`: pick an extension; its popup opens in a Chromium window.
+pub fn popup_picker() {
+    if !commands::opt_bool("extensions", false) {
+        ui::message("ext-popup: set extensions: true and restart", true);
+        return;
+    }
+    let list = installed();
+    let rows: Vec<_> = list
+        .iter()
+        .map(|(id, name)| ("setting", name.clone(), id.clone()))
+        .collect();
+    popup::pick("\u{f0483} Extension popup", &rows, move |i| {
+        let (id, name) = &list[i];
+        let manifest = json(dir().join(id).join("manifest.json")).unwrap_or_default();
+        match popup_page(&manifest) {
+            Some(page) => {
+                let page = page.trim_start_matches('/');
+                tabs::chrome_window(&format!("chrome-extension://{}/{page}", runtime_id(id)), false);
+            }
+            None => ui::message(&format!("{name} has no popup or options page"), true),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    use super::id_in;
+    use super::{id_for_path, id_in, popup_page};
+
+    #[test]
+    fn popup_page_prefers_the_toolbar_button() {
+        let m = serde_json::json!({"action": {"default_popup": "ui/popup.html"}, "options_page": "o.html"});
+        assert_eq!(popup_page(&m), Some("ui/popup.html"));
+        assert_eq!(popup_page(&serde_json::json!({"options_ui": {"page": "o.html"}})), Some("o.html"));
+        assert_eq!(popup_page(&serde_json::json!({"action": {}})), None);
+    }
+
+    #[test]
+    fn unpacked_id_is_32_letters_a_to_p() {
+        let id = id_for_path("/home/u/.local/share/rembrowser/extensions/x");
+        assert_eq!(id_in(&id), Some(id.as_str()));
+    }
 
     #[test]
     fn finds_extension_ids() {
