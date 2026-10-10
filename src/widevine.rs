@@ -84,8 +84,15 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-/// Ask the update service, download, verify, unpack. Returns the CDM version.
-fn fetch() -> Result<String, String> {
+struct Latest {
+    name: String,
+    sha: String,
+    version: String,
+    bases: Vec<String>,
+}
+
+/// What the update service currently offers.
+fn latest() -> Result<Latest, String> {
     let req = format!(
         r#"{{"request":{{"@os":"linux","@updater":"chromium","acceptformat":"crx3","protocol":"3.1","prodversion":"152.0.0.0","updaterversion":"152.0.0.0","arch":"x64","os":{{"platform":"Linux","arch":"x86_64","version":"6.0"}},"app":[{{"appid":"{APP_ID}","version":"0.0.0.0","updatecheck":{{}}}}]}}}}"#
     );
@@ -114,20 +121,75 @@ fn fetch() -> Result<String, String> {
             check["status"]
         ));
     };
-    let base = check["urls"]["url"]
+    let bases = check["urls"]["url"]
         .as_array()
-        .and_then(|u| {
+        .map(|u| {
             u.iter()
                 .filter_map(|x| x["codebase"].as_str())
-                .find(|c| c.starts_with("https://dl.google.com"))
-                .or_else(|| {
-                    u.iter()
-                        .filter_map(|x| x["codebase"].as_str())
-                        .find(|c| c.starts_with("https://"))
-                })
+                .filter(|c| c.starts_with("https://"))
+                .map(String::from)
+                .collect()
         })
-        .ok_or("no https download URL")?;
-    let crx = curl(&[&format!("{base}{name}")])?;
+        .unwrap_or_default();
+    Ok(Latest {
+        name: name.into(),
+        sha: sha.into(),
+        version: version.into(),
+        bases,
+    })
+}
+
+/// `rembrowser update`: refresh our own copy (a Chrome/Chromium copy updates with that browser).
+pub fn update() -> Result<String, String> {
+    if let Some(d) = find().filter(|d| *d != own_dir()) {
+        return Ok(format!(
+            "using {} (updated together with that browser)",
+            d.display()
+        ));
+    }
+    let have = std::fs::read_to_string(own_dir().join("manifest.json"))
+        .ok()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+        .and_then(|m| m["version"].as_str().map(String::from));
+    let l = latest()?;
+    if have.as_deref() == Some(l.version.as_str()) {
+        return Ok(format!("{} (up to date)", l.version));
+    }
+    fetch_from(l).map(|v| format!("{v} installed — restart rembrowser to use it"))
+}
+
+/// Download, verify, unpack. Returns the CDM version.
+fn fetch() -> Result<String, String> {
+    fetch_from(latest()?)
+}
+
+fn fetch_from(l: Latest) -> Result<String, String> {
+    let Latest {
+        name,
+        sha,
+        version,
+        bases,
+    } = l;
+    // Resumable: a stalled or interrupted download continues from the .part file
+    // (next mirror, or next browser start).
+    let part = own_dir().with_extension("crx3.part");
+    let _ = std::fs::create_dir_all(part.parent().ok_or("bad data dir")?);
+    let part_s = part.to_string_lossy().into_owned();
+    let mut last = String::from("no https download URL");
+    let done = bases.iter().any(|base| {
+        match curl(&["-C", "-", "-o", &part_s, &format!("{base}{name}")]) {
+            Ok(_) => true,
+            Err(e) => {
+                last = e;
+                false
+            }
+        }
+    });
+    if !done {
+        return Err(last);
+    }
+    let crx = std::fs::read(&part).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&part);
     let got = Sha256::digest(&crx)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -141,7 +203,7 @@ fn fetch() -> Result<String, String> {
     let dest = own_dir();
     let _ = std::fs::remove_dir_all(&dest);
     std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
-    Ok(version.to_string())
+    Ok(version)
 }
 
 /// CRX3 = "Cr24", u32 version, u32 header length, header (signatures), zip.

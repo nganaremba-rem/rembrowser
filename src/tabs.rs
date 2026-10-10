@@ -4,7 +4,7 @@
 //! All CEF Views calls happen on the UI thread, so tab state lives in thread_locals
 //! (no locks). Rule: never call into vim/ui while holding a borrow here.
 
-use crate::{adblock, commands, downloads, home, permissions, popup, ui, userscripts, vim};
+use crate::{adblock, apps, commands, downloads, home, permissions, popup, ui, userscripts, vim};
 use cef::*;
 use std::cell::{Cell, RefCell};
 
@@ -26,6 +26,7 @@ thread_local! {
     /// Status bar right side: find count + load progress.
     static FIND: RefCell<String> = const { RefCell::new(String::new()) };
     static PROGRESS: Cell<u8> = const { Cell::new(100) };
+    static FAVICONS: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
     /// Open DevTools windows: the main window waits for them before closing.
     static DEVTOOLS: RefCell<Vec<Window>> = const { RefCell::new(Vec::new()) };
     /// The main window was asked to close (quit_all / WM close).
@@ -38,7 +39,7 @@ thread_local! {
 /// (e.g. `"x".into()`) becomes zeroed, so CEF sees "". A *borrowed* one survives,
 /// so point it at a static UTF-16 buffer (CEF copies it).
 /// ponytail: leaks the UTF-16 copy; called once per window (main + each DevTools).
-fn static_str(s: &str) -> CefString {
+pub fn static_str(s: &str) -> CefString {
     let buf: &'static [u16] = Vec::leak(s.encode_utf16().collect());
     sys::_cef_string_utf16_t {
         str_: buf.as_ptr().cast_mut(),
@@ -49,6 +50,7 @@ fn static_str(s: &str) -> CefString {
 }
 
 pub fn create_window(url: String) {
+    CLOSING.set(false);
     let mut delegate = RemWindowDelegate::new(url);
     window_create_top_level(Some(&mut delegate));
 }
@@ -74,19 +76,36 @@ fn browser_settings() -> BrowserSettings {
     }
 }
 
-pub fn open(url: &str, background: bool) {
+/// A browser view with all of rembrowser's handlers (tabs and web apps).
+pub fn new_view(url: &str) -> Option<BrowserView> {
     let mut client = RemClient::new();
     let mut delegate = RemBrowserViewDelegate::new();
-    let bv = browser_view_create(
+    browser_view_create(
         Some(&mut client),
         Some(&url.into()),
         Some(&browser_settings()),
         None,
         None,
         Some(&mut delegate),
-    );
-    if let Some(bv) = bv {
+    )
+}
+
+pub fn open(url: &str, background: bool) {
+    if let Some(bv) = new_view(url) {
         add(bv, background);
+    }
+}
+
+/// From outside (another `rembrowser URL`, a web app's link): a tab in the browser
+/// window, opening that window first if only web apps are running.
+pub fn open_or_create(url: &str) {
+    let url = commands::resolve_url(url);
+    match window() {
+        Some(w) => {
+            open(&url, false);
+            w.activate();
+        }
+        None => create_window(url),
     }
 }
 
@@ -205,6 +224,11 @@ pub fn active_url() -> String {
     active().map(|bv| url_of(&bv)).unwrap_or_default()
 }
 
+pub fn active_favicon() -> Option<String> {
+    let id = active_id()?;
+    FAVICONS.with_borrow(|f| f.get(&id).cloned())
+}
+
 pub fn active_title() -> String {
     active().map(|bv| title_of(&bv)).unwrap_or_default()
 }
@@ -223,13 +247,15 @@ pub fn active_id() -> Option<i32> {
     active().and_then(|bv| bv.browser()).map(|b| b.identifier())
 }
 
-/// Like js(), in the tab with this browser id (if it still exists).
+/// Like js(), in the tab or web app with this browser id (if it still exists).
 pub fn js_in(id: i32, code: &str) {
-    let b = TABS.with_borrow(|t| {
-        t.iter()
-            .filter_map(|bv| bv.browser())
-            .find(|b| b.identifier() == id)
-    });
+    let b = TABS
+        .with_borrow(|t| {
+            t.iter()
+                .filter_map(|bv| bv.browser())
+                .find(|b| b.identifier() == id)
+        })
+        .or_else(|| apps::browser(id));
     if let Some(f) = b.and_then(|b| b.main_frame()) {
         f.execute_java_script(
             Some(&format!("{PAGE_JS};{code}").as_str().into()),
@@ -422,7 +448,9 @@ fn on_tab_closed(browser: &mut Browser) {
     let n = TABS.with_borrow(|t| t.len());
     if n == 0 {
         // Last tab gone: close the window, which quits (vimb `:q` on the last tab).
-        quit_all();
+        // Next tick: we may be inside can_close's loop right now (closing a tab
+        // re-entering can_close crashes CEF on the half-closed popup).
+        ui::run_on_ui(0, quit_all);
         return;
     }
     ui::reveal_tabs();
@@ -501,7 +529,16 @@ wrap_window_delegate! {
 
         fn on_window_destroyed(&self, _window: Option<&mut Window>) {
             WINDOW.with_borrow_mut(|w| w.take());
-            quit_message_loop();
+            CONTENT.with_borrow_mut(|c| c.take());
+            TABS.with_borrow_mut(Vec::clear);
+            ACTIVE.set(0);
+            // The bars and popup belonged to this window; a new one builds its own.
+            ui::reset();
+            popup::reset();
+            // Web apps keep running on their own; quit with the last window.
+            if apps::is_empty() {
+                quit_message_loop();
+            }
         }
 
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
@@ -561,10 +598,16 @@ wrap_browser_view_delegate! {
 
         fn on_popup_browser_view_created(
             &self,
-            _browser_view: Option<&mut BrowserView>,
+            browser_view: Option<&mut BrowserView>,
             popup_browser_view: Option<&mut BrowserView>,
             is_devtools: i32,
         ) -> i32 {
+            // A web app's sign-in popup etc.: another window of that app.
+            if let Some(id) = browser_view.as_ref().and_then(|v| v.browser()).and_then(|b| apps::app_id_of(&b)) {
+                let Some(bv) = popup_browser_view else { return 0 };
+                apps::window(bv.clone(), id);
+                return 1;
+            }
             // DevTools (gF): its own window, tiled next to the page by niri.
             if is_devtools != 0 {
                 let Some(bv) = popup_browser_view else { return 0 };
@@ -624,12 +667,26 @@ wrap_display_handler! {
 
     impl DisplayHandler {
         fn on_title_change(&self, browser: Option<&mut Browser>, title: Option<&CefString>) {
+            if let Some(b) = browser.as_ref().filter(|b| apps::is_app(b)) {
+                apps::set_title(b, title);
+                return;
+            }
             if browser.is_some_and(|b| is_active(b)) {
                 if let Some(w) = window() {
                     w.set_title(title);
                 }
             }
             refresh_tabbar();
+        }
+
+        // Remembered for :app-install (launcher icon). Prefer png/svg over .ico.
+        fn on_favicon_urlchange(&self, browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
+            let (Some(b), Some(list)) = (browser, icon_urls) else { return };
+            let urls: Vec<String> = std::mem::take(list).into_iter().map(|u| u.to_string()).collect();
+            let best = urls.iter().find(|u| u.ends_with(".png") || u.ends_with(".svg")).or(urls.first()).cloned();
+            if let Some(u) = best {
+                FAVICONS.with_borrow_mut(|f| f.insert(b.identifier(), u));
+            }
         }
 
         fn on_address_change(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
@@ -657,6 +714,15 @@ wrap_display_handler! {
         ) -> i32 {
             let msg = message.map(|m| m.to_string()).unwrap_or_default();
             let Some(body) = msg.strip_prefix("\u{1}rem\t") else { return 0 };
+            // Answer to a permission prompt shown inside a web-app window.
+            if let Some(rest) = body.strip_prefix("perm-answer\t") {
+                if let (Some(b), Some((id, choice))) = (browser.as_ref(), rest.split_once('\t')) {
+                    if let Ok(id) = id.parse() {
+                        permissions::answer_from(b.identifier(), id, choice);
+                    }
+                }
+                return 1;
+            }
             // Homescreen search box: only from the homescreen itself.
             if let Some(text) = body.strip_prefix("home-open\t") {
                 let from_home = browser.as_ref().and_then(|b| b.main_frame()).is_some_and(|f| home::is_home(&CefString::from(&f.url()).to_string()));
@@ -757,10 +823,10 @@ wrap_life_span_handler! {
     impl LifeSpanHandler {
         fn on_before_popup(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             _popup_id: i32,
-            _target_url: Option<&CefString>,
+            target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             target_disposition: WindowOpenDisposition,
             _user_gesture: i32,
@@ -771,11 +837,22 @@ wrap_life_span_handler! {
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
+            // Web apps: window.open popups (sign-in) stay with the app; ordinary
+            // links go to the browser as tabs.
+            if browser.is_some_and(|b| apps::is_app(b)) && target_disposition != WindowOpenDisposition::NEW_POPUP {
+                let url = target_url.map(|u| u.to_string()).unwrap_or_default();
+                ui::run_on_ui(0, move || open_or_create(&url));
+                return 1;
+            }
             NEXT_POPUP_BACKGROUND.set(target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB);
             0
         }
 
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            // A web app's browser closing = its window closing (the default).
+            if browser.as_ref().is_some_and(|b| apps::is_app(b)) {
+                return 0;
+            }
             // A Views browser is destroyed when its BrowserView leaves the window, so
             // detach it here and return 1. The default (0) would close the whole
             // window, i.e. every tab. on_tab_closed closes the window after the last tab.
@@ -794,12 +871,15 @@ wrap_keyboard_handler! {
         // Before the page sees the key: swallowing the keydown also drops its char event.
         fn on_pre_key_event(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             event: Option<&KeyEvent>,
             _os_event: Option<&mut sys::XEvent>,
             _is_keyboard_shortcut: Option<&mut i32>,
         ) -> i32 {
             let Some(e) = event else { return 0 };
+            if let Some(b) = browser.filter(|b| apps::is_app(b)) {
+                return (e.type_ == KeyEventType::RAWKEYDOWN && apps::key(b, e)) as i32;
+            }
             (e.type_ == KeyEventType::RAWKEYDOWN && vim::on_key(e)) as i32
         }
     }

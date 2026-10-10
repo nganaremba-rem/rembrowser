@@ -58,6 +58,17 @@ const COMMANDS: &[(&str, &str)] = &[
     ("source", "run a config file"),
     ("zoom", "zoom by N steps"),
     ("echo", "show a message"),
+    ("history", "recent pages"),
+    ("bookmarks", "bookmarks"),
+    ("keys", "keymap cheatsheet"),
+    ("pins", "harpoon pins"),
+    ("pin", "pin page: add | N"),
+    ("downloads", "this session's downloads"),
+    ("pip", "picture-in-picture"),
+    ("app", "open this page (or URL) as a web app"),
+    ("app-install", "add this page to the app launcher"),
+    ("config", "edit config.yaml"),
+    ("userscripts", "reload userscripts"),
 ];
 
 pub fn init(window: &Window) {
@@ -286,6 +297,11 @@ fn run_js(js: &str) {
     if let Some(f) = frame {
         f.execute_java_script(Some(&js.into()), Some(&"rembrowser://popup".into()), 0);
     }
+}
+
+/// The browser window closed: its popup went with it.
+pub fn reset() {
+    POP.with_borrow_mut(|p| p.take());
 }
 
 pub fn host() -> Option<BrowserHost> {

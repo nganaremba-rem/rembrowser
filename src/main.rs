@@ -4,10 +4,14 @@
 //! `execute_process` returns >= 0 in those and we exit immediately.
 
 mod adblock;
+mod apps;
+mod cli;
 mod commands;
+mod config;
 mod downloads;
 mod editor;
 mod home;
+mod ipc;
 mod keys;
 mod permissions;
 mod pickers;
@@ -28,6 +32,10 @@ fn data_dir() -> String {
 }
 
 fn main() {
+    // `rembrowser update` etc.: plain terminal commands, no browser.
+    if let Some(code) = cli::run() {
+        std::process::exit(code);
+    }
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
     let args = args::Args::new();
@@ -36,7 +44,12 @@ fn main() {
         std::process::exit(code);
     }
 
-    // Browser process only from here on.
+    // Browser process only from here on. Already running? Hand it the URL / app.
+    let req = ipc::from_args(&std::env::args().skip(1).collect::<Vec<_>>());
+    if ipc::forward(&req) {
+        std::process::exit(0);
+    }
+    ipc::listen();
     let root = data_dir();
     let profile = format!("{root}/Default");
     widevine::setup(&profile);
@@ -44,11 +57,7 @@ fn main() {
     // Before CEF reads its switches: the config can turn on dark-mode.
     commands::load_config();
     userscripts::load();
-
-    let url = std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with("--"))
-        .map_or_else(|| commands::resolve_url(""), |a| commands::resolve_url(&a));
+    config::watch();
 
     let settings = Settings {
         root_cache_path: root.as_str().into(),
@@ -62,24 +71,25 @@ fn main() {
         ..Default::default()
     };
 
-    let mut app = RemApp::new(url);
-    assert_eq!(
-        initialize(
-            Some(args.as_main_args()),
-            Some(&settings),
-            Some(&mut app),
-            std::ptr::null_mut(),
-        ),
-        1,
-        "CEF initialize failed"
+    let mut app = RemApp::new(req);
+    let started = initialize(
+        Some(args.as_main_args()),
+        Some(&settings),
+        Some(&mut app),
+        std::ptr::null_mut(),
     );
+    if started != 1 {
+        // The reason (no display, profile in use, ...) is in Chromium's log lines above.
+        eprintln!("rembrowser: the browser engine failed to start (see the errors above)");
+        std::process::exit(1);
+    }
     run_message_loop();
     shutdown();
 }
 
 wrap_app! {
     struct RemApp {
-        url: String,
+        req: ipc::Req,
     }
 
     impl App {
@@ -98,20 +108,20 @@ wrap_app! {
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
-            Some(RemBrowserProcessHandler::new(self.url.clone()))
+            Some(RemBrowserProcessHandler::new(self.req.clone()))
         }
     }
 }
 
 wrap_browser_process_handler! {
     struct RemBrowserProcessHandler {
-        url: String,
+        req: ipc::Req,
     }
 
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
             privacy::apply_prefs();
-            tabs::create_window(self.url.clone());
+            ipc::handle(self.req.clone());
         }
     }
 }

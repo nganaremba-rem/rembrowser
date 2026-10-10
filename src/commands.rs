@@ -66,9 +66,23 @@ pub fn load_config() {
         cfg.join("vimb/config")
     };
     source_text(include_str!("default.config"));
-    if path.exists() {
+    // config.yaml wins over the older vimb-syntax file.
+    if crate::config::path().exists() {
+        if let Err(e) = crate::config::load() {
+            eprintln!("rembrowser: {e}");
+        }
+    } else if path.exists() {
         source(&path);
     }
+}
+
+/// One command, no `|` splitting (config.yaml values may contain `|`).
+pub fn exec_one_line(line: &str) {
+    exec_one(line);
+}
+
+pub fn map_with_desc(cmd: &str, lhs: &str, rhs: &str, desc: Option<String>) {
+    vim::map(&cmd[..1], lhs, rhs, cmd.contains("noremap"), desc);
 }
 
 fn source(path: &std::path::Path) {
@@ -157,6 +171,30 @@ fn exec_one(line: &str) {
         "keys" | "map" => pickers::keys(),
         "downloads" | "dl" => crate::downloads::picker(),
         "pip" => tabs::pip(),
+        "config" | "settings" => crate::config::open_in_editor(false),
+        // :app [URL] — this page (or URL) as a web app; the tab closes.
+        "app" if args.is_empty() => {
+            let url = tabs::active_url();
+            crate::apps::open(&url);
+            tabs::close_active();
+        }
+        "app" => crate::apps::open(args),
+        // :app-install [name] — launcher entry that opens this page as a web app.
+        "app-install" => {
+            let url = tabs::active_url();
+            let name = if args.is_empty() {
+                tabs::active_title()
+            } else {
+                args.to_string()
+            };
+            match crate::apps::install(&name, &url, tabs::active_favicon()) {
+                Ok(f) => ui::message(
+                    &format!("added \"{name}\" to your app launcher ({f})"),
+                    false,
+                ),
+                Err(e) => ui::message(&format!("app-install: {e}"), true),
+            }
+        }
         "userscripts" => ui::message(
             &format!(
                 "{} userscript(s) from ~/.config/rembrowser/userscripts",

@@ -23,6 +23,11 @@ options=('!lto' '!debug')
 
 _root="$startdir/../.."
 
+# The cef crate links against Spotify's CEF build (~306 MB, headers + libcef for the
+# linker only — at runtime the binary uses Arch's cef via RUNPATH). Keep it in a
+# cache so it downloads once, not on every clean build.
+export CEF_PATH="${CEF_PATH:-${XDG_CACHE_HOME:-$HOME/.cache}/rembrowser/cef}"
+
 build() {
   cd "$_root"
   export CARGO_TARGET_DIR="$srcdir/target"

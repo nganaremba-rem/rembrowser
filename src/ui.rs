@@ -113,6 +113,14 @@ fn bar_panel(bg: u32, spacing: i32, insets: Insets, min_h: i32) -> Panel {
     p
 }
 
+/// The browser window closed (web apps may live on): forget its widgets.
+pub fn reset() {
+    BAR.with_borrow_mut(|b| b.take());
+    CHROME.with_borrow_mut(|c| c.take());
+    TOAST.with_borrow_mut(|t| t.take());
+    HOLD.set(false);
+}
+
 pub fn is_built() -> bool {
     BAR.with_borrow(|b| b.is_some())
 }

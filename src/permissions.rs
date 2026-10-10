@@ -14,6 +14,8 @@ enum Pending {
 }
 
 struct Ask {
+    /// The asking browser: web-app windows answer through their own page.
+    browser_id: i32,
     origin: String,
     key: String,
     pending: Pending,
@@ -116,7 +118,7 @@ fn finish(p: Pending, allow: bool) {
     }
 }
 
-fn request(origin: &str, media: bool, bits: u32, pending: Pending) {
+fn request(browser: Option<&Browser>, origin: &str, media: bool, bits: u32, pending: Pending) {
     let key = format!("{}:{bits}", if media { "media" } else { "perm" });
     if let Some(allow) = stored(origin, &key) {
         finish(pending, allow);
@@ -127,17 +129,36 @@ fn request(origin: &str, media: bool, bits: u32, pending: Pending) {
         *n
     });
     let what = describe(media, bits);
+    let browser_id = browser.map_or(-1, |b| b.identifier());
     ASKS.with_borrow_mut(|a| {
         a.insert(
             id,
             Ask {
+                browser_id,
                 origin: origin.into(),
                 key,
                 pending,
             },
         )
     });
-    popup::ask(id, origin, &what);
+    // The command popup lives in the browser window; a web app asks inside its own page.
+    if browser.is_some_and(crate::apps::is_app) {
+        let js = format!(
+            "__rem.ask({id},{},{})",
+            popup::js_str(origin),
+            popup::js_str(&what)
+        );
+        crate::tabs::js_in(browser_id, &js);
+    } else {
+        popup::ask(id, origin, &what);
+    }
+}
+
+/// From a web app's in-page prompt: only that browser may answer its own question.
+pub fn answer_from(browser_id: i32, id: u64, choice: &str) {
+    if ASKS.with_borrow(|a| a.get(&id).is_some_and(|x| x.browser_id == browser_id)) {
+        answer(id, choice);
+    }
 }
 
 /// From the popup: allow | always | deny | never | dismiss.
@@ -166,7 +187,7 @@ wrap_permission_handler! {
         // getUserMedia / getDisplayMedia (calls, screen share).
         fn on_request_media_access_permission(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             requesting_origin: Option<&CefString>,
             requested_permissions: u32,
@@ -174,14 +195,14 @@ wrap_permission_handler! {
         ) -> i32 {
             let Some(cb) = callback else { return 0 };
             let pending = Pending::Media { cb: cb.clone(), perms: requested_permissions };
-            request(&origin_of(requesting_origin), true, requested_permissions, pending);
+            request(browser.as_deref(), &origin_of(requesting_origin), true, requested_permissions, pending);
             1
         }
 
         // Everything else Chromium would show a prompt bubble for (notifications, ...).
         fn on_show_permission_prompt(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _prompt_id: u64,
             requesting_origin: Option<&CefString>,
             requested_permissions: u32,
@@ -193,7 +214,7 @@ wrap_permission_handler! {
                 cb.cont(PermissionRequestResult::DENY);
                 return 1;
             }
-            request(&origin_of(requesting_origin), false, requested_permissions, Pending::Prompt { cb: cb.clone() });
+            request(browser.as_deref(), &origin_of(requesting_origin), false, requested_permissions, Pending::Prompt { cb: cb.clone() });
             1
         }
     }

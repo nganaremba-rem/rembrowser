@@ -12,3 +12,5 @@ packaging/icon-preview.png
 spike/cfg.*
 spike/dat.*
 spike/xdg.*
+dist/
+packaging/arch/makepkg.log

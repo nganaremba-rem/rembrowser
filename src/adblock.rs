@@ -90,6 +90,11 @@ pub fn start() {
     });
 }
 
+/// `rembrowser update`: re-download every list now (used from the next start).
+pub fn update() -> bool {
+    build(&cache_dir().join("engine.dat")).is_some()
+}
+
 fn build(dat: &Path) -> Option<Engine> {
     let dir = cache_dir().join("lists");
     fs::create_dir_all(&dir).ok()?;
@@ -100,7 +105,16 @@ fn build(dat: &Path) -> Option<Engine> {
         let tmp = file.with_extension("tmp");
         // curl instead of an HTTP crate: it's on every Arch box and keeps the binary small.
         let ok = crate::commands::command("curl")
-            .args(["-fsSL", "--max-time", "30", "-o"])
+            .args([
+                "-fsSL",
+                "--connect-timeout",
+                "20",
+                "--speed-limit",
+                "500",
+                "--speed-time",
+                "30",
+                "-o",
+            ])
             .arg(&tmp)
             .arg(url)
             .status()

@@ -69,6 +69,12 @@ pub fn apply_switches(cl: &mut CommandLine) {
         "host-resolver-rules",
         &format!("MAP *.{BLACKHOLE} ~NOTFOUND"),
     );
+    // Native Wayland when there is one (some CEF builds default to X11/XWayland;
+    // ozone-platform-hint=auto needs XDG_SESSION_TYPE, which isn't always set).
+    if cl.has_switch(Some(&"ozone-platform".into())) == 0 {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|w| !w.is_empty());
+        set("ozone-platform", if wayland { "wayland" } else { "x11" });
+    }
     // Merge with any --disable-features the user passed on the command line.
     let key: CefString = "disable-features".into();
     let user = CefString::from(&cl.switch_value(Some(&key))).to_string();
