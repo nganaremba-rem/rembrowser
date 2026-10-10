@@ -1,6 +1,7 @@
 //! Terminal subcommands (run before any CEF code):
 //!   rembrowser config            open ~/.config/rembrowser/config.yaml in your editor
-//!   rembrowser update            engine + system packages, rembrowser, Widevine, filter lists
+//!   rembrowser update            rembrowser, Widevine, filter lists (--system: also the
+//!                                Chromium engine, through a full system upgrade)
 //!   rembrowser uninstall [--purge]
 //!   rembrowser help | version
 
@@ -14,8 +15,9 @@ const HELP: &str = "rembrowser — vim-native, privacy-first Chromium browser
 usage:
   rembrowser [URL]                open URL (default: your home page)
   rembrowser config               edit ~/.config/rembrowser/config.yaml (applies live)
-  rembrowser update               update Chromium engine + system packages, rembrowser,
-                                  Widevine (DRM) and the ad-block lists
+  rembrowser update               update rembrowser, Widevine (DRM) and the ad-block lists
+  rembrowser update --system      the same, after a full system upgrade (pacman -Syu),
+                                  which is what updates the Chromium engine on Arch
   rembrowser uninstall [--purge]  remove rembrowser (--purge: also profile, cache, config)
   rembrowser version";
 
@@ -27,7 +29,7 @@ pub fn run() -> Option<i32> {
             config::open_in_editor(true);
             0
         }
-        "update" => update(),
+        "update" => update(args.iter().any(|a| a == "--system")),
         "uninstall" => uninstall(args.iter().any(|a| a == "--purge")),
         "help" | "--help" | "-h" => {
             println!("{HELP}");
@@ -111,26 +113,61 @@ fn confirm(q: &str) -> bool {
     std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim(), "y" | "Y" | "yes")
 }
 
-fn update() -> i32 {
+/// Version of Arch's `cef` package: installed, or what the repos offer as of the last
+/// database sync (no network, no root).
+fn cef_version(repo: bool) -> Option<String> {
+    let out = Command::new("pacman")
+        .args([if repo { "-Si" } else { "-Qi" }, "cef"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.starts_with("Version"))?;
+    Some(line.split_once(':')?.1.trim().to_string())
+}
+
+/// Chromium major of a cef package version ("152.0.6-1", "1:153.0.2-1").
+fn major(version: &str) -> Option<i32> {
+    version.rsplit(':').next()?.split('.').next()?.parse().ok()
+}
+
+/// Step 1 on Arch without --system: the engine is a system package, and rembrowser
+/// leaves those to the user. Says what is installed, what is on offer, and whether a
+/// newer Chromium will need a rembrowser built for it.
+fn engine_note(installed: Option<&str>, repo: Option<&str>, built: i32) -> String {
+    let mut out = format!(
+        "  cef {} (Arch package) — not touched. It updates with your system:\n  sudo pacman -Syu   or   rembrowser update --system",
+        installed.unwrap_or("?")
+    );
+    if let Some(r) = repo.filter(|r| Some(*r) != installed) {
+        out += &format!("\n  cef {r} is available");
+        if major(r).is_some_and(|m| m != built) {
+            out += &format!(
+                " — a new Chromium: this rembrowser is built for {built} and needs its cef crate\n  moved to that version before the system upgrade (pacman would refuse it otherwise)"
+            );
+        }
+    }
+    out
+}
+
+fn update(system: bool) -> i32 {
     let kind = install_kind();
     let mut failed = false;
 
-    step(1, "Chromium engine + system packages");
+    step(1, "Chromium engine");
     match &kind {
+        // Arch has no safe single-package upgrade (cef links system libs like ICU), so
+        // the engine only moves with a full -Syu — and only when asked for (--system).
+        Install::Pacman if !system => println!(
+            "{}",
+            engine_note(
+                cef_version(false).as_deref(),
+                cef_version(true).as_deref(),
+                cef::sys::CHROME_VERSION_MAJOR
+            )
+        ),
         Install::Pacman => {
-            // Arch: never a partial upgrade (cef links system libs like ICU), so -Syu.
             // A new Chromium *major* needs a rembrowser built for that CEF API first.
-            let repo = Command::new("pacman")
-                .args(["-Si", "cef"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-            let major = repo
-                .as_deref()
-                .and_then(|t| t.lines().find(|l| l.starts_with("Version")))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|v| v.trim().split('.').next()?.parse::<i32>().ok());
-            match major {
+            match cef_version(true).as_deref().and_then(major) {
                 Some(m) if m != cef::sys::CHROME_VERSION_MAJOR => {
                     println!(
                         "  Chromium {m} is out, but this rembrowser is built for {} — skipping the system upgrade\n  (pacman would refuse it). Update rembrowser's cef crate to {m}, rebuild, then run this again.",
@@ -267,4 +304,23 @@ fn uninstall(purge: bool) -> i32 {
         );
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{engine_note, major};
+
+    #[test]
+    fn engine_step_leaves_system_packages_alone() {
+        assert_eq!(major("152.0.6-1"), Some(152));
+        assert_eq!(major("1:153.0.2-1"), Some(153));
+        // Up to date: nothing on offer.
+        let note = engine_note(Some("152.0.6-1"), Some("152.0.6-1"), 152);
+        assert!(note.contains("cef 152.0.6-1") && !note.contains("available"));
+        // A point release: offered, no rebuild needed.
+        let note = engine_note(Some("152.0.6-1"), Some("152.0.9-1"), 152);
+        assert!(note.contains("cef 152.0.9-1 is available") && !note.contains("new Chromium"));
+        // A new major: rembrowser must be built for it first.
+        assert!(engine_note(Some("152.0.6-1"), Some("153.0.2-1"), 152).contains("new Chromium"));
+    }
 }

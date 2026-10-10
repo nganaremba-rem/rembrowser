@@ -56,7 +56,8 @@ cd rembrowser/packaging/arch && makepkg -si
 ### Update / remove
 
 ```bash
-rembrowser update              # engine + system packages, rembrowser, DRM, ad-block lists
+rembrowser update              # rembrowser, DRM, ad-block lists (system packages untouched)
+rembrowser update --system     # the same after a full system upgrade (updates the Chromium engine)
 rembrowser uninstall           # keeps your profile
 rembrowser uninstall --purge   # removes everything
 ```
