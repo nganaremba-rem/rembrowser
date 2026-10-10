@@ -35,6 +35,8 @@ thread_local! {
     static NEXT_WIN: Cell<u32> = const { Cell::new(1) };
     /// Disposition seen in on_before_popup, consumed by on_popup_browser_view_created.
     static NEXT_POPUP_BACKGROUND: Cell<bool> = const { Cell::new(false) };
+    /// Open DevTools: (id of the inspected browser, the DevTools view).
+    static DEVTOOLS: RefCell<Vec<(i32, BrowserView)>> = const { RefCell::new(Vec::new()) };
     /// URLs of closed tabs, for `u` / `U`.
     static CLOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static FAVICONS: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
@@ -490,10 +492,44 @@ pub fn download(url: &str) {
     });
 }
 
-/// `gF`: DevTools for the active tab, in its own window.
-pub fn devtools() {
+/// The open DevTools of the browser with this id.
+fn devtools_of(id: i32) -> Option<Browser> {
+    DEVTOOLS.with_borrow_mut(|d| {
+        d.retain(|(_, v)| v.browser().is_some());
+        d.iter().find(|(of, _)| *of == id).and_then(|(_, v)| v.browser())
+    })
+}
+
+/// Switch the DevTools of browser `id` to `panel`, waiting (up to `tries` × 200 ms)
+/// for a DevTools that is still opening: CEF sends us no load events for its page.
+fn show_panel(id: i32, panel: &'static str, tries: u32) {
+    let frame = devtools_of(id).filter(|b| b.is_loading() == 0).and_then(|b| b.main_frame());
+    match frame.filter(|f| CefString::from(&f.url()).to_string().starts_with("devtools://")) {
+        Some(f) => {
+            // The page being loaded is not DevTools being ready: ask until the
+            // panel's tab is the selected one (4 s at most).
+            let js = format!(
+                "(() => {{ let n = 0; const t = setInterval(() => {{\
+                   try {{ DevToolsAPI.showPanel('{panel}'); }} catch {{}}\
+                   const on = [...document.querySelectorAll('*')].some((e) => e.shadowRoot?.querySelector('#tab-{panel}.selected'));\
+                   if (on || ++n > 40) clearInterval(t); }}, 100); }})()"
+            );
+            f.execute_java_script(Some(&js.as_str().into()), None, 0);
+        }
+        None if tries > 0 => ui::run_on_ui(200, move || show_panel(id, panel, tries - 1)),
+        None => {}
+    }
+}
+
+/// `gF` / Ctrl-Shift-I: DevTools for the active tab, in its own window. `panel`
+/// (Ctrl-Shift-J: "console") is the one to show; None = where DevTools was last.
+pub fn devtools(panel: Option<&'static str>) {
     with_active(|b| {
         if let Some(h) = b.host() {
+            if let Some(p) = panel {
+                let id = b.identifier();
+                ui::run_on_ui(0, move || show_panel(id, p, 25));
+            }
             // Ignored for a BrowserView-hosted browser: CEF creates a popup view
             // (see on_popup_browser_view_created).
             h.show_dev_tools(
@@ -899,6 +935,9 @@ wrap_browser_view_delegate! {
             // DevTools (gF): its own window, tiled next to the page by niri.
             if is_devtools != 0 {
                 let Some(bv) = popup_browser_view else { return 0 };
+                if let Some(of) = browser_view.as_ref().and_then(|v| v.browser()) {
+                    DEVTOOLS.with_borrow_mut(|d| d.push((of.identifier(), bv.clone())));
+                }
                 let mut d = ChromeWindowDelegate::new(bv.clone(), DEVTOOLS_APP_ID.into(), "DevTools — rembrowser".into());
                 window_create_top_level(Some(&mut d));
                 return 1;

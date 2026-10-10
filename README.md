@@ -77,7 +77,7 @@ rembrowser uninstall --purge   # removes everything
 | `gg` / `G` | top / bottom (`5j` = 5 times) |
 | `Ctrl-o` / `Ctrl-i` | back / forward |
 | `gu` / `gU` | up one URL level / site root |
-| `r` / `R` | reload / reload without cache |
+| `r` / `R`, `Ctrl-Shift-r` | reload / reload without cache |
 
 ### 🔗 Hints (type the letters shown)
 | Key | Action |
@@ -120,7 +120,7 @@ rembrowser uninstall --purge   # removes everything
 ### 🧰 Leader (`Space`) menu
 | Key | Action |
 |---|---|
-| `<Space>s.` | 🕘 history |
+| `<Space>s.` / `<Space>hd` | 🕘 history / delete all of it (asks first) |
 | `<Space>sm` | 🔖 bookmarks (`<Space>ba` adds one) |
 | `<Space>sd` | ⬇️ downloads (kept across restarts) |
 | `<Space>sq` | 📚 read-later list |
@@ -144,6 +144,7 @@ rembrowser uninstall --purge   # removes everything
 | `Ctrl-t` *(in a field)* | edit the field in nvim |
 | `gp` | picture-in-picture |
 | `gf` / `gF` | page source / DevTools |
+| `Ctrl-Shift-i` / `F12` / `Ctrl-Shift-j` | DevTools / DevTools on the Console |
 | `Ctrl-q` | quit |
 
 ### 💬 Inside the `:` popup

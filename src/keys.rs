@@ -2,7 +2,8 @@
 //!
 //! A key is a string token: a printable char ("j", "G", "$") or a bracketed name
 //! ("<C-d>", "<Space>", "<CR>", "<S-Tab>"). Ctrl letters are lowercase, so
-//! `<C-D>` in a config means the same as `<C-d>` (vim treats them alike).
+//! `<C-D>` in a config means the same as `<C-d>` (vim treats them alike); Shift held
+//! with one is spelled out: `<C-S-r>`.
 
 use cef::KeyEvent;
 
@@ -59,13 +60,18 @@ pub fn from_event(e: &KeyEvent) -> Option<Key> {
     if alt {
         prefix.push_str("M-");
     }
+    // Ctrl+Shift+R is its own key (<C-S-r>), not <C-r>.
+    let letter = |c: char| match shift && c.is_ascii_alphabetic() {
+        true => format!("<{prefix}S-{c}>"),
+        false => format!("<{prefix}{c}>"),
+    };
     // Same rule with Ctrl/Alt: the key's character (Ctrl+= is "=") beats the keycode,
     // which remappers and wtype reassign (Ctrl+= arrived as keycode "Escape").
     if ctrl || alt {
         if let Some(c) =
             char::from_u32(e.unmodified_character as u32).filter(|c| !c.is_control() && *c != ' ')
         {
-            return Some(format!("<{prefix}{}>", c.to_ascii_lowercase()));
+            return Some(letter(c.to_ascii_lowercase()));
         }
     }
     if let Some(name) = special_name(code) {
@@ -82,7 +88,7 @@ pub fn from_event(e: &KeyEvent) -> Option<Key> {
             189 => '-', // VK_OEM_MINUS
             _ => char::from_u32(e.unmodified_character as u32).filter(|c| !c.is_control())?,
         };
-        return Some(format!("<{prefix}{c}>"));
+        return Some(letter(c));
     }
     char::from_u32(e.character as u32)
         .filter(|c| !c.is_control())
@@ -122,6 +128,8 @@ fn normalize(inner: &str) -> Option<Key> {
         }
         name = &name[2..];
     }
+    // One spelling whatever the order typed: <s-c-r> is <C-S-r>, as from_event names it.
+    let mods: String = ["C-", "M-", "S-"].into_iter().filter(|m| mods.contains(m)).collect();
     let lower = name.to_ascii_lowercase();
     let canonical = match lower.as_str() {
         "lt" if mods.is_empty() => return Some("<".into()),
@@ -145,16 +153,17 @@ fn normalize(inner: &str) -> Option<Key> {
         }
         _ if name.chars().count() == 1 && !mods.is_empty() => {
             let c = name.chars().next()?;
-            // <C-D> == <C-d>; <S-x> is just "X".
+            // <C-D> == <C-d>; <S-x> is just "X"; Shift stays on Ctrl/Alt letters only
+            // (<C-S-r>), a symbol already carries it (<C-+>).
             if mods == "S-" {
                 return Some(c.to_uppercase().to_string());
             }
-            let c = if mods.contains("C-") || mods.contains("M-") {
-                c.to_ascii_lowercase()
-            } else {
-                c
+            let c = c.to_ascii_lowercase();
+            let mods = match c.is_ascii_alphabetic() {
+                true => mods,
+                false => mods.replace("S-", ""),
             };
-            return Some(format!("<{}{c}>", mods.replace("S-", "")));
+            return Some(format!("<{mods}{c}>"));
         }
         _ => return None,
     };
@@ -212,6 +221,12 @@ mod tests {
             Some("<C-Tab>")
         );
         assert_eq!(from_event(&ev(27, 0x1b, 0x1b, 0)).as_deref(), Some("<Esc>"));
+        // Ctrl+Shift+R, with and without a usable character.
+        assert_eq!(
+            from_event(&ev(82, 0x12, 0x52, CTRL | SHIFT)).as_deref(),
+            Some("<C-S-r>")
+        );
+        assert_eq!(from_event(&ev(82, 0x12, 0, CTRL | SHIFT)).as_deref(), Some("<C-S-r>"));
         // Character known only through the keycode (control char): still <C-=>.
         assert_eq!(from_event(&ev(187, 0, 0, CTRL)).as_deref(), Some("<C-=>"));
     }
@@ -220,6 +235,7 @@ mod tests {
     fn parses_vim_notation() {
         assert_eq!(parse("gT"), ["g", "T"]);
         assert_eq!(parse("<C-D><c-u>"), ["<C-d>", "<C-u>"]);
+        assert_eq!(parse("<C-S-R><s-c-r><C-S-=>"), ["<C-S-r>", "<C-S-r>", "<C-=>"]);
         assert_eq!(parse("<Space>sb"), ["<Space>", "s", "b"]);
         assert_eq!(parse(":q<CR>"), [":", "q", "<CR>"]);
         assert_eq!(parse("<S-Tab><lt>x"), ["<S-Tab>", "<", "x"]);
