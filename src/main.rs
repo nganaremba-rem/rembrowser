@@ -47,8 +47,13 @@ fn main() {
 
     // Browser process only from here on. Already running? Hand it the URL / app.
     let req = ipc::from_args(&std::env::args().skip(1).collect::<Vec<_>>());
-    if ipc::forward(&req) {
-        std::process::exit(0);
+    match ipc::forward(&req) {
+        ipc::Forwarded::Taken => std::process::exit(0),
+        ipc::Forwarded::Refused => {
+            ipc::refused();
+            std::process::exit(1);
+        }
+        ipc::Forwarded::NoInstance => {}
     }
     if matches!(req, ipc::Req::Cmd(_)) {
         eprintln!("rembrowser: not running (a :command needs a running browser)");

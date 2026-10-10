@@ -48,11 +48,42 @@ fn sock() -> PathBuf {
     PathBuf::from(dir).join("rembrowser.sock")
 }
 
-/// Give `req` to a running rembrowser. true = it took it (this process exits).
-pub fn forward(req: &Req) -> bool {
-    UnixStream::connect(sock())
-        .and_then(|mut s| s.write_all(req.line().as_bytes()))
-        .is_ok()
+/// What became of a request handed to the running rembrowser.
+pub enum Forwarded {
+    /// It took it (this process exits).
+    Taken,
+    /// It is there but didn't understand: a copy from before an update, still running.
+    Refused,
+    NoInstance,
+}
+
+/// Give `req` to a running rembrowser, which answers "ok" to what it understood.
+pub fn forward(req: &Req) -> Forwarded {
+    let Ok(mut s) = UnixStream::connect(sock()) else {
+        return Forwarded::NoInstance;
+    };
+    if s.write_all(req.line().as_bytes()).is_err() {
+        return Forwarded::NoInstance;
+    }
+    // An older copy never answers; it just closes the connection.
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let mut reply = String::new();
+    let _ = BufReader::new(s).read_line(&mut reply);
+    match reply.trim() {
+        "ok" => Forwarded::Taken,
+        _ => Forwarded::Refused,
+    }
+}
+
+/// The request went nowhere: say so in the terminal and on the desktop (a WM keybind
+/// has no terminal), instead of a launch that silently does nothing.
+pub fn refused() {
+    let msg = "The running rembrowser is from before an update and can't take this request. \
+               Close its windows (or run: pkill -x rembrowser), then start it again.";
+    eprintln!("rembrowser: {msg}");
+    let _ = crate::commands::command("notify-send")
+        .args(["-a", "rembrowser", "rembrowser needs a restart", msg])
+        .spawn();
 }
 
 /// Become the instance others forward to.
@@ -73,8 +104,10 @@ pub fn listen() {
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
             let mut line = String::new();
-            if BufReader::new(conn).read_line(&mut line).is_ok() {
-                if let Some(req) = Req::parse(&line) {
+            if BufReader::new(&conn).read_line(&mut line).is_ok() {
+                let req = Req::parse(&line);
+                let _ = (&conn).write_all(if req.is_some() { b"ok\n" } else { b"?\n" });
+                if let Some(req) = req {
                     ui::run_on_ui(0, move || handle(req));
                 }
             }
