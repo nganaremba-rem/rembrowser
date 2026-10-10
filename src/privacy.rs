@@ -86,10 +86,15 @@ pub fn apply_switches(cl: &mut CommandLine) {
     for s in SWITCHES {
         cl.append_switch(Some(&(*s).into()));
     }
-    // Chrome extensions are opt-in (`extensions: true`): off, none is loaded, also
-    // not the ones installed earlier.
+    // Chrome extensions are opt-in (`extensions: true`): off, none is loaded. On,
+    // Chromium gets the folders `:ext-install` unpacked (plus any the user passed).
     if !crate::commands::opt_bool("extensions", false) {
         cl.append_switch(Some(&"disable-extensions".into()));
+    } else if let Some(ours) = crate::extensions::load_switch() {
+        let key: CefString = "load-extension".into();
+        let user = CefString::from(&cl.switch_value(Some(&key))).to_string();
+        let dirs = if user.is_empty() { ours } else { format!("{user},{ours}") };
+        set("load-extension", &dirs);
     }
     // vimb `set dark-mode=on`: sites see prefers-color-scheme: dark.
     if crate::commands::opt_bool("dark-mode", false) {

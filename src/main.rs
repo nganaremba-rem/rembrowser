@@ -10,6 +10,7 @@ mod commands;
 mod config;
 mod downloads;
 mod editor;
+mod extensions;
 mod home;
 mod ipc;
 mod keys;

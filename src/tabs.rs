@@ -1234,7 +1234,7 @@ wrap_request_handler! {
 /// What only Chromium's own UI layer can show: these open in a Chrome-style window
 /// (`:settings`, `:extensions`, `:chrome URL`) instead of a tab.
 pub fn needs_chrome(url: &str) -> bool {
-    ["chrome://settings", "chrome://extensions", "chrome://password-manager", "https://chromewebstore.google.com"]
+    ["chrome://settings", "chrome://extensions", "chrome://password-manager"]
         .iter()
         .any(|p| url.starts_with(p))
 }

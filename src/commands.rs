@@ -181,6 +181,8 @@ fn exec_one(line: &str) {
         // Chromium's own pages, in a window with Chromium's UI layer.
         "settings" => tabs::chrome_window("chrome://settings", false),
         "extensions" => tabs::chrome_window("chrome://extensions", true),
+        "ext-install" => crate::extensions::install(args),
+        "ext-remove" => crate::extensions::remove_picker(),
         "chrome" if args.is_empty() => tabs::chrome_window(&tabs::active_url(), true),
         "chrome" => tabs::chrome_window(&resolve_url(args), true),
         // :app [URL] — this page (or URL) as a web app; the tab closes.

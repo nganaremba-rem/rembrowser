@@ -62,7 +62,7 @@ pub fn setup(profile: &str) {
     }
 }
 
-fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
+pub fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let out = commands::command("curl")
         // No total timeout (22 MB on a slow link is fine in the background): give up
         // only when stalled under 1 kB/s for a minute.
@@ -207,7 +207,7 @@ fn fetch_from(l: Latest) -> Result<String, String> {
 }
 
 /// CRX3 = "Cr24", u32 version, u32 header length, header (signatures), zip.
-fn crx3_zip(crx: &[u8]) -> Result<&[u8], String> {
+pub fn crx3_zip(crx: &[u8]) -> Result<&[u8], String> {
     if crx.len() < 12 || &crx[..4] != b"Cr24" {
         return Err("not a CRX file".into());
     }
@@ -226,7 +226,7 @@ fn u32_at(b: &[u8], i: usize) -> usize {
 }
 
 /// Minimal zip reader (central directory; stored + deflate) into `dest`.
-fn unzip(zip: &[u8], dest: &Path) -> Result<(), String> {
+pub fn unzip(zip: &[u8], dest: &Path) -> Result<(), String> {
     let eocd = (0..zip.len().saturating_sub(21))
         .rev()
         .find(|&i| zip[i..].starts_with(&[0x50, 0x4b, 0x05, 0x06]))

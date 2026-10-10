@@ -99,6 +99,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("config", "edit config.yaml"),
     ("settings", "Chromium settings (own window)"),
     ("extensions", "Chrome extensions (own window)"),
+    ("ext-install", "install an extension: Web Store URL or id (or this store page)"),
+    ("ext-remove", "remove an installed extension"),
     ("chrome", "this page (or URL) in a Chromium window with toolbar"),
     ("userscripts", "reload userscripts"),
 ];

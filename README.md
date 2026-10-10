@@ -167,6 +167,7 @@ rembrowser uninstall --purge   # removes everything
 | `:winopen [URL]` | new window |
 | `:mpv [URL]` | play this page (or URL) in mpv |
 | `:settings` `:extensions` `:chrome [URL]` | Chromium settings · extensions · a page in a Chromium window |
+| `:ext-install [URL\|id]` `:ext-remove` | install an extension from the Web Store · remove one |
 | `:app` / `:app-install` | turn this page into a web app / add it to your launcher |
 | `:pip` | picture-in-picture |
 | `:set dark-mode!` | toggle any setting |
@@ -218,11 +219,13 @@ Everything that adds weight is a switch in `settings:` (read at startup — rest
 🪶 Lightest: `adblock: false`, `drm: false`, `extensions: false`. 🧰 Fullest: all `true`.
 
 ### 🧩 Chrome extensions (optional)
-1. Set `extensions: true` in the config and restart.
-2. `:extensions` opens Chromium's extension page; `:chrome https://chromewebstore.google.com` opens the Web Store in a Chromium window where **Add to Chrome** works.
-3. Installed extensions then act on your normal tabs: content scripts, background workers and messaging run.
+1. Set `extensions: true` in the config.
+2. Open the extension's [Chrome Web Store](https://chromewebstore.google.com) page and run `:ext-install` (or `:ext-install <store URL or id>` from anywhere). The store's own button only works in Chrome, so rembrowser downloads and unpacks the extension itself.
+3. Restart. The extension now acts on your normal tabs (tested: Dark Reader, uBlock Origin Lite).
 
-Limits: tabs are not Chrome tabs, so an extension that lists tabs (`chrome.tabs.query`) sees none, and toolbar buttons / extension popups only exist in `:chrome` windows.
+`:extensions` opens Chromium's extension page (options, on/off switches) · `:ext-remove` deletes one · `:ext-install` again updates one.
+
+Limits: tabs are not Chrome tabs, so an extension that lists tabs (`chrome.tabs.query`) sees none, and toolbar buttons / extension popups only exist in `:chrome` windows. Extensions do not update on their own.
 
 ### 📜 Userscripts
 Drop `*.js` files in `~/.config/rembrowser/userscripts/`:
