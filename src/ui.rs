@@ -1,19 +1,25 @@
-//! Native status bar + command line (CEF Views widgets): no extra renderer process,
+//! Native chrome (CEF Views widgets): status bar + tab bar. No extra renderer process,
 //! no page CSS to fight. Catppuccin Mocha, like the vimb config.
+//! The command line is the popup (popup.rs).
 //!
-//! [ MODE ][ :command line… ][ url / message                    ][ [2/5] 42% ]
+//! tab bar:    [ 1 GitHub ][ 2 Arch Wiki ][ 3 … ]        (accent underline = active)
+//! status bar: [ MODE ][ url / message                        ][ 3/10 [2/5] 42% ]
 
-use crate::{keys, tabs, vim};
+use crate::tabs;
 use cef::*;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 pub const FONT: &str = "CaskaydiaMono Nerd Font Mono, 15px";
 const FONT_BOLD: &str = "CaskaydiaMono Nerd Font Mono, Bold 15px";
+const TAB_FONT: &str = "CaskaydiaMono Nerd Font Mono, 13px";
+const TAB_FONT_BOLD: &str = "CaskaydiaMono Nerd Font Mono, Bold 13px";
 const BAR_BG: u32 = 0xFF18_1825;
-const INPUT_BG: u32 = 0xFF1E_1E2E;
+const TABBAR_BG: u32 = 0xFF11_111B;
 const TEXT: u32 = 0xFFCD_D6F4;
 const SUBTEXT: u32 = 0xFFA6_ADC8;
+const SURFACE: u32 = 0xFF31_3244;
+const OVERLAY: u32 = 0xFF6C_7086;
 const GREEN: u32 = 0xFFA6_E3A1;
 const RED: u32 = 0xFFF3_8BA8;
 
@@ -23,24 +29,17 @@ pub const YELLOW: u32 = 0xFFF9_E2AF;
 pub const MAUVE: u32 = 0xFFCB_A6F7;
 pub const PEACH: u32 = 0xFFFA_B387;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CmdKind {
-    Ex,
-    Search { forward: bool },
-}
+/// Longest tab title shown (chars).
+const TAB_TITLE: usize = 22;
 
 struct Bar {
     panel: Panel,
     mode: LabelButton,
-    input: Textfield,
     url: LabelButton,
     right: LabelButton,
-    kind: Option<CmdKind>,
-    /// Waiting for the register name after <C-r>.
-    reg_pending: bool,
-    history: Vec<String>,
-    hist_pos: usize,
     url_text: String,
+    tabbar: Panel,
+    mode_color: u32,
 }
 
 thread_local! {
@@ -52,77 +51,109 @@ fn with<R>(f: impl FnOnce(&mut Bar) -> R) -> Option<R> {
 }
 
 fn set_color(l: &LabelButton, color: u32) {
-    for state in [ButtonState::NORMAL, ButtonState::HOVERED, ButtonState::PRESSED] {
+    for state in [
+        ButtonState::NORMAL,
+        ButtonState::HOVERED,
+        ButtonState::PRESSED,
+    ] {
         l.set_text_color(state, color);
     }
 }
 
-fn label(text: &str, color: u32) -> LabelButton {
-    let mut d = NoopButton::new();
+fn label(text: &str, color: u32, font: &str, on_press: Option<usize>) -> LabelButton {
+    let mut d = TabButton::new(on_press.unwrap_or(usize::MAX));
     let l = label_button_create(Some(&mut d), Some(&text.into())).expect("label");
-    l.set_font_list(Some(&FONT.into()));
+    l.set_font_list(Some(&font.into()));
     set_color(&l, color);
     View::from(&l).set_focusable(0);
     l
-}
-
-/// Builds the bar; the caller adds it under the tab area.
-pub fn build() -> Panel {
-    let panel = panel_create(None).expect("panel");
-    let layout = panel.set_to_box_layout(Some(&BoxLayoutSettings {
-        horizontal: 1,
-        between_child_spacing: 8,
-        inside_border_insets: Insets { top: 2, left: 0, bottom: 2, right: 8 },
-        cross_axis_alignment: AxisAlignment::CENTER,
-        ..Default::default()
-    }));
-    View::from(&panel).set_background_color(BAR_BG);
-
-    // Coloured text, not a pill: LabelButton paints an opaque themed background
-    // over anything behind it, so a coloured parent panel never shows.
-    let mode = label("NORMAL", BLUE);
-    mode.set_font_list(Some(&FONT_BOLD.into()));
-    let mut d = CmdDelegate::new();
-    let input = textfield_create(Some(&mut d)).expect("textfield");
-    input.set_font_list(Some(&FONT.into()));
-    View::from(&input).set_background_color(INPUT_BG);
-    View::from(&input).set_visible(0);
-    let url = label("", TEXT);
-    url.set_horizontal_alignment(HorizontalAlignment::LEFT);
-    let right = label("", SUBTEXT);
-
-    for v in [View::from(&mode), View::from(&input), View::from(&url), View::from(&right)] {
-        panel.add_child_view(Some(&mut v.clone()));
-    }
-    if let Some(l) = layout {
-        l.set_flex_for_view(Some(&mut View::from(&url)), 1);
-        l.set_flex_for_view(Some(&mut View::from(&input)), 1);
-    }
-    BAR.with_borrow_mut(|b| {
-        *b = Some(Bar {
-            panel: panel.clone(),
-            mode,
-            input,
-            url,
-            right,
-            kind: None,
-            reg_pending: false,
-            history: Vec::new(),
-            hist_pos: 0,
-            url_text: String::new(),
-        })
-    });
-    panel
 }
 
 pub fn is_built() -> bool {
     BAR.with_borrow(|b| b.is_some())
 }
 
+/// Builds both bars; returns (tab bar, status bar) for the window layout.
+pub fn build() -> (Panel, Panel) {
+    let panel = panel_create(None).expect("panel");
+    let layout = panel.set_to_box_layout(Some(&BoxLayoutSettings {
+        horizontal: 1,
+        between_child_spacing: 12,
+        inside_border_insets: Insets {
+            top: 0,
+            left: 0,
+            bottom: 0,
+            right: 8,
+        },
+        cross_axis_alignment: AxisAlignment::STRETCH,
+        ..Default::default()
+    }));
+    let mode = label(" NORMAL ", TABBAR_BG, FONT_BOLD, None);
+    let url = label("", TEXT, FONT, None);
+    url.set_horizontal_alignment(HorizontalAlignment::LEFT);
+    let right = label("", SUBTEXT, FONT, None);
+    for v in [View::from(&mode), View::from(&url), View::from(&right)] {
+        panel.add_child_view(Some(&mut v.clone()));
+    }
+    if let Some(l) = layout {
+        l.set_flex_for_view(Some(&mut View::from(&url)), 1);
+    }
+
+    let tabbar = panel_create(None).expect("panel");
+    tabbar.set_to_box_layout(Some(&BoxLayoutSettings {
+        horizontal: 1,
+        between_child_spacing: 2,
+        inside_border_insets: Insets {
+            top: 3,
+            left: 6,
+            bottom: 0,
+            right: 6,
+        },
+        cross_axis_alignment: AxisAlignment::STRETCH,
+        ..Default::default()
+    }));
+
+    BAR.with_borrow_mut(|b| {
+        *b = Some(Bar {
+            panel: panel.clone(),
+            mode,
+            url,
+            right,
+            url_text: String::new(),
+            tabbar: tabbar.clone(),
+            mode_color: BLUE,
+        })
+    });
+    (tabbar, panel)
+}
+
+/// Window theme colours: every panel and label button defaults to these.
+pub fn theme(w: &Window) {
+    for id in [
+        ColorId::COLOR_PRIMARY_BACKGROUND,
+        ColorId::COLOR_BUTTON_BACKGROUND,
+        ColorId::COLOR_WINDOW_BACKGROUND,
+    ] {
+        w.set_theme_color(id.get_raw() as i32, BAR_BG);
+    }
+    run_on_ui(0, recolor);
+}
+
+/// Per-view colours; only stick once the view is in the window (see theme()).
+pub fn recolor() {
+    with(|b| {
+        View::from(&b.tabbar).set_background_color(TABBAR_BG);
+        View::from(&b.mode).set_background_color(b.mode_color);
+    });
+    tabs::refresh_tabbar();
+}
+
 pub fn set_mode(name: &str, color: u32) {
     with(|b| {
-        b.mode.set_text(Some(&name.into()));
-        set_color(&b.mode, color);
+        // lualine-style pill: mode colour background, dark text.
+        b.mode.set_text(Some(&format!(" {name} ").as_str().into()));
+        b.mode_color = color;
+        View::from(&b.mode).set_background_color(color);
     });
 }
 
@@ -162,151 +193,76 @@ pub fn set_bar_visible(on: bool) {
     with(|b| View::from(&b.panel).set_visible(on as i32));
 }
 
-/// Opens on the next UI tick: the key that triggered it (`:`, `o`) is still being
-/// dispatched, and Views would hand that same press to the newly focused textfield.
-pub fn cmdline_open(kind: CmdKind, text: &str) {
-    let text = text.to_string();
-    run_on_ui(0, move || cmdline_open_now(kind, &text));
+pub fn set_tabbar_visible(on: bool) {
+    with(|b| View::from(&b.tabbar).set_visible(on as i32));
 }
 
-fn cmdline_open_now(kind: CmdKind, text: &str) {
-    with(|b| {
-        b.kind = Some(kind);
-        b.reg_pending = false;
-        b.hist_pos = b.history.len();
-        let prompt = match kind {
-            CmdKind::Ex => ":",
-            CmdKind::Search { forward: true } => "/",
-            CmdKind::Search { forward: false } => "?",
-        };
-        b.mode.set_text(Some(&prompt.into()));
-        set_color(&b.mode, PEACH);
-        View::from(&b.url).set_visible(0);
-        View::from(&b.input).set_visible(1);
-        b.input.set_text(Some(&text.into()));
-        recolor(&b.input);
-        b.input.request_focus();
-    });
-}
-
-fn cmdline_close() -> Option<(CmdKind, String)> {
-    let r = with(|b| {
-        let kind = b.kind.take()?;
-        let text = CefString::from(&b.input.text()).to_string();
-        View::from(&b.input).set_visible(0);
-        View::from(&b.url).set_visible(1);
-        if kind == CmdKind::Ex && !text.trim().is_empty() && b.history.last() != Some(&text) {
-            b.history.push(text.clone());
-        }
-        Some((kind, text))
-    })
-    .flatten();
-    tabs::focus_active();
-    r
-}
-
-/// Theme colours for textfields were removed from CEF 152's API: paint the text instead.
-fn recolor(t: &Textfield) {
-    let len = CefString::from(&t.text()).to_string().encode_utf16().count() as u32;
-    t.apply_text_color(TEXT, Some(&Range { from: 0, to: len }));
-}
-
-fn insert(t: &Textfield, s: &str) {
-    t.insert_or_replace_text(Some(&s.into()));
-    recolor(t);
-}
-
-/// Command-line keys. Returns true when handled (the textfield must not see it).
-fn cmdline_key(t: &Textfield, k: &str) -> bool {
-    if with(|b| std::mem::take(&mut b.reg_pending)).unwrap_or(false) {
-        if let Some(text) = vim::register(k) {
-            insert(t, &text);
-        }
-        return true;
+fn short(title: &str) -> String {
+    let t = title.trim();
+    if t.chars().count() <= TAB_TITLE {
+        return t.to_string();
     }
-    match k {
-        "<CR>" => {
-            if let Some((kind, text)) = cmdline_close() {
-                vim::cmdline_submit(kind, &text);
-            }
-        }
-        "<Esc>" | "<C-c>" | "<C-[>" => {
-            if let Some((kind, _)) = cmdline_close() {
-                vim::cmdline_cancel(kind);
-            }
-        }
-        "<C-r>" => {
-            with(|b| b.reg_pending = true);
-        }
-        "<C-u>" => {
-            t.set_text(Some(&"".into()));
-        }
-        "<C-w>" => {
-            let text = CefString::from(&t.text()).to_string();
-            let cur: Vec<char> = text.chars().collect();
-            let pos = (t.cursor_position() as usize).min(cur.len());
-            let mut start = pos;
-            while start > 0 && cur[start - 1] == ' ' {
-                start -= 1;
-            }
-            while start > 0 && cur[start - 1] != ' ' {
-                start -= 1;
-            }
-            t.select_range(Some(&Range { from: start as u32, to: pos as u32 }));
-            insert(t, "");
-        }
-        "<C-b>" | "<Home>" => t.select_range(Some(&Range { from: 0, to: 0 })),
-        "<C-e>" | "<End>" => {
-            let n = CefString::from(&t.text()).to_string().encode_utf16().count() as u32;
-            t.select_range(Some(&Range { from: n, to: n }));
-        }
-        "<Up>" | "<Down>" => {
-            let entry = with(|b| {
-                let n = b.history.len();
-                b.hist_pos = if k == "<Up>" { b.hist_pos.saturating_sub(1) } else { (b.hist_pos + 1).min(n) };
-                b.history.get(b.hist_pos).cloned().unwrap_or_default()
-            });
-            t.set_text(Some(&entry.unwrap_or_default().as_str().into()));
-            recolor(t);
-        }
-        // Completion arrives with the polished UI (phase 3); keep focus here meanwhile.
-        "<Tab>" | "<S-Tab>" => {}
-        _ => return false,
-    }
-    true
+    let cut: String = t.chars().take(TAB_TITLE - 1).collect();
+    format!("{}…", cut.trim_end())
 }
 
-wrap_textfield_delegate! {
-    struct CmdDelegate {}
+/// Rebuild the tab bar: one clickable label per tab, active one bold + underlined.
+/// ponytail: full rebuild per change; diff the labels if hundreds of tabs ever lag.
+pub fn set_tabs(titles: &[String], active: usize) {
+    let Some(bar) = BAR.with_borrow(|b| b.as_ref().map(|b| b.tabbar.clone())) else {
+        return;
+    };
+    if View::from(&bar).is_visible() == 0 {
+        return;
+    }
+    bar.remove_all_child_views();
+    for (i, t) in titles.iter().enumerate() {
+        let on = i == active;
+        let text = format!(
+            " {} {} ",
+            i + 1,
+            short(if t.is_empty() { "New tab" } else { t })
+        );
+        let l = label(
+            &text,
+            if on { TEXT } else { OVERLAY },
+            if on { TAB_FONT_BOLD } else { TAB_FONT },
+            Some(i),
+        );
+        bar.add_child_view(Some(&mut View::from(&l)));
+        View::from(&l).set_background_color(if on { SURFACE } else { TABBAR_BG });
+    }
+    View::from(&bar).invalidate_layout();
+}
 
-    impl ViewDelegate {}
+wrap_panel_delegate! {
+    struct Strip {}
 
-    impl TextfieldDelegate {
-        fn on_key_event(&self, textfield: Option<&mut Textfield>, event: Option<&KeyEvent>) -> i32 {
-            let (Some(t), Some(e)) = (textfield, event) else { return 0 };
-            if e.type_ != KeyEventType::RAWKEYDOWN {
-                return 0;
-            }
-            keys::from_event(e).is_some_and(|k| cmdline_key(t, &k)) as i32
-        }
-
-        fn on_after_user_action(&self, textfield: Option<&mut Textfield>) {
-            let Some(t) = textfield else { return };
-            recolor(t);
-            if let Some(Some(CmdKind::Search { forward })) = with(|b| b.kind) {
-                vim::search_preview(&CefString::from(&t.text()).to_string(), forward);
-            }
+    impl ViewDelegate {
+        fn preferred_size(&self, _view: Option<&mut View>) -> Size {
+            Size { width: 0, height: 2 }
         }
     }
+
+    impl PanelDelegate {}
 }
 
+// Status-bar labels pass usize::MAX; tab labels pass their index.
 wrap_button_delegate! {
-    struct NoopButton {}
+    struct TabButton {
+        tab: usize,
+    }
 
     impl ViewDelegate {}
 
     impl ButtonDelegate {
-        fn on_button_pressed(&self, _button: Option<&mut Button>) {}
+        fn on_button_pressed(&self, _button: Option<&mut Button>) {
+            if self.tab != usize::MAX {
+                let i = self.tab;
+                // Not inside the click handler: select() rebuilds the tab bar (this button).
+                run_on_ui(0, move || tabs::select(i));
+            }
+        }
     }
 }
 

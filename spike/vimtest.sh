@@ -5,8 +5,8 @@ cd "$(dirname "$0")" || exit 1
 fails=0
 ev()   { NO_NAV=1 WAIT=${W:-300} node cdp.mjs x "$1"; }
 nav()  { WAIT=${W:-2500} node cdp.mjs "$1" "${2:-1}" >/dev/null; }
-url()  { curl -s 127.0.0.1:9222/json/list | jq -r '[.[]|select(.type=="page")][0].url'; }
-ntabs(){ curl -s 127.0.0.1:9222/json/list | jq '[.[]|select(.type=="page")]|length'; }
+url()  { curl -s 127.0.0.1:9222/json/list | jq -r '[.[]|select(.type=="page" and (.url|startswith("data:text/html;base64,")|not))][0].url'; }
+ntabs(){ curl -s 127.0.0.1:9222/json/list | jq '[.[]|select(.type=="page" and (.url|startswith("data:text/html;base64,")|not))]|length'; }
 k()    { wtype "$@"; sleep 0.35; }
 check() { if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1: got [$2] want [$3]"; fails=$((fails+1)); fi; }
 truthy(){ if [ "$2" = "true" ]; then echo "PASS $1"; else echo "FAIL $1 ($2)"; fails=$((fails+1)); fi; }

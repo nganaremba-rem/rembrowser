@@ -28,14 +28,20 @@ fn special_name(code: i32) -> Option<&'static str> {
         39 => "Right",
         40 => "Down",
         46 => "Del",
-        112..=123 => ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"][(code - 112) as usize],
+        112..=123 => [
+            "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+        ][(code - 112) as usize],
         _ => return None,
     })
 }
 
 /// Key token for a RAWKEYDOWN event. None for bare modifiers and unknown keys.
 pub fn from_event(e: &KeyEvent) -> Option<Key> {
-    let (ctrl, alt, shift) = (e.modifiers & CTRL != 0, e.modifiers & ALT != 0, e.modifiers & SHIFT != 0);
+    let (ctrl, alt, shift) = (
+        e.modifiers & CTRL != 0,
+        e.modifiers & ALT != 0,
+        e.modifiers & SHIFT != 0,
+    );
     let code = e.windows_key_code;
     // The typed character wins over the keycode: remappers (keyd, kanata, wtype) can put
     // ':' on a keycode Chromium names Escape, but `character` is still ':'.
@@ -67,7 +73,9 @@ pub fn from_event(e: &KeyEvent) -> Option<Key> {
         };
         return Some(format!("<{prefix}{c}>"));
     }
-    char::from_u32(e.character as u32).filter(|c| !c.is_control()).map(String::from)
+    char::from_u32(e.character as u32)
+        .filter(|c| !c.is_control())
+        .map(String::from)
 }
 
 /// "gT<C-d><Space>x" -> ["g", "T", "<C-d>", "<Space>", "x"]. Unknown <...> stays literal chars.
@@ -130,7 +138,11 @@ fn normalize(inner: &str) -> Option<Key> {
             if mods == "S-" {
                 return Some(c.to_uppercase().to_string());
             }
-            let c = if mods.contains("C-") || mods.contains("M-") { c.to_ascii_lowercase() } else { c };
+            let c = if mods.contains("C-") || mods.contains("M-") {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            };
             return Some(format!("<{}{c}>", mods.replace("S-", "")));
         }
         _ => return None,

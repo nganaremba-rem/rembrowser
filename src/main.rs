@@ -7,6 +7,8 @@ mod adblock;
 mod commands;
 mod downloads;
 mod keys;
+mod permissions;
+mod popup;
 mod privacy;
 mod tabs;
 mod ui;

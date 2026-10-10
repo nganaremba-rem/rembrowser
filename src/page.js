@@ -160,5 +160,39 @@ window.__rem ??= (() => {
     el?.focus();
   };
   R.blur = () => deepActive()?.blur();
+
+  // ── cosmetic adblock: CSS from adblock-rust (Rust side), adopted so CSP can't block it.
+  // Generic `##.ad` rules only match names that exist, so we report class/id names
+  // (once each) and Rust answers with the matching selectors.
+  const sheet = new CSSStyleSheet();
+  const seen = new Set();
+  let rules = '', generic = false, cls = [], ids = [], timer = 0;
+  const flush = () => { timer = 0; send('cls', cls.join(' '), ids.join(' ')); cls = []; ids = []; };
+  const note = (el) => {
+    for (const c of el.classList ?? []) if (!seen.has('.' + c)) seen.add('.' + c), cls.push(c);
+    if (el.id && !seen.has('#' + el.id)) seen.add('#' + el.id), ids.push(el.id);
+  };
+  const collect = (root) => {
+    if (root.nodeType !== 1 && root !== document) return;
+    if (root.nodeType === 1) note(root);
+    for (const el of root.querySelectorAll('[class],[id]')) note(el);
+    if ((cls.length || ids.length) && !timer) timer = setTimeout(flush, 50);
+  };
+  R.cosmetic = (css, gen) => {
+    if (css) {
+      rules += css;
+      sheet.replaceSync(rules);
+      if (!document.adoptedStyleSheets.includes(sheet)) document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+    }
+    if (gen && !generic) {
+      generic = true;
+      const start = () => {
+        collect(document);
+        new MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes) collect(n); })
+          .observe(document.documentElement, { childList: true, subtree: true });
+      };
+      document.readyState === 'loading' ? addEventListener('DOMContentLoaded', start, { once: true }) : start();
+    }
+  };
   return R;
 })();

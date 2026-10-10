@@ -20,12 +20,30 @@ static ENGINE: OnceLock<Engine> = OnceLock::new();
 
 const LISTS: &[(&str, &str)] = &[
     ("easylist", "https://easylist.to/easylist/easylist.txt"),
-    ("easyprivacy", "https://easylist.to/easylist/easyprivacy.txt"),
-    ("ubo-filters", "https://ublockorigin.github.io/uAssets/filters/filters.txt"),
-    ("ubo-privacy", "https://ublockorigin.github.io/uAssets/filters/privacy.txt"),
-    ("ubo-badware", "https://ublockorigin.github.io/uAssets/filters/badware.txt"),
-    ("ubo-quick-fixes", "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt"),
-    ("peter-lowe", "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&showintro=0&mimetype=plaintext"),
+    (
+        "easyprivacy",
+        "https://easylist.to/easylist/easyprivacy.txt",
+    ),
+    (
+        "ubo-filters",
+        "https://ublockorigin.github.io/uAssets/filters/filters.txt",
+    ),
+    (
+        "ubo-privacy",
+        "https://ublockorigin.github.io/uAssets/filters/privacy.txt",
+    ),
+    (
+        "ubo-badware",
+        "https://ublockorigin.github.io/uAssets/filters/badware.txt",
+    ),
+    (
+        "ubo-quick-fixes",
+        "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt",
+    ),
+    (
+        "peter-lowe",
+        "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&showintro=0&mimetype=plaintext",
+    ),
 ];
 
 /// uBO refreshes its lists every ~4 days.
@@ -38,7 +56,9 @@ fn cache_dir() -> PathBuf {
 }
 
 fn age(p: &Path) -> Option<Duration> {
-    SystemTime::now().duration_since(fs::metadata(p).ok()?.modified().ok()?).ok()
+    SystemTime::now()
+        .duration_since(fs::metadata(p).ok()?.modified().ok()?)
+        .ok()
 }
 
 /// Write via a temp file + rename so a crash never leaves a half-written cache.
@@ -105,8 +125,46 @@ fn build(dat: &Path) -> Option<Engine> {
 
 /// `rtype` uses adblock's request type names ("script", "image", "sub_frame", ...).
 pub fn should_block(url: &str, source: &str, rtype: &str) -> bool {
-    let Some(engine) = ENGINE.get() else { return false };
-    Request::new(url, source, rtype, "GET").is_ok_and(|r| engine.check_network_request(&r).should_block())
+    let Some(engine) = ENGINE.get() else {
+        return false;
+    };
+    Request::new(url, source, rtype, "GET")
+        .is_ok_and(|r| engine.check_network_request(&r).should_block())
+}
+
+/// One rule per selector: a selector the browser can't parse then drops only itself.
+fn hide_css(selectors: impl IntoIterator<Item = String>) -> String {
+    selectors
+        .into_iter()
+        .map(|s| format!("{s}{{display:none!important}}\n"))
+        .collect()
+}
+
+/// Site-specific `##` CSS for `url`, and whether generic rules apply on it.
+pub fn page_css(url: &str) -> (String, bool) {
+    let Some(engine) = ENGINE.get() else {
+        return (String::new(), false);
+    };
+    let r = engine.url_cosmetic_resources(url);
+    (hide_css(r.hide_selectors), !r.generichide)
+}
+
+/// Generic `##.class` / `###id` CSS for class and id names page.js found on `url`.
+pub fn class_id_css(url: &str, classes: &str, ids: &str) -> String {
+    let Some(engine) = ENGINE.get() else {
+        return String::new();
+    };
+    let r = engine.url_cosmetic_resources(url);
+    if r.generichide {
+        return String::new();
+    }
+    let words = |s: &str| {
+        s.split(' ')
+            .filter(|w| !w.is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    hide_css(engine.hidden_class_id_selectors(words(classes), words(ids), &r.exceptions))
 }
 
 #[cfg(test)]
@@ -119,8 +177,37 @@ mod tests {
         set.add_filter_list("||doubleclick.net^\n".into(), ParseOptions::default());
         let engine = Engine::new_with_filter_set(set);
         let _ = ENGINE.set(engine);
-        assert!(should_block("https://ad.doubleclick.net/x.js", "https://example.com/", "script"));
-        assert!(!should_block("https://example.com/app.js", "https://example.com/", "script"));
+        assert!(should_block(
+            "https://ad.doubleclick.net/x.js",
+            "https://example.com/",
+            "script"
+        ));
+        assert!(!should_block(
+            "https://example.com/app.js",
+            "https://example.com/",
+            "script"
+        ));
+    }
+
+    #[test]
+    fn cosmetic_css() {
+        let mut set = FilterSet::new(false);
+        set.add_filter_list(
+            "example.com##.promo\n##.ad-banner\n".into(),
+            ParseOptions::default(),
+        );
+        let engine = Engine::new_with_filter_set(set);
+        let r = engine.url_cosmetic_resources("https://example.com/");
+        assert_eq!(
+            hide_css(r.hide_selectors),
+            ".promo{display:none!important}\n"
+        );
+        let generic = engine.hidden_class_id_selectors(
+            ["ad-banner", "content"],
+            [] as [&str; 0],
+            &r.exceptions,
+        );
+        assert_eq!(generic, vec![".ad-banner".to_string()]);
     }
 }
 

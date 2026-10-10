@@ -25,7 +25,9 @@ pub fn opt(key: &str) -> Option<String> {
 }
 
 pub fn opt_bool(key: &str, default: bool) -> bool {
-    opt(key).map_or(default, |v| matches!(v.as_str(), "on" | "true" | "1" | "yes"))
+    opt(key).map_or(default, |v| {
+        matches!(v.as_str(), "on" | "true" | "1" | "yes")
+    })
 }
 
 pub fn opt_num(key: &str, default: i32) -> i32 {
@@ -45,14 +47,24 @@ fn expand_tilde(p: &str) -> PathBuf {
 
 /// vimb's data dir, shared so ~/.local/bin/vimb-pick (history, bookmarks, harpoon) keeps working.
 pub fn data_dir() -> PathBuf {
-    std::env::var("XDG_DATA_HOME").map_or_else(|_| PathBuf::from(home()).join(".local/share"), PathBuf::from).join("vimb")
+    std::env::var("XDG_DATA_HOME")
+        .map_or_else(
+            |_| PathBuf::from(home()).join(".local/share"),
+            PathBuf::from,
+        )
+        .join("vimb")
 }
 
 /// ~/.config/rembrowser/config, else the vimb config as-is.
 pub fn load_config() {
-    let cfg = std::env::var("XDG_CONFIG_HOME").map_or_else(|_| PathBuf::from(home()).join(".config"), PathBuf::from);
+    let cfg = std::env::var("XDG_CONFIG_HOME")
+        .map_or_else(|_| PathBuf::from(home()).join(".config"), PathBuf::from);
     let own = cfg.join("rembrowser/config");
-    let path = if own.exists() { own } else { cfg.join("vimb/config") };
+    let path = if own.exists() {
+        own
+    } else {
+        cfg.join("vimb/config")
+    };
     source(&path);
 }
 
@@ -92,7 +104,9 @@ fn exec_one(line: &str) {
     if line.is_empty() {
         return;
     }
-    let name_end = line.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).unwrap_or(line.len());
+    let name_end = line
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(line.len());
     let (name, rest) = line.split_at(name_end);
     let bang = rest.starts_with('!');
     let args = rest.trim_start_matches('!').trim();
@@ -155,7 +169,11 @@ fn set(args: &str) {
         Some((k, v)) => (k.trim().to_string(), v.trim().to_string()),
         None if args.ends_with('!') => {
             let k = args.trim_end_matches('!').trim().to_string();
-            let v = if opt_bool(&k, default_on(&k)) { "off" } else { "on" };
+            let v = if opt_bool(&k, default_on(&k)) {
+                "off"
+            } else {
+                "on"
+            };
             (k, v.into())
         }
         None => match args.strip_prefix("no") {
@@ -167,12 +185,50 @@ fn set(args: &str) {
     match key.as_str() {
         "status-bar" => ui::set_bar_visible(opt_bool("status-bar", true)),
         "fullscreen" => tabs::set_fullscreen(opt_bool("fullscreen", false)),
+        "tab-bar" => {
+            ui::set_tabbar_visible(opt_bool("tab-bar", true));
+            tabs::refresh_tabbar();
+        }
         _ => {}
     }
 }
 
 fn default_on(key: &str) -> bool {
-    matches!(key, "status-bar" | "smooth-scrolling" | "incsearch")
+    matches!(
+        key,
+        "status-bar" | "tab-bar" | "smooth-scrolling" | "incsearch"
+    )
+}
+
+/// Options rembrowser acts on, with their current value (for :set completion).
+pub fn settings() -> Vec<(String, String)> {
+    const KNOWN: &[&str] = &[
+        "dark-mode",
+        "editor-command",
+        "fullscreen",
+        "geolocation",
+        "hint-keys",
+        "home-page",
+        "incsearch",
+        "scroll-step",
+        "smooth-scrolling",
+        "status-bar",
+        "tab-bar",
+        "x-hint-command",
+    ];
+    KNOWN
+        .iter()
+        .map(|k| {
+            let v = opt(k).unwrap_or_else(|| {
+                if default_on(k) {
+                    "on".into()
+                } else {
+                    String::new()
+                }
+            });
+            (k.to_string(), v)
+        })
+        .collect()
 }
 
 /// Text from `:open` → URL. Shortcuts: `aw niri` → arch wiki search; plain words →
@@ -182,7 +238,11 @@ pub fn resolve_url(arg: &str) -> String {
     if arg.is_empty() {
         return opt("home-page").unwrap_or_else(|| crate::HOME_URL.into());
     }
-    if arg.contains("://") || ["about:", "data:", "file:", "chrome:", "view-source:"].iter().any(|p| arg.starts_with(p)) {
+    if arg.contains("://")
+        || ["about:", "data:", "file:", "chrome:", "view-source:"]
+            .iter()
+            .any(|p| arg.starts_with(p))
+    {
         return arg.into();
     }
     let (first, rest) = arg.split_once(' ').unwrap_or((arg, ""));
@@ -191,19 +251,35 @@ pub fn resolve_url(arg: &str) -> String {
         return fill(&t, rest);
     }
     if !arg.contains(' ') && looks_like_host(arg) {
-        let local = arg.starts_with("localhost") || arg.starts_with("127.") || arg.starts_with("192.168.");
+        let local =
+            arg.starts_with("localhost") || arg.starts_with("127.") || arg.starts_with("192.168.");
         return format!("{}://{arg}", if local { "http" } else { "https" });
     }
-    let default = OPTS.with_borrow(|o| o.default_shortcut.as_ref().and_then(|d| o.shortcuts.get(d)).cloned());
-    fill(&default.unwrap_or_else(|| "https://duckduckgo.com/?q=$0".into()), arg)
+    let default = OPTS.with_borrow(|o| {
+        o.default_shortcut
+            .as_ref()
+            .and_then(|d| o.shortcuts.get(d))
+            .cloned()
+    });
+    fill(
+        &default.unwrap_or_else(|| "https://duckduckgo.com/?q=$0".into()),
+        arg,
+    )
 }
 
 fn looks_like_host(s: &str) -> bool {
     let host = s.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(host, |(h, _)| h);
+    let host = host
+        .rsplit_once(':')
+        .filter(|(_, p)| p.parse::<u16>().is_ok())
+        .map_or(host, |(h, _)| h);
     host == "localhost"
-        || (host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
-            && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        || (host.contains('.')
+            && !host.starts_with('.')
+            && !host.ends_with('.')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
 }
 
 /// vimb shortcut template: $0 = all words, $1.. = single words.
@@ -219,7 +295,9 @@ fn fill(template: &str, words: &str) -> String {
 fn encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             b' ' => "+".into(),
             _ => format!("%{b:02X}"),
         })
@@ -245,7 +323,11 @@ pub fn command(program: &str) -> Command {
     // SAFETY: close_range is a single async-signal-safe syscall.
     unsafe {
         c.pre_exec(|| {
-            libc::close_range(3, libc::c_uint::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int);
+            libc::close_range(
+                3,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+            );
             Ok(())
         });
     }
@@ -257,8 +339,11 @@ fn env_cmd(cmd: &str) -> Command {
     let mut c = command("sh");
     c.arg("-c").arg(cmd).stdin(Stdio::null());
     // vimb names keep existing scripts (vimb-pick) working.
-    c.env("VIMB_URI", &uri).env("VIMB_TITLE", &title).env("VIMB_PID", std::process::id().to_string());
-    c.env("REMBROWSER_URI", &uri).env("REMBROWSER_TITLE", &title);
+    c.env("VIMB_URI", &uri)
+        .env("VIMB_TITLE", &title)
+        .env("VIMB_PID", std::process::id().to_string());
+    c.env("REMBROWSER_URI", &uri)
+        .env("REMBROWSER_TITLE", &title);
     c
 }
 
@@ -270,8 +355,16 @@ fn shell(cmd: &str, show: bool) {
         return;
     }
     std::thread::spawn(move || {
-        let out = c.output().map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string());
-        ui::run_on_ui(0, move || ui::message(&out.unwrap_or_else(|e| e.to_string()), false));
+        let out = c.output().map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        });
+        ui::run_on_ui(0, move || {
+            ui::message(&out.unwrap_or_else(|e| e.to_string()), false)
+        });
     });
 }
 
@@ -292,7 +385,13 @@ fn tab_picker() {
     let rows: Vec<String> = tabs::titles()
         .into_iter()
         .enumerate()
-        .map(|(i, (t, u))| format!("{}  {}   —   {u}", i + 1, if t.is_empty() { &u } else { &t }))
+        .map(|(i, (t, u))| {
+            format!(
+                "{}  {}   —   {u}",
+                i + 1,
+                if t.is_empty() { &u } else { &t }
+            )
+        })
         .collect();
     std::thread::spawn(move || {
         let child = command("fuzzel")
@@ -306,7 +405,12 @@ fn tab_picker() {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(rows.join("\n").as_bytes());
         }
-        let pick = child.wait_with_output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok());
+        let pick = child.wait_with_output().ok().and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<usize>()
+                .ok()
+        });
         if let Some(i) = pick {
             ui::run_on_ui(0, move || tabs::select(i));
         }
@@ -316,7 +420,11 @@ fn tab_picker() {
 fn append_line(file: &str, line: &str) {
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(file)) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(file))
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -330,7 +438,10 @@ pub fn record_history(url: &str, title: &str) {
 
 fn bookmark_add(tags: &str) {
     let url = tabs::active_url();
-    append_line("bookmark", &format!("{url}\t{}\t{tags}", tabs::active_title().replace('\t', " ")));
+    append_line(
+        "bookmark",
+        &format!("{url}\t{}\t{tags}", tabs::active_title().replace('\t', " ")),
+    );
     ui::message(&format!("bookmarked {url}"), false);
 }
 
@@ -347,7 +458,14 @@ fn queue_pop() {
     match lines.next() {
         Some(first) => {
             let rest: Vec<&str> = lines.collect();
-            let _ = std::fs::write(&path, if rest.is_empty() { String::new() } else { rest.join("\n") + "\n" });
+            let _ = std::fs::write(
+                &path,
+                if rest.is_empty() {
+                    String::new()
+                } else {
+                    rest.join("\n") + "\n"
+                },
+            );
             open(first, false);
         }
         None => ui::message("read-later queue is empty", true),
@@ -363,10 +481,16 @@ mod tests {
         exec("shortcut-add dd=https://duckduckgo.com/?q=$0");
         exec("shortcut-add aw=https://wiki.archlinux.org/index.php?search=$0");
         exec("shortcut-default dd");
-        assert_eq!(resolve_url("aw niri wm"), "https://wiki.archlinux.org/index.php?search=niri+wm");
+        assert_eq!(
+            resolve_url("aw niri wm"),
+            "https://wiki.archlinux.org/index.php?search=niri+wm"
+        );
         assert_eq!(resolve_url("github.com/foo"), "https://github.com/foo");
         assert_eq!(resolve_url("localhost:8080"), "http://localhost:8080");
-        assert_eq!(resolve_url("rust traits"), "https://duckduckgo.com/?q=rust+traits");
+        assert_eq!(
+            resolve_url("rust traits"),
+            "https://duckduckgo.com/?q=rust+traits"
+        );
         assert_eq!(resolve_url("aw"), "https://duckduckgo.com/?q=aw");
         assert_eq!(resolve_url("about:blank"), "about:blank");
         assert_eq!(resolve_url("c++"), "https://duckduckgo.com/?q=c%2B%2B");

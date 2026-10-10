@@ -4,7 +4,7 @@
 //! All CEF Views calls happen on the UI thread, so tab state lives in thread_locals
 //! (no locks). Rule: never call into vim/ui while holding a borrow here.
 
-use crate::{adblock, commands, downloads, ui, vim};
+use crate::{adblock, commands, downloads, permissions, popup, ui, vim};
 use cef::*;
 use std::cell::{Cell, RefCell};
 
@@ -33,7 +33,12 @@ thread_local! {
 fn app_id_str() -> CefString {
     static BUF: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
     let buf = BUF.get_or_init(|| APP_ID.encode_utf16().collect());
-    sys::_cef_string_utf16_t { str_: buf.as_ptr().cast_mut(), length: buf.len(), dtor: None }.into()
+    sys::_cef_string_utf16_t {
+        str_: buf.as_ptr().cast_mut(),
+        length: buf.len(),
+        dtor: None,
+    }
+    .into()
 }
 
 pub fn create_window(url: String) {
@@ -41,7 +46,7 @@ pub fn create_window(url: String) {
     window_create_top_level(Some(&mut delegate));
 }
 
-fn window() -> Option<Window> {
+pub fn window() -> Option<Window> {
     WINDOW.with_borrow(|w| w.clone())
 }
 
@@ -56,13 +61,23 @@ pub fn with_active(f: impl FnOnce(&Browser)) {
 }
 
 fn browser_settings() -> BrowserSettings {
-    BrowserSettings { background_color: BG, ..Default::default() }
+    BrowserSettings {
+        background_color: BG,
+        ..Default::default()
+    }
 }
 
 pub fn open(url: &str, background: bool) {
     let mut client = RemClient::new();
     let mut delegate = RemBrowserViewDelegate::new();
-    let bv = browser_view_create(Some(&mut client), Some(&url.into()), Some(&browser_settings()), None, None, Some(&mut delegate));
+    let bv = browser_view_create(
+        Some(&mut client),
+        Some(&url.into()),
+        Some(&browser_settings()),
+        None,
+        None,
+        Some(&mut delegate),
+    );
     if let Some(bv) = bv {
         add(bv, background);
     }
@@ -77,7 +92,9 @@ pub fn load(url: &str) {
 }
 
 fn add(bv: BrowserView, background: bool) {
-    let Some(content) = CONTENT.with_borrow(|c| c.clone()) else { return };
+    let Some(content) = CONTENT.with_borrow(|c| c.clone()) else {
+        return;
+    };
     let mut view = View::from(&bv);
     view.set_visible(0);
     content.add_child_view(Some(&mut view));
@@ -96,7 +113,10 @@ fn add(bv: BrowserView, background: bool) {
 pub fn select(i: usize) {
     let (bv, old) = TABS.with_borrow(|t| {
         let i = i.min(t.len().saturating_sub(1));
-        (t.get(i).cloned().map(|bv| (i, bv)), t.get(ACTIVE.get()).cloned())
+        (
+            t.get(i).cloned().map(|bv| (i, bv)),
+            t.get(ACTIVE.get()).cloned(),
+        )
     });
     let Some((i, bv)) = bv else { return };
     if let Some(old) = old {
@@ -178,20 +198,29 @@ pub fn active_title() -> String {
 
 /// (title, url) of every tab, in order.
 pub fn titles() -> Vec<(String, String)> {
-    TABS.with_borrow(|t| t.clone()).iter().map(|bv| (title_of(bv), url_of(bv))).collect()
+    TABS.with_borrow(|t| t.clone())
+        .iter()
+        .map(|bv| (title_of(bv), url_of(bv)))
+        .collect()
 }
 
 /// Run JS in the active tab's main frame, page.js helpers included.
 pub fn js(code: &str) {
     with_active(|b| {
         if let Some(f) = b.main_frame() {
-            f.execute_java_script(Some(&format!("{PAGE_JS};{code}").as_str().into()), Some(&"rembrowser://page.js".into()), 0);
+            f.execute_java_script(
+                Some(&format!("{PAGE_JS};{code}").as_str().into()),
+                Some(&"rembrowser://page.js".into()),
+                0,
+            );
         }
     });
 }
 
 pub fn zoom() -> f64 {
-    active().and_then(|bv| bv.browser()?.host()).map_or(0.0, |h| h.zoom_level())
+    active()
+        .and_then(|bv| bv.browser()?.host())
+        .map_or(0.0, |h| h.zoom_level())
 }
 
 pub fn set_zoom(level: f64) {
@@ -207,7 +236,11 @@ pub fn click(x: f64, y: f64) {
     // CEF mouse coordinates are view (DIP) pixels = CSS pixels × page zoom.
     // ponytail: ignores pinch-zoom; scale by visualViewport if that ever matters.
     let factor = 1.2f64.powf(zoom());
-    let ev = MouseEvent { x: (x * factor) as i32, y: (y * factor) as i32, modifiers: 0 };
+    let ev = MouseEvent {
+        x: (x * factor) as i32,
+        y: (y * factor) as i32,
+        modifiers: 0,
+    };
     with_active(|b| {
         if let Some(h) = b.host() {
             h.send_mouse_move_event(Some(&ev), 0);
@@ -235,11 +268,25 @@ pub fn stop_find() {
     });
 }
 
+pub fn refresh_tabbar() {
+    let titles: Vec<String> = TABS
+        .with_borrow(|t| t.clone())
+        .iter()
+        .map(title_of)
+        .collect();
+    ui::set_tabs(&titles, ACTIVE.get());
+}
+
 fn refresh_right() {
+    refresh_tabbar();
     let n = TABS.with_borrow(|t| t.len());
     let find = FIND.with_borrow(|f| f.clone());
     let progress = PROGRESS.get();
-    let load = if progress < 100 { format!(" {progress}%") } else { String::new() };
+    let load = if progress < 100 {
+        format!(" {progress}%")
+    } else {
+        String::new()
+    };
     ui::set_right(format!("{find} [{}/{n}]{load}", ACTIVE.get() + 1).trim_start());
 }
 
@@ -251,13 +298,21 @@ fn build_bar() {
     if ui::is_built() {
         return;
     }
-    w.add_child_view(Some(&mut View::from(&ui::build())));
+    let (tabbar, status) = ui::build();
+    w.add_child_view_at(Some(&mut View::from(&tabbar)), 0);
+    w.add_child_view(Some(&mut View::from(&status)));
     ui::set_bar_visible(commands::opt_bool("status-bar", true));
+    ui::set_tabbar_visible(commands::opt_bool("tab-bar", true));
+    ui::recolor();
+    popup::init(&w);
     select(ACTIVE.get());
 }
 
 fn index_of(browser: &mut Browser) -> Option<usize> {
-    TABS.with_borrow(|t| t.iter().position(|bv| bv.browser().is_some_and(|b| b.is_same(Some(browser)) != 0)))
+    TABS.with_borrow(|t| {
+        t.iter()
+            .position(|bv| bv.browser().is_some_and(|b| b.is_same(Some(browser)) != 0))
+    })
 }
 
 fn is_active(browser: &mut Browser) -> bool {
@@ -314,6 +369,16 @@ wrap_window_delegate! {
     impl PanelDelegate {}
 
     impl WindowDelegate {
+        // Runs before the first layout and on every OS/GTK theme switch. Views get
+        // their theme colours re-applied *after* this (and whenever they are added),
+        // overwriting any earlier set_background_color — so per-view colours are
+        // re-applied on the next tick.
+        fn on_theme_colors_changed(&self, window: Option<&mut Window>, _chrome_theme: i32) {
+            if let Some(w) = window {
+                ui::theme(w);
+            }
+        }
+
         fn window_runtime_style(&self) -> RuntimeStyle {
             RuntimeStyle::ALLOY
         }
@@ -348,7 +413,9 @@ wrap_window_delegate! {
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
             // Ask every tab (runs beforeunload). Each closed tab hits on_tab_closed;
             // the last one closes the window again, which then passes.
-            let hosts: Vec<_> = TABS.with_borrow(|t| t.iter().filter_map(|bv| bv.browser()?.host()).collect());
+            // The popup overlay too: a browser left open at shutdown trips a CHECK.
+            let mut hosts: Vec<_> = TABS.with_borrow(|t| t.iter().filter_map(|bv| bv.browser()?.host()).collect());
+            hosts.extend(popup::host());
             hosts.iter().fold(1, |all, h| all & h.try_close_browser())
         }
 
@@ -424,6 +491,10 @@ wrap_client! {
         fn download_handler(&self) -> Option<DownloadHandler> {
             Some(downloads::RemDownloadHandler::new())
         }
+
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(permissions::RemPermissionHandler::new())
+        }
     }
 }
 
@@ -437,6 +508,7 @@ wrap_display_handler! {
                     w.set_title(title);
                 }
             }
+            refresh_tabbar();
         }
 
         fn on_address_change(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
@@ -464,6 +536,16 @@ wrap_display_handler! {
         ) -> i32 {
             let msg = message.map(|m| m.to_string()).unwrap_or_default();
             let Some(body) = msg.strip_prefix("\u{1}rem\t") else { return 0 };
+            // Cosmetic adblock runs in every tab, not just the visible one.
+            if let (Some(rest), Some(f)) = (body.strip_prefix("cls\t"), browser.as_ref().and_then(|b| b.main_frame())) {
+                let (classes, ids) = rest.split_once('\t').unwrap_or((rest, ""));
+                let css = adblock::class_id_css(&CefString::from(&f.url()).to_string(), classes, ids);
+                if !css.is_empty() {
+                    let js = format!("__rem.cosmetic({},false)", popup::js_str(&css));
+                    f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://page.js".into()), 0);
+                }
+                return 1;
+            }
             if browser.is_some_and(|b| is_active(b)) {
                 let fields: Vec<&str> = body.split('\t').collect();
                 vim::on_page_msg(&fields);
@@ -477,6 +559,19 @@ wrap_load_handler! {
     struct RemLoadHandler;
 
     impl LoadHandler {
+        // Cosmetic adblock: site CSS before the page paints; page.js starts reporting
+        // class/id names for the generic rules.
+        fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+            let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
+            let url = CefString::from(&f.url()).to_string();
+            if !url.starts_with("http") {
+                return;
+            }
+            let (css, generic) = adblock::page_css(&url);
+            let js = format!("{PAGE_JS};__rem.cosmetic({},{generic})", popup::js_str(&css));
+            f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://page.js".into()), 0);
+        }
+
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
             // Install page.js early so focus → INSERT shows without a key press.
@@ -508,7 +603,12 @@ wrap_find_handler! {
             final_update: i32,
         ) {
             if final_update != 0 && browser.is_some_and(|b| is_active(b)) {
-                let text = if count == 0 { "no match".into() } else { format!("{active_match_ordinal}/{count}") };
+                let text = if count == 0 {
+                    "no match".into()
+                } else {
+                    // Chromium reports ordinal 0 for a fresh (incsearch) session though match 1 is active.
+                    format!("{}/{count}", active_match_ordinal.max(1)) };
+                popup::set_count(&text);
                 FIND.with_borrow_mut(|f| *f = text);
                 refresh_right();
             }

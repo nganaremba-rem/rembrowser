@@ -3,7 +3,7 @@
 pkill -x rembrowser; sleep 1
 ( LD_LIBRARY_PATH=/usr/lib/cef REMBROWSER_CDP=9222 timeout 90 ../target/release/rembrowser https://example.com >tabs.log 2>&1 & )
 sleep 4
-pages() { curl -s 127.0.0.1:9222/json/list | jq -r '[.[]|select(.type=="page")|.url]|join(" , ")'; }
+pages() { curl -s 127.0.0.1:9222/json/list | jq -r '[.[]|select(.type=="page" and (.url|startswith("data:text/html;base64,")|not))|.url]|join(" , ")'; }
 wtitle() { niri msg -j windows | jq -r '.[]|select(.app_id=="rembrowser")|.title'; }
 id=$(niri msg -j windows | jq -r '.[]|select(.app_id=="rembrowser")|.id')
 niri msg action focus-window --id "$id"; sleep 0.5

@@ -1,0 +1,319 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --base: #1e1e2e; --mantle: #181825; --crust: #11111b;
+    --surface0: #313244; --surface1: #45475a; --overlay0: #6c7086;
+    --text: #cdd6f4; --subtext: #a6adc8;
+    --blue: #89b4fa; --green: #a6e3a1; --yellow: #f9e2af; --peach: #fab387;
+    --mauve: #cba6f7; --red: #f38ba8; --teal: #94e2d5; --pink: #f5c2e7;
+    --accent: var(--blue);
+    --mono: "CaskaydiaMono Nerd Font Mono", "CaskaydiaCove Nerd Font Mono", monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  /* The overlay is a native (opaque) view sized to exactly this box: Rust reads
+     #wrap's height from 'size' messages. Windowed CEF browsers can't be transparent,
+     hence square corners and no drop shadow. */
+  html, body { background: var(--base); overflow: hidden; font: 15px/1.4 var(--mono); color: var(--text); }
+  #wrap { border: 1.5px solid var(--accent); }
+  #wrap.hidden { display: none; }
+  .anim > * { animation: pop .12s ease-out; }
+  @keyframes pop { from { opacity: 0; transform: translateY(-4px); } }
+  /* lualine-style mode pill. */
+  #title {
+    background: var(--accent); color: var(--crust); font-weight: bold; font-size: 13px;
+    padding: 2px 10px; border-radius: 6px; white-space: nowrap; flex: none;
+  }
+  #cmd { display: flex; align-items: center; gap: 12px; padding: 10px 12px; }
+  #in {
+    flex: 1; background: transparent; border: 0; outline: 0; color: var(--text);
+    font: inherit; font-size: 16px; caret-color: var(--accent);
+  }
+  #count { color: var(--subtext); font-size: 13px; background: var(--surface0); padding: 1px 8px; border-radius: 6px; }
+  #count:empty { display: none; }
+  #menu { padding: 6px; border-top: 1px solid var(--surface0); }
+  #menu.hidden, #prompt.hidden { display: none; }
+  #list { max-height: 330px; overflow-y: auto; }
+  #list::-webkit-scrollbar { width: 6px; }
+  #list::-webkit-scrollbar-thumb { background: var(--surface1); border-radius: 3px; }
+  .row {
+    display: flex; align-items: center; gap: 10px; padding: 5px 10px; border-radius: 8px;
+    border-left: 3px solid transparent; cursor: pointer; white-space: nowrap;
+  }
+  .row.sel { background: var(--surface0); border-left-color: var(--accent); }
+  .row .k { width: 18px; text-align: center; flex: none; }
+  .row .t { overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
+  .row .u { margin-left: auto; padding-left: 16px; color: var(--overlay0); overflow: hidden; text-overflow: ellipsis; font-size: 13px; flex: 0 1 auto; max-width: 55%; }
+  .row b { color: var(--peach); font-weight: bold; }
+  .k.history { color: var(--mauve); } .k.bookmark { color: var(--yellow); } .k.tab { color: var(--teal); }
+  .k.command { color: var(--blue); } .k.setting { color: var(--green); } .k.cmdhist { color: var(--overlay0); }
+  #foot { display: flex; gap: 14px; justify-content: flex-end; padding: 6px 10px 2px; color: var(--overlay0); font-size: 12px; }
+  #foot kbd { color: var(--subtext); font: inherit; background: var(--surface0); padding: 0 5px; border-radius: 4px; }
+  #prompt { padding: 0 14px 14px; }
+  #pmsg { font-size: 15px; margin-bottom: 14px; }
+  #pmsg .o { color: var(--peach); font-weight: bold; }
+  #pbtns { display: flex; gap: 10px; flex-wrap: wrap; }
+  #pbtns button {
+    font: inherit; font-size: 14px; color: var(--text); background: var(--surface0);
+    border: 1px solid var(--surface1); border-radius: 8px; padding: 5px 12px; cursor: pointer;
+  }
+  #pbtns button kbd { color: var(--accent); font: inherit; font-weight: bold; margin-right: 6px; }
+  #pbtns button:hover { border-color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="wrap" class="hidden">
+  <div id="cmd"><span id="title"></span><input id="in" spellcheck="false" autocomplete="off"><span id="count"></span></div>
+  <div id="prompt" class="hidden"><div id="pmsg"></div><div id="pbtns"></div></div>
+  <div id="menu" class="hidden">
+    <div id="list"></div>
+    <div id="foot"><span><kbd>Tab</kbd> select</span><span><kbd>↵</kbd> run</span><span><kbd>Esc</kbd> close</span></div>
+  </div>
+</div>
+<script>
+'use strict';
+// Rust → here: rem.open(state) / rem.count(text) / rem.close() / rem.prompt(p).
+// Here → Rust: console.debug("\x01pop\t<type>\t<fields>").
+const send = (...f) => console.debug('\x01pop\t' + f.map((x) => String(x ?? '').replace(/[\t\n]/g, ' ')).join('\t'));
+const $ = (id) => document.getElementById(id);
+const wrap = $('wrap'), input = $('in'), list = $('list'), menu = $('menu');
+
+const MODES = {
+  ex:       { title: ' Cmdline', accent: '--blue' },
+  open:     { title: '󰖟 Open', accent: '--green' },
+  tabopen:  { title: '󰓩 Tab open', accent: '--teal' },
+  set:      { title: ' Set', accent: '--green' },
+  shell:    { title: ' Shell', accent: '--peach' },
+  searchf:  { title: ' Search ↓', accent: '--yellow' },
+  searchb:  { title: ' Search ↑', accent: '--yellow' },
+  prompt:   { title: '󰒃 Permission', accent: '--peach' },
+};
+const KIND_ICON = { history: '󰋚', bookmark: '󰃀', tab: '󰓩', command: '', setting: '', cmdhist: '󰘳' };
+const OPEN_CMDS = ['open', 'o', 'tabopen', 't', 'tabnew'];
+
+let S = null;         // state from Rust
+let items = [];       // current completion rows
+let sel = -1;         // selected row, -1 = none (input is what the user typed)
+let typed = '';       // input before Tab-cycling started
+let hist = -1;        // position in command history (Up/Down)
+let regPending = false;
+
+function mode() {
+  if (S.kind === 'search') return S.forward ? 'searchf' : 'searchb';
+  if (S.kind === 'prompt') return 'prompt';
+  const c = input.value.trimStart().split(/\s/)[0];
+  if (input.value.includes(' ')) {
+    if (c === 'open' || c === 'o') return 'open';
+    if (c === 'tabopen' || c === 't' || c === 'tabnew') return 'tabopen';
+    if (c === 'set') return 'set';
+    if (c === 'sh' || c === 'sh!' || c === 'shellex') return 'shell';
+  }
+  return 'ex';
+}
+
+function paintMode() {
+  const m = MODES[mode()];
+  document.documentElement.style.setProperty('--accent', `var(${m.accent})`);
+  $('title').textContent = m.title;
+}
+
+// ── fuzzy matching (subsequence; bonus for runs and word starts) ──────────
+function fuzzy(q, s) {
+  if (!q) return { score: 0, pos: [] };
+  const ql = q.toLowerCase(), sl = s.toLowerCase();
+  let score = 0, pos = [], j = 0, run = 0;
+  for (let i = 0; i < sl.length && j < ql.length; i++) {
+    if (sl[i] === ql[j]) {
+      run++;
+      score += 1 + run * 2 + (i === 0 || /[\s/._\-:?=&]/.test(sl[i - 1]) ? 4 : 0);
+      pos.push(i); j++;
+    } else run = 0;
+  }
+  if (j < ql.length) return null;
+  return { score: score - s.length * 0.01, pos };
+}
+
+function hl(text, pos, offset) {
+  const frag = document.createDocumentFragment();
+  let last = 0;
+  for (const p0 of pos) {
+    const p = p0 - offset;
+    if (p < 0 || p >= text.length) continue;
+    if (p > last) frag.append(text.slice(last, p));
+    const b = document.createElement('b'); b.textContent = text[p]; frag.append(b);
+    last = p + 1;
+  }
+  frag.append(text.slice(last));
+  return frag;
+}
+
+// ── completion sources by what is being typed ────────────────────────────
+function candidates(value) {
+  const sp = value.indexOf(' ');
+  const cmd = sp < 0 ? value : value.slice(0, sp);
+  const arg = sp < 0 ? '' : value.slice(sp + 1);
+  if (S.kind !== 'ex') return [];
+  if (sp < 0) {
+    if (!cmd) return [];
+    const cmds = S.commands.map(([n, d]) => ({ kind: 'command', t: n, u: d, fill: n + ' ' }));
+    const recent = S.history.slice(-30).reverse().map((h) => ({ kind: 'cmdhist', t: h, u: 'history', fill: h }));
+    return rank(cmd, [...cmds, ...recent], (x) => x.t);
+  }
+  if (OPEN_CMDS.includes(cmd)) {
+    const tabs = S.tabs.map(([i, t, u]) => ({ kind: 'tab', t: t || u, u, fill: `${cmd} ${u}` }));
+    const urls = S.urls.map(([k, t, u]) => ({ kind: k, t: t || u, u, fill: `${cmd} ${u}` }));
+    return rank(arg, [...urls, ...tabs], (x) => x.t + ' ' + x.u, 40);
+  }
+  if (cmd === 'b' || cmd === 'buffer') {
+    return rank(arg, S.tabs.map(([i, t, u]) => ({ kind: 'tab', t: `${i}  ${t || u}`, u, fill: `buffer ${i}` })), (x) => x.t + ' ' + x.u);
+  }
+  if (cmd === 'set') {
+    return rank(arg, S.settings.map(([n, v]) => ({ kind: 'setting', t: n, u: v, fill: `set ${n}=` })), (x) => x.t);
+  }
+  return [];
+}
+
+function rank(q, xs, key, limit = 60) {
+  if (!q.trim()) return xs.slice(0, limit).map((x) => ({ ...x, pos: [], off: 0 }));
+  const out = [];
+  for (const x of xs) {
+    const m = fuzzy(q.trim(), key(x));
+    if (m) out.push({ ...x, score: m.score, pos: m.pos });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
+function renderMenu() {
+  list.replaceChildren();
+  items.forEach((it, n) => {
+    const row = document.createElement('div');
+    row.className = 'row' + (n === sel ? ' sel' : '');
+    const k = document.createElement('span'); k.className = 'k ' + it.kind; k.textContent = KIND_ICON[it.kind] || '';
+    const t = document.createElement('span'); t.className = 't'; t.append(hl(it.t, it.pos || [], 0));
+    const u = document.createElement('span'); u.className = 'u';
+    // Highlight positions past the title belong to the url part ("title url").
+    u.append(it.kind === 'command' || it.kind === 'setting' || it.kind === 'cmdhist' ? it.u : hl(it.u, it.pos || [], it.t.length + 1));
+    row.append(k, t, u);
+    row.onmousedown = (e) => { e.preventDefault(); sel = n; input.value = it.fill; submit(); };
+    list.append(row);
+  });
+  menu.classList.toggle('hidden', items.length === 0);
+  list.children[sel]?.scrollIntoView({ block: 'nearest' });
+}
+
+function refresh() {
+  typed = input.value;
+  sel = -1;
+  items = candidates(typed);
+  paintMode();
+  renderMenu();
+  if (S.kind === 'search') send('preview', input.value, S.forward ? 1 : 0);
+}
+
+function move(d) {
+  if (!items.length) return histMove(d);
+  sel = sel + d;
+  if (sel >= items.length) sel = -1;
+  if (sel < -1) sel = items.length - 1;
+  input.value = sel < 0 ? typed : items[sel].fill;
+  paintMode();
+  renderMenu();
+}
+
+function histMove(d) {
+  const h = S.history;
+  if (!h.length) return;
+  hist = hist < 0 ? h.length : hist;
+  hist = Math.max(0, Math.min(h.length, hist + d));
+  input.value = hist === h.length ? typed : h[hist];
+  paintMode();
+}
+
+function submit() { const v = input.value; hide(); send('submit', S.kind, S.forward ? 1 : 0, v); }
+function cancel() { hide(); send('cancel', S.kind); }
+function hide() { wrap.classList.add('hidden'); }
+
+input.addEventListener('input', refresh);
+input.addEventListener('keydown', (e) => {
+  const k = (e.ctrlKey ? 'C-' : '') + (e.shiftKey && e.key.length > 1 ? 'S-' : '') + e.key;
+  if (regPending) {
+    regPending = false;
+    const r = S.regs[e.key];
+    if (r !== undefined) input.setRangeText(r, input.selectionStart, input.selectionEnd, 'end'), refresh();
+    e.preventDefault();
+    return;
+  }
+  const at = input.selectionStart;
+  switch (k) {
+    case 'Enter': submit(); break;
+    case 'Escape': case 'C-c': case 'C-[': cancel(); break;
+    case 'Tab': case 'C-n': case 'ArrowDown': move(1); break;
+    case 'S-Tab': case 'C-p': case 'ArrowUp': move(-1); break;
+    case 'C-r': regPending = true; break;
+    case 'C-u': input.setRangeText('', 0, at, 'start'); refresh(); break;
+    case 'C-w': {
+      const left = input.value.slice(0, at).replace(/\S*\s*$/, '');
+      input.setRangeText('', left.length, at, 'end'); refresh(); break;
+    }
+    case 'C-a': case 'C-b': case 'Home': input.setSelectionRange(0, 0); break;
+    case 'C-e': case 'End': input.setSelectionRange(input.value.length, input.value.length); break;
+    case 'C-f': send('edit', S.kind, input.value); hide(); break;
+    default: return;
+  }
+  e.preventDefault();
+});
+// Clicking the page (or another window) takes focus away = cancel, like vim's cmdline.
+input.addEventListener('blur', () => { if (S?.kind !== 'prompt' && !wrap.classList.contains('hidden')) cancel(); });
+// Rust sizes the overlay to the box.
+new ResizeObserver(() => { if (!wrap.classList.contains('hidden')) send('size', Math.ceil(wrap.getBoundingClientRect().height)); }).observe(wrap);
+
+// ── permission prompt ─────────────────────────────────────────────────
+function answer(choice) { hide(); send('answer', S.id, choice); }
+document.addEventListener('keydown', (e) => {
+  if (S?.kind !== 'prompt' || wrap.classList.contains('hidden')) return;
+  const map = { y: 'allow', a: 'always', n: 'deny', N: 'never', Escape: 'dismiss' };
+  if (map[e.key]) { e.preventDefault(); answer(map[e.key]); }
+});
+
+window.rem = {
+  open(state) {
+    S = state;
+    hist = -1;
+    regPending = false;
+    const prompt = S.kind === 'prompt';
+    input.style.display = prompt ? 'none' : '';
+    $('prompt').classList.toggle('hidden', !prompt);
+    $('count').textContent = '';
+    if (prompt) {
+      const m = $('pmsg'); m.replaceChildren();
+      const o = document.createElement('span'); o.className = 'o'; o.textContent = S.origin;
+      m.append(o, ` wants to use your ${S.what}.`);
+      const b = $('pbtns'); b.replaceChildren();
+      for (const [key, label, choice] of [['y', 'Allow once', 'allow'], ['a', 'Always allow', 'always'], ['n', 'Deny', 'deny'], ['N', 'Never', 'never']]) {
+        const btn = document.createElement('button');
+        const kb = document.createElement('kbd'); kb.textContent = key;
+        btn.append(kb, label);
+        btn.onclick = () => answer(choice);
+        b.append(btn);
+      }
+      items = [];
+      renderMenu();
+      paintMode();
+    } else {
+      input.value = S.text;
+      refresh();
+    }
+    wrap.classList.remove('hidden');
+    wrap.classList.remove('anim'); void wrap.offsetWidth; wrap.classList.add('anim');
+    if (prompt) document.activeElement?.blur(); else input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  },
+  count(text) { $('count').textContent = text; },
+  close() { hide(); },
+};
+send('ready');
+</script>
+</body>
+</html>

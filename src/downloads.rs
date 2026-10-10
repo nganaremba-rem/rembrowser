@@ -38,14 +38,20 @@ fn download_path(name: &str) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Downloads");
     let _ = std::fs::create_dir_all(&dir);
     // Strip path separators a hostile server could put in the suggested name.
-    let name = match name.rsplit(['/', '\\']).next().filter(|n| !n.is_empty() && *n != "..") {
+    let name = match name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|n| !n.is_empty() && *n != "..")
+    {
         Some(n) => n,
         None => "download",
     };
     let p = std::path::Path::new(name);
     let (stem, ext) = (
         p.file_stem().map_or(name.into(), |s| s.to_string_lossy()),
-        p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default(),
+        p.extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default(),
     );
     let mut path = dir.join(name);
     let mut n = 1;
@@ -63,8 +69,16 @@ mod tests {
     #[test]
     fn download_names_are_sanitized() {
         let p = download_path("../../etc/passwd");
-        assert!(p.ends_with("Downloads/passwd") || p.file_name().unwrap().to_string_lossy().starts_with("passwd ("));
-        assert!(download_path("..").ends_with("Downloads/download") || download_path("..").to_string_lossy().contains("download ("));
+        assert!(
+            p.ends_with("Downloads/passwd")
+                || p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("passwd (")
+        );
+        assert!(
+            download_path("..").ends_with("Downloads/download")
+                || download_path("..").to_string_lossy().contains("download (")
+        );
     }
 }
-

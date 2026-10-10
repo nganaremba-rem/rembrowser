@@ -6,8 +6,9 @@
 
 use crate::commands::{self, opt, opt_num};
 use crate::keys::{self, Key};
+use crate::popup::{self, CmdKind};
 use crate::tabs;
-use crate::ui::{self, CmdKind};
+use crate::ui;
 use cef::{ImplBrowser, KeyEvent};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -175,7 +176,13 @@ const TIMEOUT_MS: i64 = 1000;
 pub fn map(mode: &str, lhs: &str, rhs: &str, noremap: bool) {
     let m = mode.chars().next().unwrap_or('n');
     VIM.with_borrow_mut(|v| {
-        v.maps.entry(m).or_default().insert(keys::parse(lhs), Map { rhs: rhs.into(), noremap });
+        v.maps.entry(m).or_default().insert(
+            keys::parse(lhs),
+            Map {
+                rhs: rhs.into(),
+                noremap,
+            },
+        );
     });
 }
 
@@ -191,7 +198,10 @@ fn set_mode(mode: Mode) {
 
 fn show_mode() {
     let (mode, pending, count) = VIM.with_borrow(|v| (v.mode, v.pending.concat(), v.count));
-    let extra = format!("{}{pending}", count.map(|c| c.to_string()).unwrap_or_default());
+    let extra = format!(
+        "{}{pending}",
+        count.map(|c| c.to_string()).unwrap_or_default()
+    );
     let (name, color) = match mode {
         Mode::Normal if !extra.is_empty() => (extra.as_str(), ui::BLUE),
         Mode::Normal => ("NORMAL", ui::BLUE),
@@ -216,10 +226,15 @@ pub fn reset() {
 
 /// A RAWKEYDOWN in a tab. Returns true to swallow it.
 pub fn on_key(e: &KeyEvent) -> bool {
-    let Some(k) = keys::from_event(e) else { return false };
+    let Some(k) = keys::from_event(e) else {
+        return false;
+    };
     if std::env::var_os("REMBROWSER_DEBUG_KEYS").is_some() {
         let mode = VIM.with_borrow(|v| v.mode);
-        eprintln!("key {k:?} mode={mode:?} editable={}", e.focus_on_editable_field);
+        eprintln!(
+            "key {k:?} mode={mode:?} editable={}",
+            e.focus_on_editable_field
+        );
     }
     ui::clear_message();
     let editable = e.focus_on_editable_field != 0;
@@ -278,7 +293,12 @@ fn insert_key(k: &str) -> bool {
             true
         }
         _ => {
-            let rhs = VIM.with_borrow(|v| v.maps.get(&'i').and_then(|m| m.get(&vec![k.to_string()])).map(|m| (m.rhs.clone(), m.noremap)));
+            let rhs = VIM.with_borrow(|v| {
+                v.maps
+                    .get(&'i')
+                    .and_then(|m| m.get(&vec![k.to_string()]))
+                    .map(|m| (m.rhs.clone(), m.noremap))
+            });
             match rhs {
                 Some((rhs, noremap)) => {
                     run_keys(&rhs, noremap);
@@ -316,9 +336,19 @@ fn normal_key(k: Key) -> bool {
     }
     let next = VIM.with_borrow_mut(|v| {
         // Counts: 3j, 10G. A leading 0 is a key (scroll left), not a count.
-        if v.pending.is_empty() && k.len() == 1 && k.chars().all(|c| c.is_ascii_digit()) && (k != "0" || v.count.is_some()) {
+        if v.pending.is_empty()
+            && k.len() == 1
+            && k.chars().all(|c| c.is_ascii_digit())
+            && (k != "0" || v.count.is_some())
+        {
             let d = k.parse::<u32>().unwrap_or(0);
-            v.count = Some(v.count.unwrap_or(0).saturating_mul(10).saturating_add(d).min(9999));
+            v.count = Some(
+                v.count
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(d)
+                    .min(9999),
+            );
             return Next::Wait;
         }
         v.pending.push(k);
@@ -414,7 +444,7 @@ pub fn run_keys(rhs: &str, noremap: bool) {
             if done {
                 cmdline_submit(kind, &text);
             } else {
-                ui::cmdline_open(kind, &text);
+                popup::open(kind, &text);
             }
             continue;
         }
@@ -439,7 +469,9 @@ fn act(a: Act, count: u32) {
     let step = opt_num("scroll-step", 60);
     let scroll = |kind: &str, dx: i32, dy: i32| {
         let smooth = commands::opt_bool("smooth-scrolling", true);
-        tabs::js(&format!("__rem.smooth={smooth};__rem.scroll('{kind}',{dx},{dy})"));
+        tabs::js(&format!(
+            "__rem.smooth={smooth};__rem.scroll('{kind}',{dx},{dy})"
+        ));
     };
     match a {
         Act::Scroll(dx, dy) => scroll("by", dx * step * n, dy * step * n),
@@ -456,9 +488,9 @@ fn act(a: Act, count: u32) {
         Act::Left => scroll("left", 0, 0),
         Act::Right => scroll("right", 0, 0),
         Act::Hint(h, links) => start_hints(h, links),
-        Act::Prompt(p) => ui::cmdline_open(CmdKind::Ex, p),
-        Act::PromptUrl(p) => ui::cmdline_open(CmdKind::Ex, &format!("{p}{}", tabs::active_url())),
-        Act::Search(forward) => ui::cmdline_open(CmdKind::Search { forward }, ""),
+        Act::Prompt(p) => popup::open(CmdKind::Ex, p),
+        Act::PromptUrl(p) => popup::open(CmdKind::Ex, &format!("{p}{}", tabs::active_url())),
+        Act::Search(forward) => popup::open(CmdKind::Search { forward }, ""),
         Act::SearchNext(reverse) => {
             if let Some((text, forward)) = VIM.with_borrow(|v| v.last_search.clone()) {
                 tabs::find(&text, forward != reverse, true);
@@ -466,7 +498,10 @@ fn act(a: Act, count: u32) {
         }
         Act::YankUrl => yank(&tabs::active_url()),
         Act::Paste(new_tab) => {
-            let clip = commands::command("wl-paste").arg("-n").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            let clip = commands::command("wl-paste")
+                .arg("-n")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
             match clip {
                 Ok(s) if !s.is_empty() => commands::open(&s, new_tab),
                 _ => ui::message("clipboard is empty", true),
@@ -517,7 +552,11 @@ fn yank(text: &str) {
 /// `https://a.com/b/c/?q` → `https://a.com/b/`.
 fn url_up(url: &str) -> String {
     let root = url_root(url);
-    let base = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/');
+    let base = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
     match base.rfind('/') {
         Some(i) if base.len() >= root.len() && i + 1 >= root.len() => format!("{}/", &base[..i]),
         _ => root,
@@ -610,7 +649,11 @@ pub fn on_page_msg(fields: &[&str]) {
         ["focus", on] => {
             let mode = VIM.with_borrow(|v| v.mode);
             if matches!(mode, Mode::Normal | Mode::Insert) {
-                set_mode(if *on == "1" { Mode::Insert } else { Mode::Normal });
+                set_mode(if *on == "1" {
+                    Mode::Insert
+                } else {
+                    Mode::Normal
+                });
             }
         }
         ["hint-none"] if VIM.with_borrow(|v| v.mode) == Mode::Hint => {
@@ -646,8 +689,8 @@ fn hint_picked(href: &str, text: &str, x: f64, y: f64) {
                 run_keys(&cmd, true);
             }
         }
-        HintAct::PromptOpen => ui::cmdline_open(CmdKind::Ex, &format!("open {href}")),
-        HintAct::PromptTab => ui::cmdline_open(CmdKind::Ex, &format!("tabopen {href}")),
+        HintAct::PromptOpen => popup::open(CmdKind::Ex, &format!("open {href}")),
+        HintAct::PromptTab => popup::open(CmdKind::Ex, &format!("tabopen {href}")),
     }
 }
 
@@ -668,10 +711,19 @@ mod tests {
         map("n", "d", ":q<CR>", true);
         map("n", "<Space>ma", ":bma<CR>", true);
         VIM.with_borrow(|v| {
-            assert!(matches!(lookup(v, &keys::parse("d"), true), (Some(Lookup::User(..)), false)));
-            assert!(matches!(lookup(v, &keys::parse("<Space>m"), true), (None, true)));
+            assert!(matches!(
+                lookup(v, &keys::parse("d"), true),
+                (Some(Lookup::User(..)), false)
+            ));
+            assert!(matches!(
+                lookup(v, &keys::parse("<Space>m"), true),
+                (None, true)
+            ));
             // <Space> alone is a builtin (page down) but also a prefix: must wait.
-            assert!(matches!(lookup(v, &keys::parse("<Space>"), true), (Some(Lookup::Builtin(_)), true)));
+            assert!(matches!(
+                lookup(v, &keys::parse("<Space>"), true),
+                (Some(Lookup::Builtin(_)), true)
+            ));
             assert!(matches!(lookup(v, &keys::parse("g"), true), (None, true)));
         });
     }
