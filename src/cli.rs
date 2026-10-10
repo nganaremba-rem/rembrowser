@@ -65,7 +65,7 @@ fn install_kind() -> Install {
         .and_then(|p| p.canonicalize())
         .unwrap_or_default();
     if exe == Path::new("/usr/bin/rembrowser")
-        && ok(Command::new("pacman").args(["-Qqo", "/usr/bin/rembrowser"]))
+        && ok(Command::new("pacman").args(["-Qqo", "/usr/bin/rembrowser"]).stdout(std::process::Stdio::null()))
     {
         return Install::Pacman;
     }
