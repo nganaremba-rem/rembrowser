@@ -86,6 +86,16 @@ fn source_dir() -> Option<PathBuf> {
     dir.join("Cargo.toml").exists().then_some(dir)
 }
 
+const INSTALLER: &str =
+    "https://raw.githubusercontent.com/nganaremba-rem/rembrowser/main/install.sh";
+
+/// Portable bundle: the installer fetches and installs the latest release.
+fn reinstall_latest_release() -> bool {
+    ok(Command::new("sh").arg("-c").arg(format!(
+        "curl -fsSL {INSTALLER} | REMBROWSER_PORTABLE=1 bash"
+    )))
+}
+
 fn ok(c: &mut Command) -> bool {
     c.status().is_ok_and(|s| s.success())
 }
@@ -138,8 +148,10 @@ fn update() -> i32 {
 
     step(2, "rembrowser");
     match source_dir() {
+        // Portable installs (no checkout): fetch the latest release.
+        _ if matches!(kind, Install::Portable(_)) => failed |= !reinstall_latest_release(),
         None => println!(
-            "  no source checkout found (set REMBROWSER_SRC) — download a newer release instead"
+            "  no source checkout found (set REMBROWSER_SRC) — run the installer again:\n  curl -fsSL {INSTALLER} | bash"
         ),
         Some(src) => {
             if src.join(".git").exists()
@@ -159,14 +171,7 @@ fn update() -> i32 {
                 Install::Pacman => ok(Command::new("makepkg")
                     .args(["-sif", "--noconfirm"])
                     .current_dir(src.join("packaging/arch"))),
-                Install::Portable(_) => {
-                    ok(Command::new(src.join("packaging/portable/build.sh")).current_dir(&src)) && {
-                        let ver = env!("CARGO_PKG_VERSION");
-                        ok(&mut Command::new(src.join(format!(
-                            "dist/rembrowser-{ver}-x86_64-linux/install.sh"
-                        ))))
-                    }
-                }
+                Install::Portable(_) => unreachable!(),
                 Install::Dev => ok(Command::new("cargo")
                     .args(["build", "--release"])
                     .current_dir(&src)),

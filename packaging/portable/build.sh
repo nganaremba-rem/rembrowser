@@ -7,7 +7,7 @@
 # Tradeoff vs the Arch package (system cef): Spotify's CEF has no H.264/AAC, so sites
 # that only serve H.264 won't play. VP9/AV1/Opus and Widevine DRM work.
 #
-#   packaging/portable/build.sh      → dist/rembrowser-<ver>-x86_64-linux.tar.zst
+#   packaging/portable/build.sh      → dist/rembrowser-<ver>-x86_64-linux.tar.xz
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
@@ -32,8 +32,11 @@ cp -a "$cef"/{libcef.so,libEGL.so,libGLESv2.so,libvk_swiftshader.so,libvulkan.so
 cp -a "$cef"/{icudtl.dat,v8_context_snapshot.bin,chrome_100_percent.pak,chrome_200_percent.pak,resources.pak,locales} "$out/lib/"
 strip --strip-unneeded "$out/lib/libcef.so"
 cp packaging/rembrowser.svg "$out/"
+# Chromium's third-party licenses travel with its binaries.
+for f in CREDITS.html LICENSE.txt; do if [ -f "$cef/$f" ]; then cp "$cef/$f" "$out/"; fi; done
 install -m755 packaging/portable/install.sh "$out/install.sh"
 
 mkdir -p dist
-tar -C dist -I 'zstd -19 -T0' -cf "dist/$name.tar.zst" "$name"
-du -sh "$out" "dist/$name.tar.zst"
+# xz: every distro can unpack it (zstd isn't installed everywhere).
+XZ_OPT='-9 -T0' tar -C dist -cJf "dist/$name.tar.xz" "$name"
+du -sh "$out" "dist/$name.tar.xz"

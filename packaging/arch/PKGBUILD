@@ -5,7 +5,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc='Vim-native, privacy-first Chromium (CEF) browser: DRM, adblock, noice-style popup'
 arch=('x86_64')
-url='https://github.com/rem/rembrowser'
+url='https://github.com/nganaremba-rem/rembrowser'
 license=('LicenseRef-custom')
 # cef pulls the whole Chromium runtime (nss, mesa, pulse, openh264, ...). The crate is
 # pinned to CEF 152's API, so stay on that major.
