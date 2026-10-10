@@ -512,6 +512,14 @@ fn reveal(until: &'static std::thread::LocalKey<Cell<Option<Instant>>>, ms: u64)
     run_on_ui(ms as i64 + 30, update);
 }
 
+/// A key went into the page's text field: an unpinned status line that is still
+/// showing gets out of the way now instead of covering what is being typed.
+pub fn typing() {
+    if STATUS_UNTIL.take().is_some() {
+        update();
+    }
+}
+
 /// Something tab-related happened (switch, open, close): flash the tab bar.
 pub fn reveal_tabs() {
     reveal(&TABS_UNTIL, SHOW_MS);

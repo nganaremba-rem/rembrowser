@@ -369,6 +369,7 @@ pub fn on_key(e: &KeyEvent) -> bool {
                 set_mode(Mode::Normal);
                 return true;
             }
+            ui::typing();
             false
         }
         Mode::Hint => {
@@ -379,7 +380,11 @@ pub fn on_key(e: &KeyEvent) -> bool {
             if mode != Mode::Insert {
                 set_mode(Mode::Insert);
             }
-            insert_key(&k)
+            let handled = insert_key(&k);
+            if !handled {
+                ui::typing();
+            }
+            handled
         }
         _ => {
             if mode == Mode::Insert {
