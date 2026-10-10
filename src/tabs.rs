@@ -116,7 +116,7 @@ pub fn set_app_focus(view: Option<BrowserView>) {
     });
     if changed {
         APP_FOCUS.with_borrow_mut(|a| *a = view);
-        vim::reset();
+        vim::new_page();
         ui::focus_changed();
     }
 }
@@ -125,7 +125,7 @@ pub fn set_app_focus(view: Option<BrowserView>) {
 fn set_cur(id: u32) {
     set_app_focus(None);
     if CUR.replace(id) != id {
-        vim::reset();
+        vim::new_page();
         ui::focus_changed();
     }
 }
@@ -265,7 +265,9 @@ pub fn select_in(win: u32, i: usize) {
         w.set_title(Some(&title_of(&bv).as_str().into()));
     }
     ui::set_url_for(Owner::Win(win), &url_of(&bv));
-    if win == cur() {
+    if win == cur() && switched {
+        vim::new_page();
+    } else if win == cur() {
         vim::reset();
     }
     refresh_right(win);
@@ -1045,6 +1047,11 @@ wrap_load_handler! {
         fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
             let url = CefString::from(&f.url()).to_string();
+            // A new page: a field it focuses by itself means insert mode again.
+            let mut browser = browser;
+            if browser.as_deref_mut().is_some_and(is_current) {
+                vim::new_page();
+            }
             // This site's remembered zoom.
             let host = host_of(&url);
             if let (Some((_, z)), Some(h)) = (zoom_levels().into_iter().find(|(h, _)| *h == host), browser.and_then(|b| b.host())) {

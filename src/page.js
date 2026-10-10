@@ -17,6 +17,8 @@ window.__rem ??= (() => {
   const report = () => send('focus', editable(deepActive()) ? 1 : 0);
   addEventListener('focusin', report, true);
   addEventListener('focusout', () => setTimeout(report), true);
+  // A real click: ends the "stay in normal mode" that Esc started (see vim.rs).
+  addEventListener('pointerdown', (e) => { if (e.isTrusted) send('user'); }, true);
 
   // ── scrolling: the element the user is looking at, not always <html> ──
   const canScroll = (el, axis) => {
@@ -165,9 +167,10 @@ window.__rem ??= (() => {
     }
   };
 
+  // The field that has the focus already (a chat's message box), else the first one.
   R.focusInput = () => {
-    const el = all(EDITABLE).find((e) => editable(e) && visibleRect(e));
-    el?.focus();
+    if (!editable(deepActive())) all(EDITABLE).find((e) => editable(e) && visibleRect(e))?.focus();
+    report();
   };
   R.blur = () => deepActive()?.blur();
 

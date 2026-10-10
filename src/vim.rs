@@ -237,6 +237,11 @@ struct Vim {
     last_hint: String,
     last_cmd: String,
     last_search: Option<(String, bool)>,
+    /// Esc left a text field. Chat apps put the focus straight back into their
+    /// message box; without this the next key would be typed there again. Normal
+    /// mode holds until the user picks a field (i, gi, a click or hint, Tab) or the
+    /// page changes.
+    escaped: bool,
 }
 
 thread_local! {
@@ -251,6 +256,7 @@ thread_local! {
         last_hint: String::new(),
         last_cmd: String::new(),
         last_search: None,
+        escaped: false,
     });
 }
 
@@ -317,6 +323,13 @@ fn show_mode() {
     ui::set_mode(name, color);
 }
 
+/// Another page has the keys now (tab, window, navigation): a field focused there
+/// means insert mode again.
+pub fn new_page() {
+    VIM.with_borrow_mut(|v| v.escaped = false);
+    reset();
+}
+
 /// Active tab changed or page reported focus: leave Insert/Hint, keep Pass.
 pub fn reset() {
     VIM.with_borrow_mut(|v| {
@@ -342,13 +355,14 @@ pub fn on_key(e: &KeyEvent) -> bool {
         );
     }
     ui::clear_message();
-    let mode = VIM.with_borrow_mut(|v| {
+    let (mode, escaped) = VIM.with_borrow_mut(|v| {
         v.generation += 1;
-        v.mode
+        (v.mode, v.escaped)
     });
     // CEF's flag misses autofocused fields (no focus change after load); page.js's
-    // focus report (mode Insert) catches those.
-    let editable = e.focus_on_editable_field != 0 || mode == Mode::Insert;
+    // focus report (mode Insert) catches those. After Esc the flag doesn't count:
+    // the page may have taken the focus back.
+    let editable = mode == Mode::Insert || (e.focus_on_editable_field != 0 && !escaped);
     match mode {
         Mode::Pass => {
             if k == "<Esc>" {
@@ -401,6 +415,7 @@ fn insert_key(k: &str) -> bool {
     match k {
         "<Esc>" | "<C-[>" => {
             tabs::js("__rem.blur()");
+            VIM.with_borrow_mut(|v| v.escaped = true);
             set_mode(Mode::Normal);
             true
         }
@@ -483,9 +498,11 @@ fn normal_key(k: Key) -> bool {
             }
             (None, false) => {
                 // Unmapped single keys go to the page (site shortcuts keep working).
+                // That includes Tab into a field: typing there is wanted again.
                 let single = v.pending.len() == 1 && v.count.is_none();
                 v.pending.clear();
                 v.count = None;
+                v.escaped &= !single;
                 if single { Next::Pass } else { Next::Swallow }
             }
         }
@@ -659,7 +676,10 @@ fn act(a: Act, count: u32) {
         Act::UrlUp => tabs::load(&url_up(&tabs::active_url())),
         Act::UrlRoot => tabs::load(&url_root(&tabs::active_url())),
         Act::Home(new_tab) => commands::open("", new_tab),
-        Act::FocusInput => tabs::js("__rem.focusInput()"),
+        Act::FocusInput => {
+            VIM.with_borrow_mut(|v| v.escaped = false);
+            tabs::js("__rem.focusInput()")
+        }
         Act::Pass => set_mode(Mode::Pass),
         Act::Zoom(d) => zoom(d * n as f64),
         Act::ZoomReset => zoom(0.0),
@@ -826,6 +846,10 @@ fn hint_key(k: &str) {
 /// Messages from page.js in the active tab.
 pub fn on_page_msg(fields: &[&str]) {
     match fields {
+        // A real click (mouse or hint) into the page: a field it lands in is wanted.
+        ["user"] => VIM.with_borrow_mut(|v| v.escaped = false),
+        // Focus the page took back by itself after Esc doesn't count.
+        ["focus", "1"] if VIM.with_borrow(|v| v.escaped) => {}
         ["focus", on] => {
             let mode = VIM.with_borrow(|v| v.mode);
             if matches!(mode, Mode::Normal | Mode::Insert) {
