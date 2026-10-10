@@ -69,7 +69,7 @@
   <div id="prompt" class="hidden"><div id="pmsg"></div><div id="pbtns"></div></div>
   <div id="menu" class="hidden">
     <div id="list"></div>
-    <div id="foot"><span><kbd>Tab</kbd> select</span><span><kbd>↵</kbd> run</span><span><kbd>Esc</kbd> close</span></div>
+    <div id="foot"><span><kbd>Tab</kbd> select</span><span><kbd>↵</kbd> run</span><span><kbd>C-f</kbd> nvim</span><span><kbd>Esc</kbd> close</span></div>
   </div>
 </div>
 <script>
@@ -259,7 +259,7 @@ input.addEventListener('keydown', (e) => {
     }
     case 'C-a': case 'C-b': case 'Home': input.setSelectionRange(0, 0); break;
     case 'C-e': case 'End': input.setSelectionRange(input.value.length, input.value.length); break;
-    case 'C-f': send('edit', S.kind, input.value); hide(); break;
+    case 'C-f': case 'C-t': send('edit', S.kind, input.value); hide(); break;
     default: return;
   }
   e.preventDefault();

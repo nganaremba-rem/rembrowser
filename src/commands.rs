@@ -185,10 +185,7 @@ fn set(args: &str) {
     match key.as_str() {
         "status-bar" => ui::set_bar_visible(opt_bool("status-bar", true)),
         "fullscreen" => tabs::set_fullscreen(opt_bool("fullscreen", false)),
-        "tab-bar" => {
-            ui::set_tabbar_visible(opt_bool("tab-bar", true));
-            tabs::refresh_tabbar();
-        }
+        "tab-bar" => ui::set_tabbar_visible(opt_bool("tab-bar", true)),
         _ => {}
     }
 }
@@ -446,8 +443,22 @@ fn bookmark_add(tags: &str) {
 }
 
 fn queue_push() {
-    let url = tabs::active_url();
-    append_line("queue", &url);
+    queue_add(&tabs::active_url(), false);
+}
+
+/// Read-later queue (vimb's file): `;p` appends, `;P` puts it first.
+pub fn queue_add(url: &str, front: bool) {
+    if url.is_empty() {
+        return;
+    }
+    if front {
+        let path = data_dir().join("queue");
+        let rest = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::create_dir_all(data_dir());
+        let _ = std::fs::write(&path, format!("{url}\n{rest}"));
+    } else {
+        append_line("queue", url);
+    }
     ui::message(&format!("queued {url}"), false);
 }
 

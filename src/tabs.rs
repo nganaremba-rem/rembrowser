@@ -9,6 +9,7 @@ use cef::*;
 use std::cell::{Cell, RefCell};
 
 pub const APP_ID: &str = "rembrowser";
+const DEVTOOLS_APP_ID: &str = "rembrowser-devtools";
 /// Catppuccin Mocha base: no white flash while a tab loads.
 pub const BG: u32 = 0xFF1E_1E2E;
 const PAGE_JS: &str = include_str!("page.js");
@@ -25,14 +26,20 @@ thread_local! {
     /// Status bar right side: find count + load progress.
     static FIND: RefCell<String> = const { RefCell::new(String::new()) };
     static PROGRESS: Cell<u8> = const { Cell::new(100) };
+    /// Open DevTools windows: the main window waits for them before closing.
+    static DEVTOOLS: RefCell<Vec<Window>> = const { RefCell::new(Vec::new()) };
+    /// The main window was asked to close (quit_all / WM close).
+    /// ponytail: never reset; if a beforeunload cancels the quit, closing DevTools
+    /// later re-asks the tabs. Reset on cancel if that ever matters.
+    static CLOSING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// cef-rs bug (152.3): when an out-struct is written back to C, an *owned* CefString
 /// (e.g. `"x".into()`) becomes zeroed, so CEF sees "". A *borrowed* one survives,
 /// so point it at a static UTF-16 buffer (CEF copies it).
-fn app_id_str() -> CefString {
-    static BUF: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
-    let buf = BUF.get_or_init(|| APP_ID.encode_utf16().collect());
+/// ponytail: leaks the UTF-16 copy; called once per window (main + each DevTools).
+fn static_str(s: &str) -> CefString {
+    let buf: &'static [u16] = Vec::leak(s.encode_utf16().collect());
     sys::_cef_string_utf16_t {
         str_: buf.as_ptr().cast_mut(),
         length: buf.len(),
@@ -205,6 +212,52 @@ pub fn titles() -> Vec<(String, String)> {
 }
 
 /// Run JS in the active tab's main frame, page.js helpers included.
+/// Browser id of the active tab (stable while the tab lives; Send, unlike Browser).
+pub fn active_id() -> Option<i32> {
+    active().and_then(|bv| bv.browser()).map(|b| b.identifier())
+}
+
+/// Like js(), in the tab with this browser id (if it still exists).
+pub fn js_in(id: i32, code: &str) {
+    let b = TABS.with_borrow(|t| {
+        t.iter()
+            .filter_map(|bv| bv.browser())
+            .find(|b| b.identifier() == id)
+    });
+    if let Some(f) = b.and_then(|b| b.main_frame()) {
+        f.execute_java_script(
+            Some(&format!("{PAGE_JS};{code}").as_str().into()),
+            Some(&"rembrowser://page.js".into()),
+            0,
+        );
+    }
+}
+
+/// `;s`: save a link through the download handler (~/Downloads).
+pub fn download(url: &str) {
+    with_active(|b| {
+        if let Some(h) = b.host() {
+            h.start_download(Some(&url.into()));
+        }
+    });
+}
+
+/// `gF`: DevTools for the active tab, in its own window.
+pub fn devtools() {
+    with_active(|b| {
+        if let Some(h) = b.host() {
+            // Ignored for a BrowserView-hosted browser: CEF creates a popup view
+            // (see on_popup_browser_view_created).
+            h.show_dev_tools(
+                Some(&WindowInfo::default()),
+                None,
+                Some(&BrowserSettings::default()),
+                None,
+            );
+        }
+    });
+}
+
 pub fn js(code: &str) {
     with_active(|b| {
         if let Some(f) = b.main_frame() {
@@ -298,11 +351,7 @@ fn build_bar() {
     if ui::is_built() {
         return;
     }
-    let (tabbar, status) = ui::build();
-    w.add_child_view_at(Some(&mut View::from(&tabbar)), 0);
-    w.add_child_view(Some(&mut View::from(&status)));
-    ui::set_bar_visible(commands::opt_bool("status-bar", true));
-    ui::set_tabbar_visible(commands::opt_bool("tab-bar", true));
+    ui::build();
     ui::recolor();
     popup::init(&w);
     select(ACTIVE.get());
@@ -385,20 +434,26 @@ wrap_window_delegate! {
 
         fn on_window_created(&self, window: Option<&mut Window>) {
             let Some(window) = window else { return };
-            // [ tabs (flex) ] over [ status bar ].
+            // [ tab bar ] over [ tabs (flex) ] over [ status bar ]. The bars start as
+            // empty fixed-height slots so the page doesn't shift when they fill in.
             let layout = window.set_to_box_layout(Some(&BoxLayoutSettings {
                 cross_axis_alignment: AxisAlignment::STRETCH,
                 ..Default::default()
             }));
+            let (tabbar, status) = ui::frame();
             let content = panel_create(None).expect("panel");
             content.set_to_fill_layout();
+            window.add_child_view(Some(&mut View::from(&tabbar)));
             window.add_child_view(Some(&mut View::from(&content)));
+            window.add_child_view(Some(&mut View::from(&status)));
             if let Some(l) = layout {
                 l.set_flex_for_view(Some(&mut View::from(&content)), 1);
             }
             View::from(&*window).set_background_color(BG);
             WINDOW.with_borrow_mut(|w| *w = Some(window.clone()));
             CONTENT.with_borrow_mut(|c| *c = Some(content));
+            ui::set_bar_visible(commands::opt_bool("status-bar", true));
+            ui::set_tabbar_visible(commands::opt_bool("tab-bar", true));
             open(&self.url, false);
             window.show();
             // Fallback for slow first pages; normally the first load_end builds it.
@@ -411,6 +466,14 @@ wrap_window_delegate! {
         }
 
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
+            // DevTools windows first: one still open keeps CEF from shutting down.
+            // Each one's on_window_destroyed retries this close.
+            CLOSING.set(true);
+            let devtools = DEVTOOLS.with_borrow(|d| d.clone());
+            if !devtools.is_empty() {
+                devtools.iter().for_each(|w| w.close());
+                return 0;
+            }
             // Ask every tab (runs beforeunload). Each closed tab hits on_tab_closed;
             // the last one closes the window again, which then passes.
             // The popup overlay too: a browser left open at shutdown trips a CHECK.
@@ -425,9 +488,9 @@ wrap_window_delegate! {
             properties: Option<&mut LinuxWindowProperties>,
         ) -> i32 {
             let Some(p) = properties else { return 0 };
-            p.wayland_app_id = app_id_str();
-            p.wm_class_class = app_id_str();
-            p.wm_class_name = app_id_str();
+            p.wayland_app_id = static_str(APP_ID);
+            p.wm_class_class = static_str(APP_ID);
+            p.wm_class_name = static_str(APP_ID);
             1
         }
     }
@@ -445,12 +508,31 @@ wrap_browser_view_delegate! {
             RuntimeStyle::ALLOY
         }
 
+        // Popups that become tabs must be Alloy like the others. DevTools is the
+        // exception: CEF only supports Chrome style there (default delegate).
+        fn delegate_for_popup_browser_view(
+            &self,
+            _browser_view: Option<&mut BrowserView>,
+            _settings: Option<&BrowserSettings>,
+            _client: Option<&mut Client>,
+            is_devtools: i32,
+        ) -> Option<BrowserViewDelegate> {
+            (is_devtools == 0).then(RemBrowserViewDelegate::new)
+        }
+
         fn on_popup_browser_view_created(
             &self,
             _browser_view: Option<&mut BrowserView>,
             popup_browser_view: Option<&mut BrowserView>,
-            _is_devtools: i32,
+            is_devtools: i32,
         ) -> i32 {
+            // DevTools (gF): its own window, tiled next to the page by niri.
+            if is_devtools != 0 {
+                let Some(bv) = popup_browser_view else { return 0 };
+                let mut d = DevToolsWindowDelegate::new(bv.clone());
+                window_create_top_level(Some(&mut d));
+                return 1;
+            }
             // Popups (target=_blank, window.open) become tabs. Keeps window.opener,
             // so OAuth "Sign in with X" popups still work.
             let Some(bv) = popup_browser_view else { return 0 };
@@ -703,6 +785,53 @@ wrap_request_handler! {
             _disable_default_handling: Option<&mut i32>,
         ) -> Option<ResourceRequestHandler> {
             Some(adblock::hook::RemResourceRequestHandler::new())
+        }
+    }
+}
+
+// DevTools window: just the view, plus an app_id niri rules can match.
+wrap_window_delegate! {
+    struct DevToolsWindowDelegate {
+        view: BrowserView,
+    }
+
+    impl ViewDelegate {}
+
+    impl PanelDelegate {}
+
+    impl WindowDelegate {
+        fn on_window_created(&self, window: Option<&mut Window>) {
+            let Some(w) = window else { return };
+            w.set_to_fill_layout();
+            w.add_child_view(Some(&mut View::from(&self.view)));
+            w.set_title(Some(&"DevTools — rembrowser".into()));
+            w.show();
+            DEVTOOLS.with_borrow_mut(|d| d.push(w.clone()));
+        }
+
+        fn on_window_destroyed(&self, window: Option<&mut Window>) {
+            let Some(w) = window else { return };
+            DEVTOOLS.with_borrow_mut(|d| d.retain(|x| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));
+            if CLOSING.get() {
+                ui::run_on_ui(0, quit_all);
+            }
+        }
+
+        // Closing the window closes DevTools' browser first (like the main window).
+        fn can_close(&self, _window: Option<&mut Window>) -> i32 {
+            self.view.browser().and_then(|b| b.host()).map_or(1, |h| h.try_close_browser())
+        }
+
+        fn linux_window_properties(
+            &self,
+            _window: Option<&mut Window>,
+            properties: Option<&mut LinuxWindowProperties>,
+        ) -> i32 {
+            let Some(p) = properties else { return 0 };
+            p.wayland_app_id = static_str(DEVTOOLS_APP_ID);
+            p.wm_class_class = static_str(DEVTOOLS_APP_ID);
+            p.wm_class_name = static_str(DEVTOOLS_APP_ID);
+            1
         }
     }
 }

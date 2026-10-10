@@ -33,7 +33,6 @@ pub const PEACH: u32 = 0xFFFA_B387;
 const TAB_TITLE: usize = 22;
 
 struct Bar {
-    panel: Panel,
     mode: LabelButton,
     url: LabelButton,
     right: LabelButton,
@@ -44,7 +43,14 @@ struct Bar {
 
 thread_local! {
     static BAR: RefCell<Option<Bar>> = const { RefCell::new(None) };
+    /// (tab bar, status bar) slots, created with the window; filled by build().
+    static FRAME: RefCell<Option<(Panel, Panel)>> = const { RefCell::new(None) };
 }
+
+/// Minimum bar heights: the empty slots made at window creation are already as tall
+/// as the filled bars (labels are 27-28px), so filling them shifts nothing.
+const TABBAR_H: i32 = 30;
+const STATUS_H: i32 = 28;
 
 fn with<R>(f: impl FnOnce(&mut Bar) -> R) -> Option<R> {
     BAR.with_borrow_mut(|b| b.as_mut().map(f))
@@ -73,33 +79,12 @@ pub fn is_built() -> bool {
     BAR.with_borrow(|b| b.is_some())
 }
 
-/// Builds both bars; returns (tab bar, status bar) for the window layout.
-pub fn build() -> (Panel, Panel) {
-    let panel = panel_create(None).expect("panel");
-    let layout = panel.set_to_box_layout(Some(&BoxLayoutSettings {
-        horizontal: 1,
-        between_child_spacing: 12,
-        inside_border_insets: Insets {
-            top: 0,
-            left: 0,
-            bottom: 0,
-            right: 8,
-        },
-        cross_axis_alignment: AxisAlignment::STRETCH,
-        ..Default::default()
-    }));
-    let mode = label(" NORMAL ", TABBAR_BG, FONT_BOLD, None);
-    let url = label("", TEXT, FONT, None);
-    url.set_horizontal_alignment(HorizontalAlignment::LEFT);
-    let right = label("", SUBTEXT, FONT, None);
-    for v in [View::from(&mode), View::from(&url), View::from(&right)] {
-        panel.add_child_view(Some(&mut v.clone()));
-    }
-    if let Some(l) = layout {
-        l.set_flex_for_view(Some(&mut View::from(&url)), 1);
-    }
-
-    let tabbar = panel_create(None).expect("panel");
+/// Empty (tab bar, status bar) slots for the window layout. Cheap: no labels, no
+/// fonts. The labels cost ~100 ms of UI thread, so build() fills them in after
+/// the first page has loaded.
+pub fn frame() -> (Panel, Panel) {
+    let mut d = Painted::new(TABBAR_BG);
+    let tabbar = panel_create(Some(&mut d)).expect("panel");
     tabbar.set_to_box_layout(Some(&BoxLayoutSettings {
         horizontal: 1,
         between_child_spacing: 2,
@@ -109,13 +94,45 @@ pub fn build() -> (Panel, Panel) {
             bottom: 0,
             right: 6,
         },
+        minimum_cross_axis_size: TABBAR_H - 3,
         cross_axis_alignment: AxisAlignment::STRETCH,
         ..Default::default()
     }));
+    let status = panel_create(None).expect("panel");
+    status.set_to_box_layout(Some(&BoxLayoutSettings {
+        horizontal: 1,
+        between_child_spacing: 12,
+        inside_border_insets: Insets {
+            top: 0,
+            left: 0,
+            bottom: 0,
+            right: 8,
+        },
+        minimum_cross_axis_size: STATUS_H,
+        cross_axis_alignment: AxisAlignment::STRETCH,
+        ..Default::default()
+    }));
+    FRAME.with_borrow_mut(|f| *f = Some((tabbar.clone(), status.clone())));
+    (tabbar, status)
+}
+
+pub fn build() {
+    let Some((tabbar, panel)) = FRAME.with_borrow(|f| f.clone()) else {
+        return;
+    };
+    let mode = label(" NORMAL ", TABBAR_BG, FONT_BOLD, None);
+    let url = label("", TEXT, FONT, None);
+    url.set_horizontal_alignment(HorizontalAlignment::LEFT);
+    let right = label("", SUBTEXT, FONT, None);
+    for v in [View::from(&mode), View::from(&url), View::from(&right)] {
+        panel.add_child_view(Some(&mut v.clone()));
+    }
+    if let Some(l) = panel.get_layout().and_then(|l| l.as_box_layout()) {
+        l.set_flex_for_view(Some(&mut View::from(&url)), 1);
+    }
 
     BAR.with_borrow_mut(|b| {
         *b = Some(Bar {
-            panel: panel.clone(),
             mode,
             url,
             right,
@@ -124,7 +141,6 @@ pub fn build() -> (Panel, Panel) {
             mode_color: BLUE,
         })
     });
-    (tabbar, panel)
 }
 
 /// Window theme colours: every panel and label button defaults to these.
@@ -141,10 +157,7 @@ pub fn theme(w: &Window) {
 
 /// Per-view colours; only stick once the view is in the window (see theme()).
 pub fn recolor() {
-    with(|b| {
-        View::from(&b.tabbar).set_background_color(TABBAR_BG);
-        View::from(&b.mode).set_background_color(b.mode_color);
-    });
+    with(|b| View::from(&b.mode).set_background_color(b.mode_color));
     tabs::refresh_tabbar();
 }
 
@@ -190,11 +203,12 @@ pub fn set_right(text: &str) {
 }
 
 pub fn set_bar_visible(on: bool) {
-    with(|b| View::from(&b.panel).set_visible(on as i32));
+    FRAME.with_borrow(|f| f.as_ref().map(|f| View::from(&f.1).set_visible(on as i32)));
 }
 
 pub fn set_tabbar_visible(on: bool) {
-    with(|b| View::from(&b.tabbar).set_visible(on as i32));
+    FRAME.with_borrow(|f| f.as_ref().map(|f| View::from(&f.0).set_visible(on as i32)));
+    tabs::refresh_tabbar();
 }
 
 fn short(title: &str) -> String {
@@ -235,12 +249,18 @@ pub fn set_tabs(titles: &[String], active: usize) {
     View::from(&bar).invalidate_layout();
 }
 
+// A panel with its own background: CEF re-applies theme colours (on add, show, OS
+// theme switch) and then calls on_theme_changed — the documented place to override.
 wrap_panel_delegate! {
-    struct Strip {}
+    struct Painted {
+        bg: u32,
+    }
 
     impl ViewDelegate {
-        fn preferred_size(&self, _view: Option<&mut View>) -> Size {
-            Size { width: 0, height: 2 }
+        fn on_theme_changed(&self, view: Option<&mut View>) {
+            if let Some(v) = view {
+                v.set_background_color(self.bg);
+            }
         }
     }
 

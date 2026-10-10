@@ -65,7 +65,9 @@ window.__rem ??= (() => {
   const CLICKABLE = 'a[href],area[href],button,input:not([type=hidden]),select,textarea,summary,label[for],' +
     '[role=button],[role=link],[role=tab],[role=checkbox],[role=radio],[role=menuitem],[role=option],[role=switch],' +
     '[role=treeitem],[onclick],[contenteditable=""],[contenteditable=true],[tabindex]:not([tabindex="-1"]),video,audio';
-  const LINKS = 'a[href],area[href]';
+  const EDITABLE = 'input:not([type=hidden]),textarea,[contenteditable=""],[contenteditable=true]';
+  // vimb hint modes: what each kind of hint may target.
+  const FILTERS = { all: CLICKABLE, links: 'a[href],area[href]', images: 'img', editable: EDITABLE };
   const all = (sel, root = document, out = []) => {
     for (const el of root.querySelectorAll(sel)) out.push(el);
     for (const el of root.querySelectorAll('*')) if (el.shadowRoot) all(sel, el.shadowRoot, out);
@@ -99,11 +101,11 @@ window.__rem ??= (() => {
   };
   let H = null;
   R.hintsClear = () => { H?.host.remove(); H = null; };
-  R.hints = (keys, linksOnly) => {
+  R.hints = (keys, filter) => {
     R.hintsClear();
     const seen = new Set(), items = [];
-    for (const el of all(linksOnly ? LINKS : CLICKABLE)) {
-      if (seen.has(el)) continue;
+    for (const el of all(FILTERS[filter] ?? CLICKABLE)) {
+      if (seen.has(el) || (filter === 'editable' && !editable(el))) continue;
       seen.add(el);
       const v = visibleRect(el);
       if (v) items.push({ el, ...v });
@@ -148,6 +150,7 @@ window.__rem ??= (() => {
     if (left.length === 1 && left[0].label === H.typed) {
       const { el, x, y } = left[0];
       R.hintsClear();
+      R.picked = el;  // for follow-ups: ;k removes it, ;e edits it
       const href = el.closest?.('a[href],area[href]')?.href || el.src || el.currentSrc || '';
       const text = (el.innerText || el.value || el.alt || el.title || '').trim().slice(0, 300);
       send('hint-pick', href, text, x, y, editable(el) ? 1 : 0);
@@ -155,11 +158,30 @@ window.__rem ??= (() => {
   };
 
   R.focusInput = () => {
-    const el = all('input:not([type=hidden]),textarea,[contenteditable=""],[contenteditable=true]')
-      .find((e) => editable(e) && visibleRect(e));
+    const el = all(EDITABLE).find((e) => editable(e) && visibleRect(e));
     el?.focus();
   };
   R.blur = () => deepActive()?.blur();
+
+  // ── external editor: insert-mode Ctrl-T / ;e ──────────────────
+  // The field is remembered: focus moves to the editor window meanwhile.
+  R.editGet = (el = deepActive()) => {
+    if (!editable(el) || el.tagName === 'SELECT') { send('edit-none'); return; }
+    R.editing = el;
+    send('edit-text', encodeURIComponent(el.isContentEditable ? el.innerText : el.value));
+  };
+  // insertText = a real edit: React/Vue/Lexical see input events, undo works.
+  R.editSet = (t) => {
+    const el = R.editing;
+    if (!el?.isConnected) return;
+    el.focus();
+    if (el.isContentEditable) getSelection().selectAllChildren(el); else el.select();
+    if (document.execCommand('insertText', false, t)) return;
+    if (el.isContentEditable) { el.innerText = t; return; }
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value').set.call(el, t);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
 
   // ── cosmetic adblock: CSS from adblock-rust (Rust side), adopted so CSP can't block it.
   // Generic `##.ad` rules only match names that exist, so we report class/id names

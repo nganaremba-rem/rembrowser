@@ -5,6 +5,7 @@
 //! (`focus_on_editable_field`), so typing in any field just works.
 
 use crate::commands::{self, opt, opt_num};
+use crate::editor;
 use crate::keys::{self, Key};
 use crate::popup::{self, CmdKind};
 use crate::tabs;
@@ -30,6 +31,16 @@ enum HintAct {
     XCommand,
     PromptOpen,
     PromptTab,
+    /// ;i / ;I (new tab)
+    OpenImage(bool),
+    /// ;s
+    Save,
+    /// ;k
+    Remove,
+    /// ;p (queue end) / ;P (front)
+    Queue(bool),
+    /// ;e
+    Edit,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +51,8 @@ enum Act {
     Bottom,
     Left,
     Right,
-    Hint(HintAct, bool),
+    /// Action + what may be hinted (page.js FILTERS: all, links, images, editable).
+    Hint(HintAct, &'static str),
     Prompt(&'static str),
     PromptUrl(&'static str),
     Search(bool),
@@ -68,6 +80,8 @@ enum Act {
     ZoomReset,
     QuitAll,
     Escape,
+    ViewSource,
+    Inspector,
 }
 
 /// vimb's default normal-mode keys (`man vimb`), plus Ctrl-T/W/Tab for muscle memory.
@@ -86,15 +100,24 @@ const BUILTINS: &[(&str, Act)] = &[
     ("0", Act::Left),
     ("^", Act::Left),
     ("$", Act::Right),
-    ("f", Act::Hint(HintAct::Click, false)),
-    ("F", Act::Hint(HintAct::BgTab, true)),
-    (";o", Act::Hint(HintAct::Click, false)),
-    (";t", Act::Hint(HintAct::BgTab, true)),
-    (";y", Act::Hint(HintAct::Yank, true)),
-    (";Y", Act::Hint(HintAct::YankText, false)),
-    (";x", Act::Hint(HintAct::XCommand, true)),
-    (";O", Act::Hint(HintAct::PromptOpen, true)),
-    (";T", Act::Hint(HintAct::PromptTab, true)),
+    ("f", Act::Hint(HintAct::Click, "all")),
+    ("F", Act::Hint(HintAct::BgTab, "links")),
+    (";o", Act::Hint(HintAct::Click, "all")),
+    (";t", Act::Hint(HintAct::BgTab, "links")),
+    (";y", Act::Hint(HintAct::Yank, "links")),
+    (";Y", Act::Hint(HintAct::YankText, "all")),
+    (";x", Act::Hint(HintAct::XCommand, "links")),
+    (";O", Act::Hint(HintAct::PromptOpen, "links")),
+    (";T", Act::Hint(HintAct::PromptTab, "links")),
+    (";i", Act::Hint(HintAct::OpenImage(false), "images")),
+    (";I", Act::Hint(HintAct::OpenImage(true), "images")),
+    (";s", Act::Hint(HintAct::Save, "links")),
+    (";k", Act::Hint(HintAct::Remove, "all")),
+    (";p", Act::Hint(HintAct::Queue(false), "links")),
+    (";P", Act::Hint(HintAct::Queue(true), "links")),
+    (";e", Act::Hint(HintAct::Edit, "editable")),
+    ("gf", Act::ViewSource),
+    ("gF", Act::Inspector),
     ("o", Act::Prompt("open ")),
     ("O", Act::PromptUrl("open ")),
     ("t", Act::Prompt("tabopen ")),
@@ -271,7 +294,8 @@ pub fn on_key(e: &KeyEvent) -> bool {
 
 /// Browser keys that mean nothing in a text field, so they work in insert mode too.
 /// (<C-w> stays the field's delete-word, like vim/readline.)
-const GLOBAL_KEYS: &[&str] = &["<C-Tab>", "<C-S-Tab>", "<C-t>", "<C-q>"];
+/// (<C-t> is vimb's input-mode "edit in editor", handled below.)
+const GLOBAL_KEYS: &[&str] = &["<C-Tab>", "<C-S-Tab>", "<C-q>"];
 
 fn insert_key(k: &str) -> bool {
     if GLOBAL_KEYS.contains(&k) {
@@ -290,6 +314,11 @@ fn insert_key(k: &str) -> bool {
         }
         "<C-z>" => {
             set_mode(Mode::Pass);
+            true
+        }
+        // vimb: edit the field in editor-command (nvim popup).
+        "<C-t>" => {
+            tabs::js("__rem.editGet()");
             true
         }
         _ => {
@@ -487,7 +516,9 @@ fn act(a: Act, count: u32) {
         Act::Bottom => scroll("bottom", 0, 0),
         Act::Left => scroll("left", 0, 0),
         Act::Right => scroll("right", 0, 0),
-        Act::Hint(h, links) => start_hints(h, links),
+        Act::Hint(h, filter) => start_hints(h, filter),
+        Act::ViewSource => tabs::open(&format!("view-source:{}", tabs::active_url()), false),
+        Act::Inspector => ui::run_on_ui(0, tabs::devtools),
         Act::Prompt(p) => popup::open(CmdKind::Ex, p),
         Act::PromptUrl(p) => popup::open(CmdKind::Ex, &format!("{p}{}", tabs::active_url())),
         Act::Search(forward) => popup::open(CmdKind::Search { forward }, ""),
@@ -620,13 +651,13 @@ pub fn search_preview(text: &str, forward: bool) {
 
 // ── hints ────────────────────────────────────────────────────────
 
-fn start_hints(h: HintAct, links_only: bool) {
+fn start_hints(h: HintAct, filter: &str) {
     VIM.with_borrow_mut(|v| v.hint_act = h);
     set_mode(Mode::Hint);
     let keys = opt("hint-keys").unwrap_or_else(|| "asdfghjkl".into());
     // JSON-quote the keys: they come from the config file.
     let keys: String = keys.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    tabs::js(&format!("__rem.hints('{keys}',{links_only})"));
+    tabs::js(&format!("__rem.hints('{keys}','{filter}')"));
 }
 
 fn hint_key(k: &str) {
@@ -656,6 +687,8 @@ pub fn on_page_msg(fields: &[&str]) {
                 });
             }
         }
+        ["edit-none"] => ui::message("no text field focused", true),
+        ["edit-text", text] => edit_field(editor::percent_decode(text)),
         ["hint-none"] if VIM.with_borrow(|v| v.mode) == Mode::Hint => {
             set_mode(Mode::Normal);
             ui::message("no hints", true);
@@ -691,7 +724,26 @@ fn hint_picked(href: &str, text: &str, x: f64, y: f64) {
         }
         HintAct::PromptOpen => popup::open(CmdKind::Ex, &format!("open {href}")),
         HintAct::PromptTab => popup::open(CmdKind::Ex, &format!("tabopen {href}")),
+        HintAct::OpenImage(new_tab) if new_tab => tabs::open(href, false),
+        HintAct::OpenImage(_) => tabs::load(href),
+        HintAct::Save => tabs::download(href),
+        HintAct::Remove => tabs::js("__rem.picked?.remove()"),
+        HintAct::Queue(front) => commands::queue_add(href, front),
+        HintAct::Edit => tabs::js("__rem.editGet(__rem.picked)"),
     }
+}
+
+/// Field text → editor-command → back into the same field of the same tab.
+fn edit_field(text: String) {
+    let Some(id) = tabs::active_id() else { return };
+    let had_newline = text.ends_with('\n');
+    editor::edit(&text, &editor::field_command(), move |mut new| {
+        // Editors end the file with a newline; don't add one to a one-line field.
+        if !had_newline && new.ends_with('\n') {
+            new.pop();
+        }
+        tabs::js_in(id, &format!("__rem.editSet({})", popup::js_str(&new)));
+    });
 }
 
 #[cfg(test)]

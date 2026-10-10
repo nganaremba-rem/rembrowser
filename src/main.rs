@@ -6,6 +6,7 @@
 mod adblock;
 mod commands;
 mod downloads;
+mod editor;
 mod keys;
 mod permissions;
 mod popup;

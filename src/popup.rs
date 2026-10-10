@@ -5,7 +5,7 @@
 //! Rust → page: `rem.open(state)`, `rem.count(text)`. Page → Rust: console messages
 //! "\x01pop\t<type>\t…" on this view's own client, so web pages can't fake them.
 
-use crate::{commands, permissions, tabs, ui, vim};
+use crate::{commands, editor, permissions, tabs, ui, vim};
 use cef::*;
 use std::cell::RefCell;
 
@@ -358,29 +358,13 @@ fn parse_kind(kind: &str, forward: &str) -> CmdKind {
     }
 }
 
-/// Ctrl-F: vim's command-line window. Edit the line in the nvim-vimb popup
+/// Ctrl-F / Ctrl-T: vim's command-line window. Edit the line in the nvim-vimb popup
 /// (niri rule ^vimb-cmdedit$ floats it); write = run it, :q = cancel.
 fn edit_in_nvim(kind: CmdKind, text: &str) {
-    let path = std::env::temp_dir().join(format!("rembrowser-cmd-{}.vimbcmd", std::process::id()));
-    if std::fs::write(&path, format!("{text}\n")).is_err() {
-        return;
-    }
-    let before = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let mut c = commands::command("foot");
-    c.args(["--app-id", "vimb-cmdedit", "nvim"]).arg(&path);
-    c.env("NVIM_APPNAME", "nvim-vimb")
-        .env("VIMB_POPUP", "cmdline");
-    std::thread::spawn(move || {
-        let _ = c.status();
-        let changed = std::fs::metadata(&path).and_then(|m| m.modified()).ok() != before;
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
-        if changed {
-            ui::run_on_ui(0, move || {
-                for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                    vim::cmdline_submit(kind, line);
-                }
-            });
+    let cmd = "foot --app-id vimb-cmdedit env NVIM_APPNAME=nvim-vimb VIMB_POPUP=cmdline nvim %s";
+    editor::edit(&format!("{text}\n"), cmd, move |text| {
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            vim::cmdline_submit(kind, line);
         }
     });
 }
