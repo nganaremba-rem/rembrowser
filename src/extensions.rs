@@ -68,14 +68,13 @@ fn installed() -> Vec<(String, String)> {
 /// The tabs here have no window of their own, so an extension sees `sender.tab.windowId`
 /// -1, which every `chrome.windows` call rejects ("No window with id: -1"): Bitwarden's
 /// "Unlock account" under a login field dies on it. Read -1 as "the current window".
-const SHIM: &str = "/*rembrowser*/if (chrome.windows) for (const m of ['get', 'update', 'remove']) { \
-    const orig = chrome.windows[m].bind(chrome.windows); \
-    chrome.windows[m] = (id, ...rest) => orig(id === -1 ? chrome.windows.WINDOW_ID_CURRENT : id, ...rest); }\n";
+const SHIM: &str = include_str!("ext-shim.js");
+const SHIM_END: &str = "/*end rembrowser*/\n";
 
 /// Put the shim at the top of the extension's service worker. (A wrapper that
-/// `importScripts` the original fails to start bundles like Bitwarden's.) Idempotent;
-/// `:ext-install` unpacks a clean copy, patched again at the next start. True if it
-/// changed the file.
+/// `importScripts` the original fails to start bundles like Bitwarden's.) Idempotent,
+/// and swaps an older shim for this one; `:ext-install` unpacks a clean copy, patched
+/// again at the next start. True if it changed the file.
 fn patch(folder: &Path) -> bool {
     let Some(sw) = json(folder.join("manifest.json"))
         .and_then(|m| m["background"]["service_worker"].as_str().map(String::from))
@@ -84,10 +83,16 @@ fn patch(folder: &Path) -> bool {
     };
     let path = folder.join(sw);
     let Ok(code) = std::fs::read_to_string(&path) else { return false };
-    if code.starts_with("/*rembrowser*/") {
+    if code.starts_with(SHIM) {
         return false;
     }
-    std::fs::write(&path, format!("{SHIM}{code}")).is_ok()
+    let original = match (code.starts_with("/*rembrowser"), code.find(SHIM_END)) {
+        (false, _) => &code[..],
+        (true, Some(i)) if i < 8192 => &code[i + SHIM_END.len()..],
+        // The first shim was one line.
+        (true, _) => code.split_once('\n').map_or("", |(_, rest)| rest),
+    };
+    std::fs::write(&path, format!("{SHIM}{original}")).is_ok()
 }
 
 /// (name, folder, id) of the extensions installed through the Web Store page
