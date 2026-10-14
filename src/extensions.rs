@@ -4,9 +4,9 @@
 //! fetches the extension's package from Google's download service itself — the file
 //! Chrome would get — and unpacks it to ~/.local/share/rembrowser/extensions/<id>.
 //! Every folder there is handed to Chromium with --load-extension at startup, so
-//! installs and removals apply after a restart. `:extensions` (chrome://extensions)
-//! shows them with their options and on/off switches; `:ext-popup` opens the page
-//! behind an extension's toolbar button in its own window.
+//! installs and removals apply after a restart.
+//! `:extensions` lists them; the one picked opens the page behind its toolbar button in
+//! a small window. `:ext-manage` is chrome://extensions (options, on/off switches).
 //!
 //! ponytail: loaded unpacked, an extension without a "key" in its manifest gets its
 //! id from its folder path, not from the store (`runtime_id`). Write the package's
@@ -65,8 +65,39 @@ fn installed() -> Vec<(String, String)> {
     out
 }
 
+/// The tabs here have no window of their own, so an extension sees `sender.tab.windowId`
+/// -1, which every `chrome.windows` call rejects ("No window with id: -1"): Bitwarden's
+/// "Unlock account" under a login field dies on it. Read -1 as "the current window".
+const SHIM: &str = "/*rembrowser*/if (chrome.windows) for (const m of ['get', 'update', 'remove']) { \
+    const orig = chrome.windows[m].bind(chrome.windows); \
+    chrome.windows[m] = (id, ...rest) => orig(id === -1 ? chrome.windows.WINDOW_ID_CURRENT : id, ...rest); }\n";
+
+/// Put the shim at the top of the extension's service worker. (A wrapper that
+/// `importScripts` the original fails to start bundles like Bitwarden's.) Idempotent;
+/// `:ext-install` unpacks a clean copy, patched again at the next start. True if it
+/// changed the file.
+fn patch(folder: &Path) -> bool {
+    let Some(sw) = json(folder.join("manifest.json"))
+        .and_then(|m| m["background"]["service_worker"].as_str().map(String::from))
+    else {
+        return false;
+    };
+    let path = folder.join(sw);
+    let Ok(code) = std::fs::read_to_string(&path) else { return false };
+    if code.starts_with("/*rembrowser*/") {
+        return false;
+    }
+    std::fs::write(&path, format!("{SHIM}{code}")).is_ok()
+}
+
 /// Value for --load-extension: the installed folders (None = nothing installed).
 pub fn load_switch() -> Option<String> {
+    // Chromium runs the worker script it stored last time, however the file changed:
+    // after patching, forget the stored workers (sites re-register theirs on the next visit).
+    let patched = installed().iter().filter(|(id, _)| patch(&dir().join(id))).count();
+    if patched > 0 {
+        let _ = std::fs::remove_dir_all(PathBuf::from(crate::data_dir()).join("Default/Service Worker"));
+    }
     let dirs: Vec<String> = installed()
         .iter()
         .map(|(id, _)| dir().join(id).display().to_string())
@@ -186,10 +217,10 @@ fn popup_page(manifest: &serde_json::Value) -> Option<&str> {
     .find_map(|v| v.as_str().filter(|p| !p.is_empty()))
 }
 
-/// `:ext-popup`: pick an extension; its popup opens in a Chromium window.
-pub fn popup_picker() {
+/// `:extensions`: pick an extension; its popup opens as if its toolbar button was clicked.
+pub fn picker() {
     if !commands::opt_bool("extensions", false) {
-        ui::message("ext-popup: set extensions: true and restart", true);
+        ui::message("extensions: set extensions: true in config.yaml and restart", true);
         return;
     }
     let list = installed();
@@ -203,9 +234,9 @@ pub fn popup_picker() {
         match popup_page(&manifest) {
             Some(page) => {
                 let page = page.trim_start_matches('/');
-                tabs::chrome_window(&format!("chrome-extension://{}/{page}", runtime_id(id)), false);
+                tabs::extension_popup(&format!("chrome-extension://{}/{page}", runtime_id(id)));
             }
-            None => ui::message(&format!("{name} has no popup or options page"), true),
+            None => ui::message(&format!("{name} has no popup or options page (:ext-manage)"), true),
         }
     });
 }

@@ -70,6 +70,16 @@ struct Chrome {
     tab_ctl: Option<OverlayController>,
     book_ctl: Option<OverlayController>,
     status_ctl: Option<OverlayController>,
+    /// Thin bar along the top edge while a page loads (see `load_state`).
+    loadbar: Panel,
+    load_ctl: Option<OverlayController>,
+    /// Drawn fraction, CEF's reported progress, ticks since that last changed.
+    load_frac: f32,
+    load_real: f32,
+    load_still: u32,
+    loading: bool,
+    /// Bumped on every start/finish so stale timers stop themselves.
+    load_gen: u32,
 }
 
 thread_local! {
@@ -86,6 +96,7 @@ thread_local! {
 }
 
 const TABBAR_H: i32 = 30;
+const LOADBAR_H: i32 = 3;
 const BOOKBAR_H: i32 = 26;
 const STATUS_H: i32 = 28;
 /// Bookmarks shown in the bar.
@@ -251,6 +262,33 @@ pub fn focus_changed() {
 /// (top slot, status bar slot) for a new window's layout: spacers as tall as the
 /// pinned bars. Cheap — the labels (~100 ms of UI thread) come in build(), after the
 /// first page has loaded.
+/// The loading bar: equal-width segments in a row, coloured along a gradient. An overlay
+/// narrower than the window squeezes them all (flex 1), so the gradient always spans
+/// exactly the filled part.
+fn gradient_bar() -> Panel {
+    const SEGMENTS: u32 = 48;
+    // blue -> mauve -> pink -> peach
+    const STOPS: [u32; 4] = [BLUE, MAUVE, 0xFFF5_C2E7, PEACH];
+    let bar = bar_panel(BLUE, 0, Insets::default(), LOADBAR_H);
+    let layout = bar.get_layout().and_then(|l| l.as_box_layout());
+    for i in 0..SEGMENTS {
+        let t = i as f32 / (SEGMENTS - 1) as f32 * (STOPS.len() - 1) as f32;
+        let (a, b) = (STOPS[t as usize], STOPS[(t as usize + 1).min(STOPS.len() - 1)]);
+        let mix = |shift: u32| {
+            let (x, y) = (((a >> shift) & 0xFF) as f32, ((b >> shift) & 0xFF) as f32);
+            (x + (y - x) * t.fract()) as u32
+        };
+        let color = 0xFF00_0000 | mix(16) << 16 | mix(8) << 8 | mix(0);
+        let seg = panel_create(Some(&mut Painted::new(color))).expect("panel");
+        let mut v = View::from(&seg);
+        bar.add_child_view(Some(&mut v));
+        if let Some(l) = &layout {
+            l.set_flex_for_view(Some(&mut v), 1);
+        }
+    }
+    bar
+}
+
 pub fn frame(win: u32, window: &Window) -> (Panel, Panel) {
     let slot = |top| panel_create(Some(&mut Slot::new(top))).expect("panel");
     let (top_slot, status_slot) = (slot(true), slot(false));
@@ -287,6 +325,7 @@ pub fn frame(win: u32, window: &Window) -> (Panel, Panel) {
         },
         STATUS_H,
     );
+    let loadbar = gradient_bar();
     CHROME.with_borrow_mut(|c| {
         c.push(Chrome {
             win,
@@ -299,6 +338,13 @@ pub fn frame(win: u32, window: &Window) -> (Panel, Panel) {
             tab_ctl: None,
             book_ctl: None,
             status_ctl: None,
+            loadbar,
+            load_ctl: None,
+            load_frac: 0.0,
+            load_real: 0.0,
+            load_still: 0,
+            loading: false,
+            load_gen: 0,
         })
     });
     (top_slot, status_slot)
@@ -315,6 +361,11 @@ pub fn attach(win: u32) {
         c.book_ctl = over(&c.bookbar);
         c.tab_ctl = over(&c.tabbar);
         c.status_ctl = over(&c.status);
+        // Above everything, hidden until a page loads.
+        c.load_ctl = over(&c.loadbar);
+        if let Some(l) = &c.load_ctl {
+            l.set_visible(0);
+        }
     });
     place();
     update();
@@ -373,6 +424,14 @@ pub fn place() {
             bar(&c.tab_ctl, 0, TABBAR_H);
             bar(&c.book_ctl, tabs_h, BOOKBAR_H);
             bar(&c.status_ctl, size.height - STATUS_H, STATUS_H);
+            if let Some(l) = &c.load_ctl {
+                l.set_bounds(Some(&Rect {
+                    x: 0,
+                    y: 0,
+                    width: (size.width as f32 * c.load_frac) as i32,
+                    height: LOADBAR_H,
+                }));
+            }
         }
     });
 }
@@ -518,6 +577,74 @@ pub fn typing() {
     if STATUS_UNTIL.take().is_some() {
         update();
     }
+}
+
+/// A page started or stopped loading in the visible tab of `win`: a gradient bar along
+/// the top that fills left to right. It follows CEF's reported progress (eased, never
+/// backwards); before the first report, and while a report stalls, it creeps a little
+/// so a slow server still shows motion. Finishing fills it and hides it.
+pub fn load_state(win: u32, loading: bool) {
+    let epoch = with_chrome(win, |c| {
+        // Switching to a tab that is already loaded: nothing to flash.
+        if !loading && !c.loading {
+            return None;
+        }
+        c.load_gen += 1;
+        c.loading = loading;
+        c.load_real = 0.0;
+        c.load_still = 0;
+        c.load_frac = if loading { 0.02 } else { 1.0 };
+        if let Some(l) = &c.load_ctl {
+            l.set_visible(1);
+        }
+        Some(c.load_gen)
+    });
+    let Some(Some(epoch)) = epoch else { return };
+    place();
+    if loading {
+        run_on_ui(33, move || load_tick(win, epoch));
+    } else {
+        run_on_ui(300, move || {
+            let hide = with_chrome(win, |c| {
+                (c.load_gen == epoch).then(|| c.load_ctl.clone()).flatten()
+            });
+            if let Some(Some(l)) = hide {
+                l.set_visible(0);
+            }
+        });
+    }
+}
+
+fn load_tick(win: u32, epoch: u32) {
+    let alive = with_chrome(win, |c| {
+        if c.load_gen != epoch || !c.loading {
+            return false;
+        }
+        c.load_still += 1;
+        // Creep allowance grows toward 8% (or 12% before any report) the longer
+        // the progress sits still: ~30 ticks per second.
+        let slack = if c.load_real > 0.0 { 0.08 } else { 0.12 };
+        let creep = slack * (1.0 - 0.99f32.powi(c.load_still as i32));
+        let goal = (c.load_real + creep).min(0.97);
+        if goal > c.load_frac {
+            c.load_frac += (goal - c.load_frac) * 0.2;
+        }
+        true
+    });
+    if alive == Some(true) {
+        place();
+        run_on_ui(33, move || load_tick(win, epoch));
+    }
+}
+
+/// CEF's own progress (0.0..=1.0) for the visible tab.
+pub fn load_progress(win: u32, p: f32) {
+    with_chrome(win, |c| {
+        if c.loading && p > c.load_real {
+            c.load_real = p;
+            c.load_still = 0;
+        }
+    });
 }
 
 /// Something tab-related happened (switch, open, close): flash the tab bar.
