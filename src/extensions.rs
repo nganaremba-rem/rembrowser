@@ -90,6 +90,28 @@ fn patch(folder: &Path) -> bool {
     std::fs::write(&path, format!("{SHIM}{code}")).is_ok()
 }
 
+/// (name, folder, runtime id) of everything the browser runs: our unpacked folders and
+/// those installed through the Web Store page (Default/Extensions/<id>/<version>).
+fn runnable() -> Vec<(String, PathBuf, String)> {
+    let mut out: Vec<_> = installed()
+        .into_iter()
+        .map(|(id, name)| (name, dir().join(&id), runtime_id(&id)))
+        .collect();
+    let store = PathBuf::from(crate::data_dir()).join("Default/Extensions");
+    for e in std::fs::read_dir(store).into_iter().flatten().flatten() {
+        let id = e.file_name().to_string_lossy().into_owned();
+        // Newest version folder.
+        let newest = std::fs::read_dir(e.path()).into_iter().flatten().flatten().map(|v| v.path()).max();
+        if let Some(folder) = newest.filter(|f| f.join("manifest.json").exists()) {
+            if id_in(&id) == Some(id.as_str()) && !out.iter().any(|o| o.2 == id) {
+                out.push((name_of(&folder).unwrap_or_else(|| id.clone()), folder, id));
+            }
+        }
+    }
+    out.sort_by_key(|o| o.0.to_lowercase());
+    out
+}
+
 /// Value for --load-extension: the installed folders (None = nothing installed).
 pub fn load_switch() -> Option<String> {
     // Chromium runs the worker script it stored last time, however the file changed:
@@ -223,18 +245,18 @@ pub fn picker() {
         ui::message("extensions: set extensions: true in config.yaml and restart", true);
         return;
     }
-    let list = installed();
+    let list = runnable();
     let rows: Vec<_> = list
         .iter()
-        .map(|(id, name)| ("setting", name.clone(), id.clone()))
+        .map(|(name, _, rid)| ("setting", name.clone(), rid.clone()))
         .collect();
     popup::pick("\u{f0483} Extension popup", &rows, move |i| {
-        let (id, name) = &list[i];
-        let manifest = json(dir().join(id).join("manifest.json")).unwrap_or_default();
+        let (name, folder, rid) = &list[i];
+        let manifest = json(folder.join("manifest.json")).unwrap_or_default();
         match popup_page(&manifest) {
             Some(page) => {
                 let page = page.trim_start_matches('/');
-                tabs::extension_popup(&format!("chrome-extension://{}/{page}", runtime_id(id)));
+                tabs::extension_popup(&format!("chrome-extension://{rid}/{page}"));
             }
             None => ui::message(&format!("{name} has no popup or options page (:ext-manage)"), true),
         }
