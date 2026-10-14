@@ -90,39 +90,53 @@ fn patch(folder: &Path) -> bool {
     std::fs::write(&path, format!("{SHIM}{code}")).is_ok()
 }
 
-/// (name, folder, runtime id) of everything the browser runs: our unpacked folders and
-/// those installed through the Web Store page (Default/Extensions/<id>/<version>).
-fn runnable() -> Vec<(String, PathBuf, String)> {
-    let mut out: Vec<_> = installed()
-        .into_iter()
-        .map(|(id, name)| (name, dir().join(&id), runtime_id(&id)))
-        .collect();
-    let store = PathBuf::from(crate::data_dir()).join("Default/Extensions");
-    for e in std::fs::read_dir(store).into_iter().flatten().flatten() {
+/// (name, folder, id) of the extensions installed through the Web Store page
+/// (Default/Extensions/<id>/<version>, newest version).
+fn store_installed() -> Vec<(String, PathBuf, String)> {
+    let root = PathBuf::from(crate::data_dir()).join("Default/Extensions");
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
         let id = e.file_name().to_string_lossy().into_owned();
-        // Newest version folder.
         let newest = std::fs::read_dir(e.path()).into_iter().flatten().flatten().map(|v| v.path()).max();
         if let Some(folder) = newest.filter(|f| f.join("manifest.json").exists()) {
-            if id_in(&id) == Some(id.as_str()) && !out.iter().any(|o| o.2 == id) {
+            if id_in(&id) == Some(id.as_str()) {
                 out.push((name_of(&folder).unwrap_or_else(|| id.clone()), folder, id));
             }
         }
     }
+    out
+}
+
+/// (name, folder, runtime id) of everything the browser runs. An unpacked copy of an
+/// extension that is also installed from the Web Store is not run: two of the same
+/// extension would both draw their menus on a page.
+fn runnable() -> Vec<(String, PathBuf, String)> {
+    let mut out = store_installed();
+    let unpacked: Vec<_> = installed()
+        .into_iter()
+        .filter(|(_, name)| !out.iter().any(|o| &o.0 == name))
+        .map(|(id, name)| (name, dir().join(&id), id))
+        .collect();
+    out.extend(unpacked);
     out.sort_by_key(|o| o.0.to_lowercase());
     out
 }
 
-/// Value for --load-extension: the installed folders (None = nothing installed).
+/// Value for --load-extension: the unpacked folders that are not duplicates (None =
+/// nothing to load). Patches every extension's worker first.
 pub fn load_switch() -> Option<String> {
+    let all = runnable();
     // Chromium runs the worker script it stored last time, however the file changed:
     // after patching, forget the stored workers (sites re-register theirs on the next visit).
-    let patched = installed().iter().filter(|(id, _)| patch(&dir().join(id))).count();
+    let patched = all.iter().filter(|(_, folder, _)| patch(folder)).count();
     if patched > 0 {
         let _ = std::fs::remove_dir_all(PathBuf::from(crate::data_dir()).join("Default/Service Worker"));
     }
-    let dirs: Vec<String> = installed()
+    let store = store_installed();
+    let dirs: Vec<String> = all
         .iter()
-        .map(|(id, _)| dir().join(id).display().to_string())
+        .filter(|(_, _, id)| !store.iter().any(|s| &s.2 == id))
+        .map(|(_, folder, _)| folder.display().to_string())
         .collect();
     (!dirs.is_empty()).then(|| dirs.join(","))
 }
@@ -248,10 +262,11 @@ pub fn picker() {
     let list = runnable();
     let rows: Vec<_> = list
         .iter()
-        .map(|(name, _, rid)| ("setting", name.clone(), rid.clone()))
+        .map(|(name, _, id)| ("setting", name.clone(), id.clone()))
         .collect();
     popup::pick("\u{f0483} Extension popup", &rows, move |i| {
-        let (name, folder, rid) = &list[i];
+        let (name, folder, id) = &list[i];
+        let rid = if folder.starts_with(dir()) { runtime_id(id) } else { id.clone() };
         let manifest = json(folder.join("manifest.json")).unwrap_or_default();
         match popup_page(&manifest) {
             Some(page) => {
