@@ -610,9 +610,7 @@ pub fn set_zoom(level: f64) {
 }
 
 fn zoom_file() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let data = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
-    std::path::PathBuf::from(data).join("rembrowser/zoom")
+    std::path::PathBuf::from(crate::data_dir()).join("zoom")
 }
 
 fn zoom_levels() -> Vec<(String, f64)> {
@@ -1116,11 +1114,16 @@ wrap_load_handler! {
         fn on_loading_state_change(&self, browser: Option<&mut Browser>, is_loading: i32, _can_go_back: i32, _can_go_forward: i32) {
             if let Some(win) = browser.and_then(shown_in) {
                 ui::load_state(win, is_loading != 0);
+                popup::refocus(Owner::Win(win));
             }
         }
 
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
+            let mut browser = browser;
+            if let Some(win) = browser.as_deref_mut().and_then(shown_in) {
+                popup::refocus(Owner::Win(win));
+            }
             // A web app's command popup, ready before its first `:` (like the browser's).
             if let Some(id) = browser.as_ref().filter(|b| apps::is_app(b)).map(|b| b.identifier()) {
                 if let Some(w) = apps::window_of(id) {

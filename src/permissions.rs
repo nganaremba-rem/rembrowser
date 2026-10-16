@@ -66,11 +66,7 @@ fn describe(media: bool, bits: u32) -> String {
 }
 
 fn store_path() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME").map_or_else(
-        |_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"),
-        PathBuf::from,
-    );
-    base.join("rembrowser/permissions")
+    PathBuf::from(crate::data_dir()).join("permissions")
 }
 
 /// Stored decision for origin+permission: Some(true) always, Some(false) never.

@@ -45,7 +45,8 @@ fn sock() -> PathBuf {
     // XDG_RUNTIME_DIR is per-user and 0700.
     let dir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/tmp/rembrowser-{}", unsafe { libc::getuid() }));
-    PathBuf::from(dir).join("rembrowser.sock")
+    // A private window is its own instance: it must not hand its URLs to the normal one.
+    PathBuf::from(dir).join(if crate::is_private() { "rembrowser-private.sock" } else { "rembrowser.sock" })
 }
 
 /// What became of a request handed to the running rembrowser.

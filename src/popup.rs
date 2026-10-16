@@ -99,6 +99,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("config", "edit config.yaml"),
     ("settings", "Chromium settings (own window)"),
     ("extensions", "pick an extension: opens its popup (own window)"),
+    ("private", "open a private window (nothing saved; extensions included)"),
     ("ext-manage", "manage extensions: options, on/off (own window)"),
     ("ext-install", "install an extension: Web Store URL or id (or this store page)"),
     ("ext-remove", "remove an installed extension"),
@@ -410,6 +411,16 @@ pub fn forget(owner: Owner) {
 /// The popup browser of a window, for that window's can_close.
 pub fn host(owner: Owner) -> Option<BrowserHost> {
     with_owner(owner, |p| p.bv.browser()?.host()).flatten()
+}
+
+/// A page load took the keyboard from a command line that is open (the page's view
+/// grabs focus when its navigation commits): give it back, so the cursor stays.
+pub fn refocus(owner: Owner) {
+    with_owner(owner, |p| {
+        if p.ready && p.ctl.is_visible() != 0 {
+            p.bv.request_focus();
+        }
+    });
 }
 
 pub fn is_open() -> bool {

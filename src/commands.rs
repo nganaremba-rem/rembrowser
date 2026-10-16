@@ -170,6 +170,7 @@ fn exec_one(line: &str) {
         "config" => crate::config::open_in_editor(false),
         // Chromium's own pages, in a window with Chromium's UI layer.
         "settings" => tabs::chrome_window("chrome://settings", false),
+        "private" => private_window(args),
         "extensions" | "ext-popup" => crate::extensions::picker(),
         "ext-manage" => tabs::chrome_window("chrome://extensions", true),
         "ext-install" => crate::extensions::install(args),
@@ -421,6 +422,26 @@ pub fn command(program: &str) -> Command {
         });
     }
     c
+}
+
+/// `:private [URL]`: a private window: its own throwaway profile, so no history, cookies
+/// or logins carry in or out. It is another rembrowser process (`--private`).
+fn private_window(url: &str) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut cmd = command(&exe.to_string_lossy());
+    cmd.arg("--private");
+    if !url.is_empty() {
+        cmd.arg(resolve_url(url));
+    }
+    match cmd.spawn() {
+        // Reap it when that window quits.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => ui::message(&format!("private: {e}"), true),
+    }
 }
 
 /// `;m` / `:mpv [URL]`: play in mpv (which uses yt-dlp for YouTube & co.). No URL, or

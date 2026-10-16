@@ -26,10 +26,33 @@ mod widevine;
 
 use cef::*;
 
-fn data_dir() -> String {
+/// The profile of normal windows.
+fn real_data_dir() -> String {
     let base = std::env::var("XDG_DATA_HOME")
         .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap_or_default()));
     format!("{base}/rembrowser")
+}
+
+/// Where this process keeps its profile and data files: the real one, or in a private
+/// window (`--private`) a throwaway folder in RAM that is deleted on exit.
+fn data_dir() -> String {
+    std::env::var("REMBROWSER_PRIVATE_DIR").unwrap_or_else(|_| real_data_dir())
+}
+
+fn is_private() -> bool {
+    std::env::var_os("REMBROWSER_PRIVATE_DIR").is_some()
+}
+
+/// `--private`: own profile folder (tmpfs, mode 700) and own single-instance socket,
+/// so it runs beside the normal browser and leaves nothing behind.
+fn enter_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let run = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let dir = format!("{run}/rembrowser-private-{}", std::process::id());
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    // SAFETY: single-threaded here, before the browser starts any thread.
+    unsafe { std::env::set_var("REMBROWSER_PRIVATE_DIR", dir) };
 }
 
 fn main() {
@@ -45,7 +68,12 @@ fn main() {
         std::process::exit(code);
     }
 
-    // Browser process only from here on. Already running? Hand it the URL / app.
+    // Browser process only from here on. Private window? Own profile first: the
+    // single-instance socket below depends on it.
+    if std::env::args().any(|a| a == "--private") {
+        enter_private();
+    }
+    // Already running? Hand it the URL / app.
     let req = ipc::from_args(&std::env::args().skip(1).collect::<Vec<_>>());
     match ipc::forward(&req) {
         ipc::Forwarded::Taken => std::process::exit(0),
@@ -96,10 +124,16 @@ fn main() {
     if started != 1 {
         // The reason (no display, profile in use, ...) is in Chromium's log lines above.
         eprintln!("rembrowser: the browser engine failed to start (see the errors above)");
+        if is_private() {
+            let _ = std::fs::remove_dir_all(data_dir());
+        }
         std::process::exit(1);
     }
     run_message_loop();
     shutdown();
+    if is_private() {
+        let _ = std::fs::remove_dir_all(data_dir());
+    }
 }
 
 wrap_app! {
@@ -137,6 +171,9 @@ wrap_browser_process_handler! {
         fn on_context_initialized(&self) {
             privacy::apply_prefs();
             ipc::handle(self.req.clone());
+            if is_private() {
+                ui::run_on_ui(0, || ui::toast("private window: nothing is saved", false));
+            }
         }
     }
 }

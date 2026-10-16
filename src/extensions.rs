@@ -17,8 +17,28 @@ use crate::{commands, popup, tabs, ui, widevine};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+/// The real profile: a private window (`--private`) has a profile of its own, but
+/// runs the same extensions, loaded unpacked from the real folders.
+fn real_data() -> PathBuf {
+    PathBuf::from(crate::real_data_dir())
+}
+
 fn dir() -> PathBuf {
-    PathBuf::from(crate::data_dir()).join("extensions")
+    real_data().join("extensions")
+}
+
+/// Web Store installs can't be loaded unpacked as they are (their `_metadata` signature
+/// folder is refused), so a private window runs a copy without it.
+fn private_copy(folder: &Path, id: &str) -> PathBuf {
+    let dest = PathBuf::from(crate::data_dir()).join("ext-store").join(id);
+    if !dest.exists() {
+        let _ = std::fs::create_dir_all(dest.parent().unwrap_or(&dest));
+        let copied = commands::command("cp").arg("-a").arg(folder).arg(&dest).status();
+        if copied.is_ok_and(|s| s.success()) {
+            let _ = std::fs::remove_dir_all(dest.join("_metadata"));
+        }
+    }
+    dest
 }
 
 /// The extension id (32 letters a–p) in a Web Store URL, or given as is.
@@ -98,7 +118,7 @@ fn patch(folder: &Path) -> bool {
 /// (name, folder, id) of the extensions installed through the Web Store page
 /// (Default/Extensions/<id>/<version>, newest version).
 fn store_installed() -> Vec<(String, PathBuf, String)> {
-    let root = PathBuf::from(crate::data_dir()).join("Default/Extensions");
+    let root = real_data().join("Default/Extensions");
     let mut out = Vec::new();
     for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
         let id = e.file_name().to_string_lossy().into_owned();
@@ -117,6 +137,11 @@ fn store_installed() -> Vec<(String, PathBuf, String)> {
 /// extension would both draw their menus on a page.
 fn runnable() -> Vec<(String, PathBuf, String)> {
     let mut out = store_installed();
+    if crate::is_private() {
+        for o in &mut out {
+            o.1 = private_copy(&o.1, &o.2);
+        }
+    }
     let unpacked: Vec<_> = installed()
         .into_iter()
         .filter(|(_, name)| !out.iter().any(|o| &o.0 == name))
@@ -124,6 +149,24 @@ fn runnable() -> Vec<(String, PathBuf, String)> {
         .collect();
     out.extend(unpacked);
     out.sort_by_key(|o| o.0.to_lowercase());
+    out
+}
+
+/// (name, folder, id) of extensions added with "Load unpacked" in chrome://extensions:
+/// Chromium keeps them in the profile prefs (location 4) and reloads them itself, so
+/// they are listed but never patched or passed to --load-extension.
+fn loaded_unpacked() -> Vec<(String, PathBuf, String)> {
+    let mut out: Vec<(String, PathBuf, String)> = Vec::new();
+    for file in ["Preferences", "Secure Preferences"] {
+        let prefs = json(real_data().join("Default").join(file)).unwrap_or_default();
+        for (id, e) in prefs["extensions"]["settings"].as_object().into_iter().flatten() {
+            let folder = PathBuf::from(e["path"].as_str().unwrap_or_default());
+            let known = out.iter().any(|o| &o.2 == id);
+            if e["location"] == 4 && !known && !folder.starts_with(dir()) && folder.join("manifest.json").exists() {
+                out.push((name_of(&folder).unwrap_or_else(|| id.clone()), folder, id.clone()));
+            }
+        }
+    }
     out
 }
 
@@ -137,12 +180,18 @@ pub fn load_switch() -> Option<String> {
     if patched > 0 {
         let _ = std::fs::remove_dir_all(PathBuf::from(crate::data_dir()).join("Default/Service Worker"));
     }
-    let store = store_installed();
-    let dirs: Vec<String> = all
+    // Chromium loads Web Store installs from the profile itself; a private profile
+    // has none, so there they are loaded like the rest (as copies, see runnable).
+    let private = crate::is_private();
+    let store = if private { Vec::new() } else { store_installed() };
+    let mut dirs: Vec<String> = all
         .iter()
         .filter(|(_, _, id)| !store.iter().any(|s| &s.2 == id))
         .map(|(_, folder, _)| folder.display().to_string())
         .collect();
+    if private {
+        dirs.extend(loaded_unpacked().into_iter().map(|(_, folder, _)| folder.display().to_string()));
+    }
     (!dirs.is_empty()).then(|| dirs.join(","))
 }
 
@@ -228,12 +277,11 @@ pub fn remove_picker() {
 /// The id Chromium runs the unpacked folder under: the store id when the manifest
 /// carries the store's key, else the SHA-256 of the folder's real path, first 16
 /// bytes, each hex digit as a letter a–p.
-fn runtime_id(id: &str) -> String {
-    let folder = dir().join(id);
+fn runtime_id(folder: &Path, id: &str) -> String {
     if json(folder.join("manifest.json")).is_some_and(|m| m["key"].is_string()) {
         return id.into();
     }
-    let real = folder.canonicalize().unwrap_or(folder);
+    let real = folder.canonicalize().unwrap_or(folder.to_path_buf());
     id_for_path(&real.to_string_lossy())
 }
 
@@ -264,19 +312,29 @@ pub fn picker() {
         ui::message("extensions: set extensions: true in config.yaml and restart", true);
         return;
     }
-    let list = runnable();
+    let mut list = runnable();
+    list.extend(loaded_unpacked());
+    list.sort_by_key(|o| o.0.to_lowercase());
     let rows: Vec<_> = list
         .iter()
         .map(|(name, _, id)| ("setting", name.clone(), id.clone()))
         .collect();
     popup::pick("\u{f0483} Extension popup", &rows, move |i| {
         let (name, folder, id) = &list[i];
-        let rid = if folder.starts_with(dir()) { runtime_id(id) } else { id.clone() };
+        let copied = PathBuf::from(crate::data_dir()).join("ext-store");
+        let rid = if folder.starts_with(dir()) || folder.starts_with(copied) { runtime_id(folder, id) } else { id.clone() };
         let manifest = json(folder.join("manifest.json")).unwrap_or_default();
         match popup_page(&manifest) {
             Some(page) => {
                 let page = page.trim_start_matches('/');
-                tabs::extension_popup(&format!("chrome-extension://{rid}/{page}"));
+                // Alloy tabs are invisible to chrome.tabs, so tell the popup which site it
+                // was opened on (the cookie exporter reads it; others ignore the parameter).
+                let host = tabs::active_url()
+                    .split_once("://")
+                    .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or("").to_string())
+                    .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:".contains(&b)));
+                let query = host.map(|h| format!("{}rembrowser_host={h}", if page.contains('?') { '&' } else { '?' }));
+                tabs::extension_popup(&format!("chrome-extension://{rid}/{page}{}", query.unwrap_or_default()));
             }
             None => ui::message(&format!("{name} has no popup or options page (:ext-manage)"), true),
         }

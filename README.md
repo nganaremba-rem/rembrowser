@@ -173,6 +173,7 @@ rembrowser uninstall --purge   # removes everything
 | `:winopen [URL]` | new window |
 | `:mpv [URL]` | play this page (or URL) in mpv |
 | `:settings` `:extensions` `:chrome [URL]` | Chromium settings · extensions · a page in a Chromium window |
+| `:private [URL]` | a private window: own throwaway profile in RAM (no history/cookies/logins carried in or out), extensions included · `rembrowser --private` from a shell |
 | `:ext-install [URL\|id]` `:ext-remove` | install an extension from the Web Store · remove one |
 | `:ext-popup` | open an extension's popup in its own window |
 | `:app` / `:app-install` | turn this page into a web app / add it to your launcher |
