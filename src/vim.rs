@@ -193,7 +193,7 @@ const BUILTINS: &[(&str, Act, &str)] = &[
     ("<C-S-r>", Act::ReloadNoCache, "reload, no cache"),
     ("<C-r>", Act::Reload, "reload"),
     ("<F5>", Act::Reload, "reload"),
-    ("<C-c>", Act::Stop, "stop loading"),
+    ("<C-c>", Act::Stop, "copy selection, else stop loading"),
     ("<C-o>", Act::Back, "back"),
     ("<C-i>", Act::Forward, "forward"),
     ("u", Act::Reopen(false), "reopen closed tab"),
@@ -681,7 +681,11 @@ fn act(a: Act, count: u32) {
         }
         Act::Reload => tabs::with_active(|b| b.reload()),
         Act::ReloadNoCache => tabs::with_active(|b| b.reload_ignore_cache()),
-        Act::Stop => tabs::with_active(|b| b.stop_load()),
+        // Copy page text like any browser (and Mod+C, which sends Ctrl+C); stop only
+        // with nothing selected. A gesture, so the page lets execCommand write.
+        Act::Stop => tabs::js_gesture(
+            r"getSelection().isCollapsed ? console.debug('\x01rem\tstop') : document.execCommand('copy')",
+        ),
         Act::Back => (0..n).for_each(|_| tabs::with_active(|b| b.go_back())),
         Act::Forward => (0..n).for_each(|_| tabs::with_active(|b| b.go_forward())),
         Act::Reopen(new_tab) => tabs::reopen(new_tab),
@@ -909,6 +913,8 @@ pub fn on_page_msg(fields: &[&str]) {
             Some(_) => ui::message("clipboard is empty", true),
             None => {}
         },
+        // From <C-c> with nothing selected (a page stopping its own load is harmless).
+        ["stop"] => tabs::with_active(|b| b.stop_load()),
         ["pip-none"] => ui::message("no video on this page", true),
         ["edit-none"] => ui::message("no text field focused", true),
         // Only the answer to our own request (Ctrl-T, ;e): a page can't open the
