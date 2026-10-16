@@ -66,11 +66,7 @@ fn describe(media: bool, bits: u32) -> String {
 }
 
 fn store_path() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME").map_or_else(
-        |_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"),
-        PathBuf::from,
-    );
-    base.join("rembrowser/permissions")
+    PathBuf::from(crate::data_dir()).join("permissions")
 }
 
 /// Stored decision for origin+permission: Some(true) always, Some(false) never.
@@ -219,7 +215,7 @@ wrap_permission_handler! {
             callback: Option<&mut PermissionPromptCallback>,
         ) -> i32 {
             let Some(cb) = callback else { return 0 };
-            // vimb geolocation=never: refuse location without asking.
+            // geolocation=never: refuse location without asking.
             if requested_permissions == 256 && crate::commands::opt("geolocation").as_deref() == Some("never") {
                 cb.cont(PermissionRequestResult::DENY);
                 return 1;

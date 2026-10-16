@@ -68,7 +68,7 @@ window.__rem ??= (() => {
     '[role=button],[role=link],[role=tab],[role=checkbox],[role=radio],[role=menuitem],[role=option],[role=switch],' +
     '[role=treeitem],[onclick],[contenteditable=""],[contenteditable=true],[tabindex]:not([tabindex="-1"]),video,audio';
   const EDITABLE = 'input:not([type=hidden]),textarea,[contenteditable=""],[contenteditable=true]';
-  // vimb hint modes: what each kind of hint may target.
+  // Hint modes: what each kind of hint may target.
   const FILTERS = { all: CLICKABLE, links: 'a[href],area[href]', images: 'img', editable: EDITABLE,
     media: 'a[href],area[href],video,audio' };
   const all = (sel, root = document, out = []) => {
@@ -88,7 +88,7 @@ window.__rem ??= (() => {
     }
     return null;
   };
-  // Same-length labels (vimb hint-keys-same-length): no label is a prefix of another.
+  // Same-length labels: no label is a prefix of another.
   const labels = (n, keys) => {
     if (n <= 0) return [];
     const k = keys.length;

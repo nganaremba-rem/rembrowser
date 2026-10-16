@@ -77,7 +77,7 @@ rembrowser uninstall --purge   # removes everything
 | `gg` / `G` | top / bottom (`5j` = 5 times) |
 | `Ctrl-o` / `Ctrl-i` | back / forward |
 | `gu` / `gU` | up one URL level / site root |
-| `r` / `R` | reload / reload without cache |
+| `r` / `R`, `Ctrl-Shift-r` | reload / reload without cache |
 
 ### 🔗 Hints (type the letters shown)
 | Key | Action |
@@ -120,7 +120,7 @@ rembrowser uninstall --purge   # removes everything
 ### 🧰 Leader (`Space`) menu
 | Key | Action |
 |---|---|
-| `<Space>s.` | 🕘 history |
+| `<Space>s.` / `<Space>hd` | 🕘 history / delete all of it (asks first) |
 | `<Space>sm` | 🔖 bookmarks (`<Space>ba` adds one) |
 | `<Space>sd` | ⬇️ downloads (kept across restarts) |
 | `<Space>sq` | 📚 read-later list |
@@ -130,6 +130,10 @@ rembrowser uninstall --purge   # removes everything
 | `<Space>ut` / `<Space>ul` | 📌 pin tab bar / status line |
 | `<Space>ub` | 🔖 show / hide the bookmark bar |
 | `<Space>uc` | ⚙️ edit config |
+| `<Space>us` | ⚙️ Chromium settings |
+| `<Space>ee` / `<Space>ep` | 🧩 extensions: manage / open a popup |
+| `<Space>ei` / `<Space>ex` | 🧩 extensions: install from this Web Store page / remove one |
+| `<Space>ec` | 🧩 this page in a Chromium window (toolbar, extension buttons) |
 
 ### 🎛️ Modes & extras
 | Key | Action |
@@ -140,6 +144,7 @@ rembrowser uninstall --purge   # removes everything
 | `Ctrl-t` *(in a field)* | edit the field in nvim |
 | `gp` | picture-in-picture |
 | `gf` / `gF` | page source / DevTools |
+| `Ctrl-Shift-i` / `F12` / `Ctrl-Shift-j` | DevTools / DevTools on the Console |
 | `Ctrl-q` | quit |
 
 ### 💬 Inside the `:` popup
@@ -168,7 +173,9 @@ rembrowser uninstall --purge   # removes everything
 | `:winopen [URL]` | new window |
 | `:mpv [URL]` | play this page (or URL) in mpv |
 | `:settings` `:extensions` `:chrome [URL]` | Chromium settings · extensions · a page in a Chromium window |
+| `:private [URL]` | a private window: own throwaway profile in RAM (no history/cookies/logins carried in or out), extensions included · `rembrowser --private` from a shell |
 | `:ext-install [URL\|id]` `:ext-remove` | install an extension from the Web Store · remove one |
+| `:ext-popup` | open an extension's popup in its own window |
 | `:app` / `:app-install` | turn this page into a web app / add it to your launcher |
 | `:pip` | picture-in-picture |
 | `:set dark-mode!` | toggle any setting |
@@ -204,8 +211,6 @@ keys:
     "<Space>sb": { run: ":tabs<CR>", desc: tabs picker }
 ```
 
-🔄 Coming from **vimb**? Add `source: [~/.config/vimb/config]` — your vimb config just works.
-
 ### 🪶 Light or full
 Everything that adds weight is a switch in `settings:` (read at startup — restart after changing one):
 
@@ -224,9 +229,9 @@ Everything that adds weight is a switch in `settings:` (read at startup — rest
 2. Open the extension's [Chrome Web Store](https://chromewebstore.google.com) page and run `:ext-install` (or `:ext-install <store URL or id>` from anywhere). The store's own button only works in Chrome, so rembrowser downloads and unpacks the extension itself.
 3. Restart. The extension now acts on your normal tabs (tested: Dark Reader, uBlock Origin Lite).
 
-`:extensions` opens Chromium's extension page (options, on/off switches) · `:ext-remove` deletes one · `:ext-install` again updates one.
+`:extensions` opens Chromium's extension page (options, on/off switches) · `:ext-popup` opens an extension's popup (the page behind its toolbar button) in its own window · `:ext-remove` deletes one · `:ext-install` again updates one.
 
-Limits: tabs are not Chrome tabs, so an extension that lists tabs (`chrome.tabs.query`) sees none, and toolbar buttons / extension popups only exist in `:chrome` windows. Extensions do not update on their own.
+Limits: tabs are not Chrome tabs, so an extension that lists tabs (`chrome.tabs.query`) sees none, and toolbar buttons only exist in `:chrome` windows (`:ext-popup` opens the popup without one). Extensions do not update on their own.
 
 ### 📜 Userscripts
 Drop `*.js` files in `~/.config/rembrowser/userscripts/`:

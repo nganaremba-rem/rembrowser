@@ -1,4 +1,4 @@
-//! Ex commands (vimb names) + options. The config file is just ex commands, so it
+//! Ex commands + options. The config file is just ex commands, so it
 //! runs through the same `exec` as the `:` command line.
 
 use crate::{pickers, tabs, ui, vim};
@@ -45,28 +45,18 @@ pub fn expand_tilde(p: &str) -> PathBuf {
     }
 }
 
-/// vimb's data dir, shared so ~/.local/bin/vimb-pick (history, bookmarks, harpoon) keeps working.
+/// ~/.local/share/rembrowser: history, bookmark, harpoon and queue live here.
 pub fn data_dir() -> PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .map_or_else(
-            |_| PathBuf::from(home()).join(".local/share"),
-            PathBuf::from,
-        )
-        .join("vimb")
+    PathBuf::from(crate::data_dir())
 }
 
-/// ~/.config/rembrowser/config, else the vimb config as-is.
+/// Built-in defaults, then config.yaml, else the older ~/.config/rembrowser/config.
 pub fn load_config() {
     let cfg = std::env::var("XDG_CONFIG_HOME")
         .map_or_else(|_| PathBuf::from(home()).join(".config"), PathBuf::from);
-    let own = cfg.join("rembrowser/config");
-    let path = if own.exists() {
-        own
-    } else {
-        cfg.join("vimb/config")
-    };
+    let path = cfg.join("rembrowser/config");
     source_text(include_str!("default.config"));
-    // config.yaml wins over the older vimb-syntax file.
+    // config.yaml wins over the older ex-command file.
     if crate::config::path().exists() {
         if let Err(e) = crate::config::load() {
             eprintln!("rembrowser: {e}");
@@ -95,7 +85,7 @@ fn source(path: &std::path::Path) {
 }
 
 fn source_text(text: &str) {
-    // `#:` above a map = its description in the :keys cheatsheet (vimb-pick format).
+    // `#:` above a map = its description in the :keys cheatsheet.
     let mut desc = None;
     for line in text.lines() {
         let line = line.trim();
@@ -120,7 +110,7 @@ const MAP_CMDS: &[&str] = &[
 ];
 
 /// Run one command line. `a|b` runs both, except for map commands whose RHS owns the `|`
-/// (vimb: `nnoremap <Space>uz :set status-bar!|set fullscreen!<CR>`).
+/// (`nnoremap <Space>uz :set status-bar!|set fullscreen!<CR>`).
 pub fn exec(line: &str) {
     let line = line.trim().trim_start_matches(':').trim();
     let first = line.split_whitespace().next().unwrap_or("");
@@ -180,7 +170,9 @@ fn exec_one(line: &str) {
         "config" => crate::config::open_in_editor(false),
         // Chromium's own pages, in a window with Chromium's UI layer.
         "settings" => tabs::chrome_window("chrome://settings", false),
-        "extensions" => tabs::chrome_window("chrome://extensions", true),
+        "private" => private_window(args),
+        "extensions" | "ext-popup" => crate::extensions::picker(),
+        "ext-manage" => tabs::chrome_window("chrome://extensions", true),
         "ext-install" => crate::extensions::install(args),
         "ext-remove" => crate::extensions::remove_picker(),
         "chrome" if args.is_empty() => tabs::chrome_window(&tabs::active_url(), true),
@@ -235,8 +227,6 @@ fn exec_one(line: &str) {
         "qpop" => queue_pop(),
         "echo" => ui::message(args, false),
         "zoom" => vim::zoom(args.parse().unwrap_or(0.0)),
-        // vimb autocommands only handed DRM sites to Helium; rembrowser plays DRM natively.
-        "au" | "autocmd" | "augroup" => {}
         _ => ui::message(&format!("Not a command: {name}"), true),
     }
 }
@@ -380,7 +370,7 @@ fn looks_like_host(s: &str) -> bool {
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
 }
 
-/// vimb shortcut template: $0 = all words, $1.. = single words.
+/// Shortcut template: $0 = all words, $1.. = single words.
 fn fill(template: &str, words: &str) -> String {
     let parts: Vec<&str> = words.split_whitespace().collect();
     let mut out = template.replace("$0", &encode(words));
@@ -434,6 +424,26 @@ pub fn command(program: &str) -> Command {
     c
 }
 
+/// `:private [URL]`: a private window: its own throwaway profile, so no history, cookies
+/// or logins carry in or out. It is another rembrowser process (`--private`).
+fn private_window(url: &str) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut cmd = command(&exe.to_string_lossy());
+    cmd.arg("--private");
+    if !url.is_empty() {
+        cmd.arg(resolve_url(url));
+    }
+    match cmd.spawn() {
+        // Reap it when that window quits.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => ui::message(&format!("private: {e}"), true),
+    }
+}
+
 /// `;m` / `:mpv [URL]`: play in mpv (which uses yt-dlp for YouTube & co.). No URL, or
 /// a <video> whose source is a blob: this page.
 pub fn mpv(url: &str) {
@@ -463,12 +473,9 @@ fn env_cmd(cmd: &str) -> Command {
     let (uri, title) = (tabs::active_url(), tabs::active_title());
     let mut c = command("sh");
     c.arg("-c").arg(cmd).stdin(Stdio::null());
-    // vimb names keep existing scripts (vimb-pick) working.
-    c.env("VIMB_URI", &uri)
-        .env("VIMB_TITLE", &title)
-        .env("VIMB_PID", std::process::id().to_string());
     c.env("REMBROWSER_URI", &uri)
-        .env("REMBROWSER_TITLE", &title);
+        .env("REMBROWSER_TITLE", &title)
+        .env("REMBROWSER_PID", std::process::id().to_string());
     c
 }
 
@@ -494,7 +501,7 @@ fn shell(cmd: &str, show: bool) {
 }
 
 /// `:shellex cmd` runs cmd and executes each stdout line as an ex command
-/// (vimb-pick prints `open URL`, `normal KEYS`).
+/// (a picker script prints `open URL`, `normal KEYS`).
 fn shellex(cmd: &str) {
     let mut c = env_cmd(cmd);
     c.stderr(Stdio::null());
@@ -535,14 +542,14 @@ pub fn edit_lines(path: &std::path::Path, mut keep: impl FnMut(usize, &str) -> O
     }
 }
 
-/// vimb history format: "uri\ttitle", oldest first.
+/// History file: "uri\ttitle", oldest first.
 pub fn record_history(url: &str, title: &str) {
     if url.starts_with("http") && !crate::home::is_home(url) {
         append_line("history", &format!("{url}\t{}", title.replace('\t', " ")));
     }
 }
 
-/// (url, title, tags) of every bookmark, in file order (vimb's format).
+/// (url, title, tags) of every bookmark, in file order.
 pub fn bookmarks() -> Vec<(String, String, String)> {
     // Entry n is the n-th non-blank line: the index edit_lines() works with.
     std::fs::read_to_string(data_dir().join("bookmark"))
@@ -571,7 +578,7 @@ fn queue_push() {
     queue_add(&tabs::active_url(), false);
 }
 
-/// Read-later queue (vimb's file): `;p` appends, `;P` puts it first.
+/// Read-later queue: `;p` appends, `;P` puts it first.
 pub fn queue_add(url: &str, front: bool) {
     if url.is_empty() {
         return;
@@ -613,7 +620,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_urls_like_vimb() {
+    fn resolves_urls() {
         exec("shortcut-add dd=https://duckduckgo.com/?q=$0");
         exec("shortcut-add aw=https://wiki.archlinux.org/index.php?search=$0");
         exec("shortcut-default dd");

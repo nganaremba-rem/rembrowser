@@ -83,11 +83,12 @@ enum Act {
     QuitAll,
     Escape,
     ViewSource,
-    Inspector,
+    /// DevTools; Some = the panel to show.
+    Inspector(Option<&'static str>),
     Pip,
 }
 
-/// vimb's default normal-mode keys (`man vimb`), plus Ctrl-T/W/Tab for muscle memory.
+/// The default normal-mode keys, plus Ctrl-T/W/Tab for muscle memory.
 /// (keys, action, description for the :keys cheatsheet)
 const BUILTINS: &[(&str, Act, &str)] = &[
     ("j", Act::Scroll(0, 1), "scroll down"),
@@ -170,7 +171,10 @@ const BUILTINS: &[(&str, Act, &str)] = &[
         "hint: play in mpv",
     ),
     ("gf", Act::ViewSource, "view page source"),
-    ("gF", Act::Inspector, "DevTools"),
+    ("gF", Act::Inspector(None), "DevTools"),
+    ("<C-S-i>", Act::Inspector(None), "DevTools"),
+    ("<F12>", Act::Inspector(None), "DevTools"),
+    ("<C-S-j>", Act::Inspector(Some("console")), "DevTools console"),
     ("gp", Act::Pip, "picture-in-picture (main video)"),
     ("o", Act::Prompt("open "), ":open"),
     ("O", Act::PromptUrl("open "), ":open with current URL"),
@@ -186,7 +190,10 @@ const BUILTINS: &[(&str, Act, &str)] = &[
     ("P", Act::Paste(true), "open clipboard URL in new tab"),
     ("r", Act::Reload, "reload"),
     ("R", Act::ReloadNoCache, "reload, no cache"),
-    ("<C-c>", Act::Stop, "stop loading"),
+    ("<C-S-r>", Act::ReloadNoCache, "reload, no cache"),
+    ("<C-r>", Act::Reload, "reload"),
+    ("<F5>", Act::Reload, "reload"),
+    ("<C-c>", Act::Stop, "copy selection, else stop loading"),
     ("<C-o>", Act::Back, "back"),
     ("<C-i>", Act::Forward, "forward"),
     ("u", Act::Reopen(false), "reopen closed tab"),
@@ -397,10 +404,16 @@ pub fn on_key(e: &KeyEvent) -> bool {
 
 /// Browser keys that mean nothing in a text field, so they work in insert mode too.
 /// (<C-w> stays the field's delete-word, like vim/readline.)
-/// (<C-t> is vimb's input-mode "edit in editor", handled below.)
+/// (<C-t> in a field is "edit in editor", handled below.)
 const GLOBAL_KEYS: &[&str] = &[
     "<C-Tab>",
     "<C-S-Tab>",
+    "<C-S-r>",
+    "<C-r>",
+    "<F5>",
+    "<C-S-i>",
+    "<C-S-j>",
+    "<F12>",
     "<C-q>",
     "<C-=>",
     "<C-+>",
@@ -428,7 +441,7 @@ fn insert_key(k: &str) -> bool {
             set_mode(Mode::Pass);
             true
         }
-        // vimb: edit the field in editor-command (nvim popup).
+        // Edit the field in editor-command (nvim popup).
         "<C-t>" => {
             EDIT_WANTED.set(Some(std::time::Instant::now()));
             tabs::js("__rem.editGet()");
@@ -628,7 +641,7 @@ fn act(a: Act, count: u32) {
             "__rem.smooth=false;__rem.scroll('page',0,{})",
             p * n as f32
         )),
-        // 50G = 50% (vimb), plain G = bottom.
+        // 50G = 50%, plain G = bottom.
         Act::Top if count > 1 => scroll("percent", 0, n.min(100)),
         Act::Bottom if count > 1 => scroll("percent", 0, n.min(100)),
         Act::Top => scroll("top", 0, 0),
@@ -637,7 +650,7 @@ fn act(a: Act, count: u32) {
         Act::Right => scroll("right", 0, 0),
         Act::Hint(h, filter) => start_hints(h, filter),
         Act::ViewSource => tabs::open(&format!("view-source:{}", tabs::active_url()), false),
-        Act::Inspector => ui::run_on_ui(0, tabs::devtools),
+        Act::Inspector(panel) => ui::run_on_ui(0, move || tabs::devtools(panel)),
         Act::Pip => tabs::pip(),
         Act::Prompt(p) => popup::open(CmdKind::Ex, p),
         Act::PromptUrl(p) => popup::open(CmdKind::Ex, &format!("{p}{}", tabs::active_url())),
@@ -668,7 +681,11 @@ fn act(a: Act, count: u32) {
         }
         Act::Reload => tabs::with_active(|b| b.reload()),
         Act::ReloadNoCache => tabs::with_active(|b| b.reload_ignore_cache()),
-        Act::Stop => tabs::with_active(|b| b.stop_load()),
+        // Copy page text like any browser (and Mod+C, which sends Ctrl+C); stop only
+        // with nothing selected. A gesture, so the page lets execCommand write.
+        Act::Stop => tabs::js_gesture(
+            r"getSelection().isCollapsed ? console.debug('\x01rem\tstop') : document.execCommand('copy')",
+        ),
         Act::Back => (0..n).for_each(|_| tabs::with_active(|b| b.go_back())),
         Act::Forward => (0..n).for_each(|_| tabs::with_active(|b| b.go_forward())),
         Act::Reopen(new_tab) => tabs::reopen(new_tab),
@@ -896,6 +913,8 @@ pub fn on_page_msg(fields: &[&str]) {
             Some(_) => ui::message("clipboard is empty", true),
             None => {}
         },
+        // From <C-c> with nothing selected (a page stopping its own load is harmless).
+        ["stop"] => tabs::with_active(|b| b.stop_load()),
         ["pip-none"] => ui::message("no video on this page", true),
         ["edit-none"] => ui::message("no text field focused", true),
         // Only the answer to our own request (Ctrl-T, ;e): a page can't open the

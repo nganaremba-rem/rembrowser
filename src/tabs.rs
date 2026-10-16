@@ -35,6 +35,8 @@ thread_local! {
     static NEXT_WIN: Cell<u32> = const { Cell::new(1) };
     /// Disposition seen in on_before_popup, consumed by on_popup_browser_view_created.
     static NEXT_POPUP_BACKGROUND: Cell<bool> = const { Cell::new(false) };
+    /// Open DevTools: (id of the inspected browser, the DevTools view).
+    static DEVTOOLS: RefCell<Vec<(i32, BrowserView)>> = const { RefCell::new(Vec::new()) };
     /// URLs of closed tabs, for `u` / `U`.
     static CLOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static FAVICONS: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
@@ -47,6 +49,8 @@ thread_local! {
     /// ponytail: never reset; if a beforeunload cancels the quit, closing DevTools
     /// later re-asks the tabs. Reset on cancel if that ever matters.
     static CLOSING: Cell<bool> = const { Cell::new(false) };
+    /// The hidden window extensions see as "current" exists (see ensure_extension_anchor).
+    static ANCHOR: Cell<bool> = const { Cell::new(false) };
 }
 
 /// cef-rs bug (152.3): when an out-struct is written back to C, an *owned* CefString
@@ -83,6 +87,7 @@ pub fn cur() -> u32 {
 /// A new browser window showing `url`.
 pub fn create_window(url: String) {
     CLOSING.set(false);
+    ensure_extension_anchor();
     let id = NEXT_WIN.replace(NEXT_WIN.get() + 1);
     let mut delegate = RemWindowDelegate::new(id, url);
     window_create_top_level(Some(&mut delegate));
@@ -269,6 +274,8 @@ pub fn select_in(win: u32, i: usize) {
     }
     View::from(&bv).set_visible(1);
     bv.request_focus();
+    // The loading bar follows the tab now shown.
+    ui::load_state(win, bv.browser().is_some_and(|b| b.is_loading() != 0));
     if let Some(w) = window_of(win) {
         w.set_title(Some(&title_of(&bv).as_str().into()));
     }
@@ -490,10 +497,44 @@ pub fn download(url: &str) {
     });
 }
 
-/// `gF`: DevTools for the active tab, in its own window.
-pub fn devtools() {
+/// The open DevTools of the browser with this id.
+fn devtools_of(id: i32) -> Option<Browser> {
+    DEVTOOLS.with_borrow_mut(|d| {
+        d.retain(|(_, v)| v.browser().is_some());
+        d.iter().find(|(of, _)| *of == id).and_then(|(_, v)| v.browser())
+    })
+}
+
+/// Switch the DevTools of browser `id` to `panel`, waiting (up to `tries` × 200 ms)
+/// for a DevTools that is still opening: CEF sends us no load events for its page.
+fn show_panel(id: i32, panel: &'static str, tries: u32) {
+    let frame = devtools_of(id).filter(|b| b.is_loading() == 0).and_then(|b| b.main_frame());
+    match frame.filter(|f| CefString::from(&f.url()).to_string().starts_with("devtools://")) {
+        Some(f) => {
+            // The page being loaded is not DevTools being ready: ask until the
+            // panel's tab is the selected one (4 s at most).
+            let js = format!(
+                "(() => {{ let n = 0; const t = setInterval(() => {{\
+                   try {{ DevToolsAPI.showPanel('{panel}'); }} catch {{}}\
+                   const on = [...document.querySelectorAll('*')].some((e) => e.shadowRoot?.querySelector('#tab-{panel}.selected'));\
+                   if (on || ++n > 40) clearInterval(t); }}, 100); }})()"
+            );
+            f.execute_java_script(Some(&js.as_str().into()), None, 0);
+        }
+        None if tries > 0 => ui::run_on_ui(200, move || show_panel(id, panel, tries - 1)),
+        None => {}
+    }
+}
+
+/// `gF` / Ctrl-Shift-I: DevTools for the active tab, in its own window. `panel`
+/// (Ctrl-Shift-J: "console") is the one to show; None = where DevTools was last.
+pub fn devtools(panel: Option<&'static str>) {
     with_active(|b| {
         if let Some(h) = b.host() {
+            if let Some(p) = panel {
+                let id = b.identifier();
+                ui::run_on_ui(0, move || show_panel(id, p, 25));
+            }
             // Ignored for a BrowserView-hosted browser: CEF creates a popup view
             // (see on_popup_browser_view_created).
             h.show_dev_tools(
@@ -569,9 +610,7 @@ pub fn set_zoom(level: f64) {
 }
 
 fn zoom_file() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let data = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
-    std::path::PathBuf::from(data).join("rembrowser/zoom")
+    std::path::PathBuf::from(crate::data_dir()).join("zoom")
 }
 
 fn zoom_levels() -> Vec<(String, f64)> {
@@ -704,7 +743,7 @@ fn on_tab_closed(browser: &mut Browser) {
     }
     content.remove_child_view(Some(&mut View::from(&removed)));
     if n == 0 {
-        // Last tab gone: close the window (the last window quits, vimb `:q`).
+        // Last tab gone: close the window (the last window quits).
         // Next tick: we may be inside can_close's loop right now (closing a tab
         // re-entering can_close crashes CEF on the half-closed popup).
         ui::run_on_ui(0, move || close_window(win));
@@ -899,7 +938,10 @@ wrap_browser_view_delegate! {
             // DevTools (gF): its own window, tiled next to the page by niri.
             if is_devtools != 0 {
                 let Some(bv) = popup_browser_view else { return 0 };
-                let mut d = ChromeWindowDelegate::new(bv.clone(), DEVTOOLS_APP_ID.into(), "DevTools — rembrowser".into());
+                if let Some(of) = browser_view.as_ref().and_then(|v| v.browser()) {
+                    DEVTOOLS.with_borrow_mut(|d| d.push((of.identifier(), bv.clone())));
+                }
+                let mut d = ChromeWindowDelegate::new(bv.clone(), DEVTOOLS_APP_ID.into(), "DevTools — rembrowser".into(), false, None);
                 window_create_top_level(Some(&mut d));
                 return 1;
             }
@@ -995,6 +1037,7 @@ wrap_display_handler! {
         fn on_loading_progress_change(&self, browser: Option<&mut Browser>, progress: f64) {
             if let Some(win) = browser.and_then(shown_in) {
                 with_win(win, |w| w.progress = (progress * 100.0) as u8);
+                ui::load_progress(win, progress as f32);
                 refresh_right(win);
             }
         }
@@ -1067,8 +1110,20 @@ wrap_load_handler! {
             }
         }
 
+        // Top-edge loading bar of the visible tab.
+        fn on_loading_state_change(&self, browser: Option<&mut Browser>, is_loading: i32, _can_go_back: i32, _can_go_forward: i32) {
+            if let Some(win) = browser.and_then(shown_in) {
+                ui::load_state(win, is_loading != 0);
+                popup::refocus(Owner::Win(win));
+            }
+        }
+
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
+            let mut browser = browser;
+            if let Some(win) = browser.as_deref_mut().and_then(shown_in) {
+                popup::refocus(Owner::Win(win));
+            }
             // A web app's command popup, ready before its first `:` (like the browser's).
             if let Some(id) = browser.as_ref().filter(|b| apps::is_app(b)).map(|b| b.identifier()) {
                 if let Some(w) = apps::window_of(id) {
@@ -1243,6 +1298,28 @@ pub fn needs_chrome(url: &str) -> bool {
 /// per window is CEF's limit for this style. `toolbar` adds Chrome's address bar
 /// with the extension buttons and menu.
 pub fn chrome_window(url: &str, toolbar: bool) {
+    make_chrome_window(url, toolbar, false, None);
+}
+
+/// An extension's popup page: a small fixed-size window (niri floats those), the
+/// nearest thing to the bubble under a toolbar button.
+pub fn extension_popup(url: &str) {
+    make_chrome_window(url, false, false, Some(Size { width: 400, height: 600 }));
+}
+
+/// Extensions ask for "the current window" (`chrome.windows.getCurrent`) before they
+/// open a popout; the Alloy tabs are none, so with no Chrome-style window that call
+/// fails and, e.g., Bitwarden's "Unlock account" silently does nothing. One window that
+/// is never shown fixes it for every extension. Closed with the last browser window
+/// like DevTools; the next window made brings it back.
+pub fn ensure_extension_anchor() {
+    if !commands::opt_bool("extensions", false) || ANCHOR.replace(true) {
+        return;
+    }
+    make_chrome_window("about:blank", false, true, None);
+}
+
+fn make_chrome_window(url: &str, toolbar: bool, hidden: bool, size: Option<Size>) {
     let mut client = ChromeClient::new();
     let mut delegate = ChromeViewDelegate::new(toolbar);
     let view = browser_view_create(
@@ -1254,7 +1331,7 @@ pub fn chrome_window(url: &str, toolbar: bool) {
         Some(&mut delegate),
     );
     if let Some(bv) = view {
-        let mut d = ChromeWindowDelegate::new(bv, CHROME_APP_ID.into(), "Chromium — rembrowser".into());
+        let mut d = ChromeWindowDelegate::new(bv, CHROME_APP_ID.into(), "Chromium — rembrowser".into(), hidden, size);
         window_create_top_level(Some(&mut d));
     }
 }
@@ -1300,11 +1377,13 @@ wrap_window_delegate! {
         view: BrowserView,
         app_id: String,
         title: String,
+        hidden: bool,
+        size: Option<Size>,
     }
 
     impl ViewDelegate {
         fn preferred_size(&self, _view: Option<&mut View>) -> Size {
-            Size { width: 1100, height: 800 }
+            self.size.clone().unwrap_or(Size { width: 1100, height: 800 })
         }
     }
 
@@ -1314,11 +1393,11 @@ wrap_window_delegate! {
         // cef-rs defaults these to 0 (CEF's C++ defaults are true): a fixed-size
         // window, which niri opens floating.
         fn can_resize(&self, _window: Option<&mut Window>) -> i32 {
-            1
+            self.size.is_none() as i32
         }
 
         fn can_maximize(&self, _window: Option<&mut Window>) -> i32 {
-            1
+            self.size.is_none() as i32
         }
 
         fn can_minimize(&self, _window: Option<&mut Window>) -> i32 {
@@ -1335,14 +1414,19 @@ wrap_window_delegate! {
                 l.set_flex_for_view(Some(&mut View::from(&self.view)), 1);
             }
             w.set_title(Some(&self.title.as_str().into()));
-            w.show();
-            self.view.request_focus();
+            if !self.hidden {
+                w.show();
+                self.view.request_focus();
+            }
             CHROME_WINS.with_borrow_mut(|d| d.push(w.clone()));
         }
 
         fn on_window_destroyed(&self, window: Option<&mut Window>) {
             let Some(w) = window else { return };
             CHROME_WINS.with_borrow_mut(|d| d.retain(|x| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));
+            if self.hidden {
+                ANCHOR.set(false);
+            }
             if CLOSING.get() {
                 ui::run_on_ui(0, close_all);
             }
