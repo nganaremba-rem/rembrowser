@@ -2,14 +2,14 @@
 #   cd packaging/arch && makepkg -si
 pkgname=rembrowser
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Vim-native, privacy-first Chromium (CEF) browser: DRM, adblock, noice-style popup'
 arch=('x86_64')
 url='https://github.com/nganaremba-rem/rembrowser'
-license=('LicenseRef-custom')
+license=('MIT')
 # cef pulls the whole Chromium runtime (nss, mesa, pulse, openh264, ...). The crate is
-# pinned to CEF 152's API, so stay on that major.
-depends=('cef>=152' 'cef<153' 'curl' 'gcc-libs' 'glibc')
+# pinned to CEF 154's API, so stay on that major.
+depends=('cef>=154' 'cef<155' 'curl' 'gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=(
   'wl-clipboard: clipboard without a per-site prompt for p/P'
@@ -42,6 +42,7 @@ check() {
 package() {
   cd "$_root"
   install -Dm755 "$srcdir/target/release/rembrowser" "$pkgdir/usr/bin/rembrowser"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 packaging/rembrowser.desktop "$pkgdir/usr/share/applications/rembrowser.desktop"
   install -Dm644 packaging/rembrowser.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/rembrowser.svg"
 }

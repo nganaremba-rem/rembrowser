@@ -168,11 +168,19 @@ fn update(system: bool) -> i32 {
         Install::Pacman => {
             // A new Chromium *major* needs a rembrowser built for that CEF API first.
             match cef_version(true).as_deref().and_then(major) {
+                // bump-cef.sh moves the crate pin + PKGBUILD to the repo's cef, builds and
+                // installs rembrowser; only then can pacman take the new cef.
                 Some(m) if m != cef::sys::CHROME_VERSION_MAJOR => {
-                    println!(
-                        "  Chromium {m} is out, but this rembrowser is built for {} — skipping the system upgrade\n  (pacman would refuse it). Update rembrowser's cef crate to {m}, rebuild, then run this again.",
-                        cef::sys::CHROME_VERSION_MAJOR
-                    );
+                    println!("  Chromium {m} is out; moving rembrowser's cef crate to it first");
+                    let bumped = source_dir().is_some_and(|src| {
+                        ok(&mut Command::new(src.join("packaging/arch/bump-cef.sh")))
+                    });
+                    if bumped {
+                        failed |= !ok(Command::new("sudo").args(["pacman", "-Syu"]));
+                    } else {
+                        println!("  bump failed (new crate not out yet, or an API change to fix) — system upgrade skipped");
+                        failed = true;
+                    }
                 }
                 _ => failed |= !ok(Command::new("sudo").args(["pacman", "-Syu"])),
             }
