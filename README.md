@@ -46,6 +46,17 @@ curl -fsSL https://raw.githubusercontent.com/nganaremba-rem/rembrowser/main/inst
 - 🐧 **Arch & Arch-based** → builds the native package (system Chromium engine, every codec). `pacman` installs all dependencies.
 - 📦 **Ubuntu 22.04+, Debian 12+, Fedora 35+, …** → installs the portable bundle into `~/.local` (no root). *Note: the portable engine has no H.264, so H.264-only sites won't play.*
 
+### Arch pacman repo (prebuilt, updates with `-Syu`)
+
+Packages are signed with the key `FAC3 D400 E106 D054 07A0 504F C6ED 9221 C017 576E`.
+
+```bash
+curl -fsSL https://github.com/nganaremba-rem/rembrowser/releases/download/repo/rembrowser-repo.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key FAC3D400E106D05407A0504FC6ED9221C017576E
+printf '\n[rembrowser]\nServer = https://github.com/nganaremba-rem/rembrowser/releases/download/repo\n' | sudo tee -a /etc/pacman.conf
+sudo pacman -Sy rembrowser
+```
+
 ### By hand (Arch)
 
 ```bash
