@@ -5,7 +5,7 @@
 //! (no locks). Rule: never call into vim/ui while holding a borrow here.
 
 use crate::popup::Owner;
-use crate::{adblock, apps, commands, downloads, home, permissions, popup, ui, userscripts, vim};
+use crate::{adblock, apps, commands, downloads, home, permissions, popup, session, ui, userscripts, vim};
 use cef::*;
 use std::cell::{Cell, RefCell};
 
@@ -389,6 +389,7 @@ fn add(win: u32, bv: BrowserView, background: bool) {
     if i > 0 {
         ui::reveal_tabs();
     }
+    session_dirty();
 }
 
 /// `usize::MAX` = last tab.
@@ -430,6 +431,7 @@ pub fn select_in(win: u32, i: usize) {
         vim::reset();
     }
     refresh_right(win);
+    session_dirty();
 }
 
 /// Relative move, wrapping (gt / gT).
@@ -492,6 +494,79 @@ pub fn close_window(id: u32) {
 
 fn close_all() {
     win_ids().into_iter().for_each(close_window);
+}
+
+thread_local! {
+    /// Windows still to rebuild from the saved session (see restore_session).
+    static RESTORE: RefCell<Vec<session::Win>> = const { RefCell::new(Vec::new()) };
+    static SESSION_PENDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A tab whose page is not loaded: blank view, the real url/title kept until selected
+/// (the same trick as tab sleep, so restoring 30 tabs costs the RAM of one).
+fn sleeping_view(url: &str) -> Option<BrowserView> {
+    let fresh = new_view("about:blank")?;
+    let sid = NEXT_SLEEP_ID.replace(NEXT_SLEEP_ID.get() + 1);
+    View::from(&fresh).set_id(sid);
+    ASLEEP.with_borrow_mut(|m| m.insert(sid, (url.to_string(), host_of(url))));
+    Some(fresh)
+}
+
+/// What is worth bringing back: real pages, not the homescreen or error pages.
+fn saveable(url: &str) -> bool {
+    (url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://"))
+        && !home::is_home(url)
+        && !url.contains(['\t', '\n'])
+}
+
+/// Something about the tabs changed: write the session soon (debounced).
+pub fn session_dirty() {
+    if !crate::is_private() && !SESSION_PENDING.replace(true) {
+        ui::run_on_ui(1500, session_flush);
+    }
+}
+
+fn session_flush() {
+    SESSION_PENDING.set(false);
+    // During a quit the windows close one by one: saving then would erase the session.
+    if QUITTING.get() || CLOSING.get() {
+        return;
+    }
+    let wins: Vec<session::Win> = WINS.with_borrow(|ws| {
+        ws.iter()
+            .filter_map(|w| {
+                let mut urls = Vec::new();
+                let mut active = 0;
+                for (i, bv) in w.tabs.iter().enumerate() {
+                    let u = url_of(bv);
+                    if saveable(&u) {
+                        if i <= w.active {
+                            active = urls.len();
+                        }
+                        urls.push(u);
+                    }
+                }
+                (!urls.is_empty()).then_some(session::Win { urls, active })
+            })
+            .collect()
+    });
+    // Never replace a session with nothing: closing the last tab must keep it.
+    if !wins.is_empty() {
+        session::save(&wins);
+    }
+}
+
+/// Reopen the saved windows. False if there is nothing saved.
+pub fn restore_session() -> bool {
+    let wins = session::load();
+    if wins.is_empty() {
+        return false;
+    }
+    RESTORE.with_borrow_mut(|q| q.extend(wins.iter().cloned()));
+    for w in &wins {
+        create_window(w.urls[0].clone());
+    }
+    true
 }
 
 thread_local! {
@@ -955,6 +1030,7 @@ fn on_tab_closed(browser: &mut Browser) {
     FAVICONS.with_borrow_mut(|m| m.remove(&id));
     LAST_CRASH.with_borrow_mut(|m| m.remove(&id));
     content.remove_child_view(Some(&mut View::from(&removed)));
+    session_dirty();
     if n == 0 {
         // Last tab gone: close the window (the last window quits).
         // Next tick: we may be inside can_close's loop right now (closing a tab
@@ -1054,6 +1130,18 @@ wrap_window_delegate! {
             ui::attach(id);
             if let Some(bv) = new_view(&self.url) {
                 add(id, bv, false);
+            }
+            // A restored session: this window's other tabs, asleep until selected.
+            let restore = RESTORE.with_borrow_mut(|q| (!q.is_empty()).then(|| q.remove(0)));
+            if let Some(r) = restore {
+                for u in r.urls.iter().skip(1) {
+                    if let Some(bv) = sleeping_view(u) {
+                        add(id, bv, true);
+                    }
+                }
+                if r.active > 0 {
+                    select_in(id, r.active);
+                }
             }
             crate::mark("window created, shown");
             window.show();
@@ -1413,6 +1501,7 @@ wrap_load_handler! {
                 .map(|e| CefString::from(&e.title()).to_string())
                 .unwrap_or_default();
             commands::record_history(&url, &title);
+            session_dirty();
             if let Some((win, _)) = browser.and_then(index_of).filter(|(win, _)| !ui::is_built(*win)) {
                 ui::run_on_ui(0, move || build_bar(win));
             }

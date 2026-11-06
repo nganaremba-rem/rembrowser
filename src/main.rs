@@ -18,6 +18,7 @@ mod permissions;
 mod pickers;
 mod popup;
 mod privacy;
+mod session;
 mod tabs;
 mod ui;
 mod userscripts;
@@ -120,6 +121,9 @@ fn main() {
     mark("ipc forwarded/none");
     ipc::listen();
     mark("ipc listening");
+    if !is_private() {
+        session::start();
+    }
     let root = data_dir();
     let profile = format!("{root}/Default");
     // First: the config decides which optional parts start at all (drm, adblock,
@@ -169,6 +173,9 @@ fn main() {
     mark("cef initialized");
     run_message_loop();
     shutdown();
+    if !is_private() {
+        session::mark_clean();
+    }
     if is_private() {
         let _ = std::fs::remove_dir_all(data_dir());
     }
@@ -209,7 +216,18 @@ wrap_browser_process_handler! {
         fn on_context_initialized(&self) {
             mark("context initialized");
             privacy::apply_prefs();
-            ipc::handle(self.req.clone());
+            // A bare launch can bring the last session back (see session.rs).
+            let bare = matches!(&self.req, ipc::Req::Open(u) if u.is_empty());
+            let restore = bare
+                && !is_private()
+                && match commands::opt("restore-session").as_deref().unwrap_or("crash") {
+                    "always" => true,
+                    "crash" => session::crashed(),
+                    _ => false,
+                };
+            if !(restore && tabs::restore_session()) {
+                ipc::handle(self.req.clone());
+            }
             if is_private() {
                 ui::run_on_ui(0, || ui::toast("private window: nothing is saved", false));
             }

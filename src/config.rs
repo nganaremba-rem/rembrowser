@@ -37,6 +37,7 @@ settings:
   keep-running: false      # true = closing the last window keeps the browser alive in the
                            # background (~270 MB) so the next launch opens in ~0.1 s, not ~0.9 s.
                            # :qa / Ctrl-q still quit for real.
+  restore-session: crash   # crash = bring the tabs back after a crash/kill, always, off (:restore any time)
   sleep-after: 10          # minutes a hidden tab may idle before it sleeps (0 = never)
   # cookie-allow: "bank.example.com"  # hosts allowed to set cookies as a frame (3-D Secure etc.)
   download-path: ~/Downloads

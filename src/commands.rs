@@ -139,6 +139,11 @@ fn exec_one(line: &str) {
         "t" | "tabopen" | "tabnew" => open(args, true),
         "winopen" | "window" => tabs::create_window(resolve_url(args)),
         "q" | "quit" | "close" | "tabclose" => tabs::close_active(),
+        "restore" => {
+            if !tabs::restore_session() {
+                ui::message("no saved session", true);
+            }
+        }
         "qa" | "qall" | "quitall" | "wqa" => tabs::quit_all(),
         "back" => tabs::with_active(|b| b.go_back()),
         "forward" => tabs::with_active(|b| b.go_forward()),

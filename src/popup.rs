@@ -65,6 +65,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("winopen", "open in new window"),
     ("quit", "close tab"),
     ("quitall", "quit browser"),
+    ("restore", "reopen the saved session"),
     ("tabs", "pick a tab"),
     ("buffer", "go to tab N"),
     ("back", "history back"),
