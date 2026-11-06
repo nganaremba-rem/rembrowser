@@ -144,6 +144,9 @@ fn exec_one(line: &str) {
                 ui::message("no saved session", true);
             }
         }
+        // `rembrowser --background`: boot the engine with no window (autostart at login).
+        // Nothing to do here: the process stays up and the next launch opens a window fast.
+        "background" => {}
         "qa" | "qall" | "quitall" | "wqa" => tabs::quit_all(),
         "back" => tabs::with_active(|b| b.go_back()),
         "forward" => tabs::with_active(|b| b.go_forward()),

@@ -114,7 +114,8 @@ fn main() {
         }
         ipc::Forwarded::NoInstance => {}
     }
-    if matches!(req, ipc::Req::Cmd(_)) {
+    // `--background` is the one command that may start the browser (no window).
+    if matches!(&req, ipc::Req::Cmd(c) if c != "background") {
         eprintln!("rembrowser: not running (a :command needs a running browser)");
         std::process::exit(1);
     }

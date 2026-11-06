@@ -149,6 +149,9 @@ pub fn handle(req: Req) {
 /// argv → request: `--app=URL` / `--app URL` / `--new-window [URL]` / `:command` /
 /// `URL` / nothing (home page).
 pub fn from_args(args: &[String]) -> Req {
+    if args.iter().any(|a| a == "--background") {
+        return Req::Cmd("background".into());
+    }
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if let Some(u) = a.strip_prefix("--app=") {
@@ -182,6 +185,7 @@ mod tests {
         assert_eq!(a(&["--app", "discord.com"]), Req::App("discord.com".into()));
         assert_eq!(a(&["https://x.org"]), Req::Open("https://x.org".into()));
         assert_eq!(a(&[]), Req::Open(String::new()));
+        assert_eq!(a(&["--background"]), Req::Cmd("background".into()));
         assert_eq!(a(&[":tabopen x.org"]), Req::Cmd("tabopen x.org".into()));
         assert_eq!(a(&["--new-window"]), Req::Window(String::new()));
         assert_eq!(a(&["--new-window", "x.org"]), Req::Window("x.org".into()));
