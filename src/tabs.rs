@@ -929,6 +929,51 @@ fn remember_icon(host: &str, img: &Image) {
     let _ = std::fs::write(path, bytes);
 }
 
+/// Dark icons (GitHub, Notion, ...) vanish on the dark tab bar, so put them on a light
+/// rounded tile. Bright icons are returned as is. Running it twice changes nothing,
+/// because the tiled result is bright.
+fn with_chip(img: &Image) -> Image {
+    let (mut w, mut h) = (0, 0);
+    let Some(bin) = img.as_bitmap(1.0, cef::ColorType::BGRA_8888, cef::AlphaType::POSTMULTIPLIED, Some(&mut w), Some(&mut h))
+    else { return img.clone() };
+    let n = bin.size();
+    if w <= 0 || h <= 0 || n != (w * h * 4) as usize || bin.raw_data().is_null() {
+        return img.clone();
+    }
+    // SAFETY: raw_data() points at size() bytes while `bin` is alive.
+    let px = unsafe { std::slice::from_raw_parts(bin.raw_data() as *const u8, n) };
+    let (mut sum, mut cnt) = (0.0f32, 0u32);
+    for p in px.chunks_exact(4).filter(|p| p[3] > 128) {
+        sum += 0.2126 * p[2] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[0] as f32;
+        cnt += 1;
+    }
+    if cnt == 0 || sum / cnt as f32 / 255.0 >= 0.35 {
+        return img.clone();
+    }
+    let (wf, hf, r) = (w as f32, h as f32, (w.min(h) as f32 / 4.0).max(2.0));
+    let mut out = Vec::with_capacity(n);
+    for (i, p) in px.chunks_exact(4).enumerate() {
+        let (x, y) = ((i as i32 % w) as f32 + 0.5, (i as i32 / w) as f32 + 0.5);
+        // Inside the rounded square? (distance to the nearest corner centre when in a corner)
+        let (dx, dy) = ((x - r).min(wf - r - x).min(0.0), (y - r).min(hf - r - y).min(0.0));
+        if dx * dx + dy * dy > r * r {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        let a = p[3] as f32 / 255.0;
+        let bg = [0xF4u8 as f32, 0xEE as f32, 0xEE as f32]; // B, G, R of #EEEEF4
+        for c in 0..3 {
+            out.push((p[c] as f32 * a + bg[c] * (1.0 - a)) as u8);
+        }
+        out.push(255);
+    }
+    let Some(new) = cef::image_create() else { return img.clone() };
+    if new.add_bitmap(1.0, w, h, cef::ColorType::BGRA_8888, cef::AlphaType::POSTMULTIPLIED, Some(&out)) == 0 {
+        return img.clone();
+    }
+    new
+}
+
 /// Navigation started in a tab: paint the site's remembered icon now (or none, if unknown).
 fn show_cached_icon(id: i32, url: &str) {
     let host = host_of(url);
@@ -1489,8 +1534,9 @@ wrap_download_image_callback! {
             let Some(win) = win_of_browser(self.id) else { return };
             match image {
                 Some(img) if (200..300).contains(&status) && img.is_empty() == 0 => {
+                    let img = with_chip(img);
                     FAV_IMG.with_borrow_mut(|m| m.insert(self.id, img.clone()));
-                    remember_icon(&self.host, img);
+                    remember_icon(&self.host, &img);
                 }
                 _ => return,
             }
