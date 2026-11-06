@@ -65,6 +65,10 @@ thread_local! {
     /// URLs of closed tabs, for `u` / `U`.
     static CLOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static FAVICONS: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
+    /// Site -> its last known icon (also kept on disk), so a tab shows it the moment you
+    /// navigate, before the page has even reported its icon URL. FAV_HOST = site each tab shows.
+    static HOST_ICON: RefCell<std::collections::HashMap<String, Image>> = RefCell::new(std::collections::HashMap::new());
+    static FAV_HOST: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
     /// Browser id -> when its renderer last died (see on_render_process_terminated).
     static LAST_CRASH: RefCell<std::collections::HashMap<i32, std::time::Instant>> = RefCell::new(std::collections::HashMap::new());
     /// The web-app window with keyboard focus (None = a browser window).
@@ -182,6 +186,7 @@ fn sleep_tab(win: u32, old: &BrowserView) {
         HIDDEN.with_borrow_mut(|h| h.remove(&id));
         FAVICONS.with_borrow_mut(|m| m.remove(&id));
         FAV_IMG.with_borrow_mut(|m| m.remove(&id));
+        FAV_HOST.with_borrow_mut(|m| m.remove(&id));
         KEEP.with_borrow_mut(|k| k.remove(&id));
         b.host()
     });
@@ -885,6 +890,61 @@ fn zoom_levels() -> Vec<(String, f64)> {
     })
 }
 
+/// Disk file for a site's icon; None if the host has odd characters (never a path escape).
+fn icon_file(host: &str) -> Option<std::path::PathBuf> {
+    let ok = !host.is_empty()
+        && host.len() < 120
+        && host.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-');
+    ok.then(|| std::path::Path::new(&crate::data_dir()).join("favicons").join(format!("{host}.png")))
+}
+
+fn cached_icon(host: &str) -> Option<Image> {
+    if let Some(img) = HOST_ICON.with_borrow(|m| m.get(host).cloned()) {
+        return Some(img);
+    }
+    let bytes = std::fs::read(icon_file(host)?).ok()?;
+    let img = cef::image_create()?;
+    (img.add_png(1.0, Some(&bytes)) != 0).then_some(())?;
+    HOST_ICON.with_borrow_mut(|m| m.insert(host.to_string(), img.clone()));
+    Some(img)
+}
+
+fn remember_icon(host: &str, img: &Image) {
+    HOST_ICON.with_borrow_mut(|m| m.insert(host.to_string(), img.clone()));
+    // CEF writes the pixel size through these pointers, so they must not be null.
+    let (mut w, mut h) = (0, 0);
+    let png = img.as_png(1.0, 1, Some(&mut w), Some(&mut h));
+    let (Some(path), Some(png)) = (icon_file(host), png) else { return };
+    let (p, n) = (png.raw_data() as *const u8, png.size());
+    if p.is_null() || n == 0 {
+        return;
+    }
+    // SAFETY: CEF guarantees raw_data() points at size() bytes while `png` is alive.
+    let bytes = unsafe { std::slice::from_raw_parts(p, n) };
+    if let Some(dir) = path.parent() {
+        use std::os::unix::fs::DirBuilderExt;
+        // 0700: file names are the sites you visit.
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+    }
+    let _ = std::fs::write(path, bytes);
+}
+
+/// Navigation started in a tab: paint the site's remembered icon now (or none, if unknown).
+fn show_cached_icon(id: i32, url: &str) {
+    let host = host_of(url);
+    if host.is_empty() || FAV_HOST.with_borrow(|m| m.get(&id) == Some(&host)) {
+        return;
+    }
+    match cached_icon(&host) {
+        Some(img) => FAV_IMG.with_borrow_mut(|m| m.insert(id, img)),
+        None => FAV_IMG.with_borrow_mut(|m| m.remove(&id)),
+    };
+    FAV_HOST.with_borrow_mut(|m| m.insert(id, host));
+    if let Some(win) = win_of_browser(id) {
+        refresh_tabbar(win);
+    }
+}
+
 fn host_of(url: &str) -> String {
     url.split("://")
         .nth(1)
@@ -1028,6 +1088,7 @@ fn on_tab_closed(browser: &mut Browser) {
     HIDDEN.with_borrow_mut(|h| h.remove(&id));
     KEEP.with_borrow_mut(|k| k.remove(&id));
     FAVICONS.with_borrow_mut(|m| m.remove(&id));
+    FAV_HOST.with_borrow_mut(|m| m.remove(&id));
     LAST_CRASH.with_borrow_mut(|m| m.remove(&id));
     content.remove_child_view(Some(&mut View::from(&removed)));
     session_dirty();
@@ -1333,13 +1394,17 @@ wrap_display_handler! {
             FAVICONS.with_borrow_mut(|f| f.insert(id, u.clone()));
             // Decoded 16 px copy for the tab (CEF fetches it itself, favicon cache, no cookies).
             if let Some(h) = b.host() {
-                let mut cb = FavCallback::new(id);
+                let host = FAV_HOST.with_borrow(|m| m.get(&id).cloned()).unwrap_or_default();
+                let mut cb = FavCallback::new(id, host);
                 h.download_image(Some(&u.as_str().into()), 1, 16, 0, Some(&mut cb));
             }
         }
 
         fn on_address_change(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
             let main = frame.is_some_and(|f| f.is_main() != 0);
+            if let (true, Some(b), Some(u)) = (main, browser.as_ref(), url) {
+                show_cached_icon(b.identifier(), &u.to_string());
+            }
             if let Some(b) = browser.as_ref().filter(|b| main && apps::is_app(b)) {
                 ui::set_url_for(Owner::App(b.identifier()), &url.map(|u| u.to_string()).unwrap_or_default());
                 return;
@@ -1415,6 +1480,7 @@ fn win_of_browser(id: i32) -> Option<u32> {
 wrap_download_image_callback! {
     struct FavCallback {
         id: i32,
+        host: String,
     }
 
     impl DownloadImageCallback {
@@ -1424,6 +1490,7 @@ wrap_download_image_callback! {
             match image {
                 Some(img) if (200..300).contains(&status) && img.is_empty() == 0 => {
                     FAV_IMG.with_borrow_mut(|m| m.insert(self.id, img.clone()));
+                    remember_icon(&self.host, img);
                 }
                 _ => return,
             }
