@@ -452,6 +452,11 @@ pub fn mpv(url: &str) {
     } else {
         url.to_string()
     };
+    // mpv/ffmpeg also open file://, edl://, smb://, ... : a page link must not pick those.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        ui::message("mpv: only http(s) links", true);
+        return;
+    }
     let cmd = opt("mpv-command").unwrap_or_else(|| "mpv".into());
     let mut words = cmd.split_whitespace();
     let prog = words.next().unwrap_or("mpv");

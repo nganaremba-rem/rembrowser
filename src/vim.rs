@@ -673,8 +673,9 @@ fn act(a: Act, count: u32) {
                 Err(_) => {
                     PASTE_WANTED.set(Some((std::time::Instant::now(), new_tab)));
                     tabs::js_gesture(
-                        "navigator.clipboard.readText().then((t) => console.debug('\\x01rem\\tpaste\\t' + t.replace(/[\\t\\n]/g, ' ')), \
-                         () => console.debug('\\x01rem\\tpaste\\t'))",
+                        &"navigator.clipboard.readText().then((t) => console.debug('\\x01rem:__NONCE__\\tpaste\\t' + t.replace(/[\\t\\n]/g, ' ')), \
+                         () => console.debug('\\x01rem:__NONCE__\\tpaste\\t'))"
+                            .replace("__NONCE__", tabs::nonce()),
                     );
                 }
             }
@@ -684,7 +685,8 @@ fn act(a: Act, count: u32) {
         // Copy page text like any browser (and Mod+C, which sends Ctrl+C); stop only
         // with nothing selected. A gesture, so the page lets execCommand write.
         Act::Stop => tabs::js_gesture(
-            r"getSelection().isCollapsed ? console.debug('\x01rem\tstop') : document.execCommand('copy')",
+            &r"getSelection().isCollapsed ? console.debug('\x01rem:__NONCE__\tstop') : document.execCommand('copy')"
+                .replace("__NONCE__", tabs::nonce()),
         ),
         Act::Back => (0..n).for_each(|_| tabs::with_active(|b| b.go_back())),
         Act::Forward => (0..n).for_each(|_| tabs::with_active(|b| b.go_forward())),

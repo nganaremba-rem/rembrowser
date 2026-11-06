@@ -55,7 +55,36 @@ fn enter_private() {
     unsafe { std::env::set_var("REMBROWSER_PRIVATE_DIR", dir) };
 }
 
+/// A panic inside a CEF callback aborts the whole browser with no trace. Write one
+/// (message, place, backtrace) to `<data>/panic.log` so the next crash has evidence.
+fn install_panic_log() {
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let bt = std::backtrace::Backtrace::force_capture();
+        let line = format!("--- panic ---\n{info}\n{bt}\n");
+        eprintln!("{line}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}/panic.log", real_data_dir()))
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }));
+}
+
+/// `REMBROWSER_TIMING=1`: print how long each startup stage took (ms since main).
+pub fn mark(label: &str) {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t0 = T0.get_or_init(std::time::Instant::now);
+    if std::env::var_os("REMBROWSER_TIMING").is_some() {
+        eprintln!("[timing] {:>5} ms  {label}", t0.elapsed().as_millis());
+    }
+}
+
 fn main() {
+    mark("main");
+    install_panic_log();
     // `rembrowser update` etc.: plain terminal commands, no browser.
     if let Some(code) = cli::run() {
         std::process::exit(code);
@@ -63,6 +92,7 @@ fn main() {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
     let args = args::Args::new();
+    mark("before execute_process");
     let code = execute_process(Some(args.as_main_args()), None, std::ptr::null_mut());
     if code >= 0 {
         std::process::exit(code);
@@ -87,19 +117,25 @@ fn main() {
         eprintln!("rembrowser: not running (a :command needs a running browser)");
         std::process::exit(1);
     }
+    mark("ipc forwarded/none");
     ipc::listen();
+    mark("ipc listening");
     let root = data_dir();
     let profile = format!("{root}/Default");
     // First: the config decides which optional parts start at all (drm, adblock,
     // extensions) and which switches CEF gets (dark-mode).
     commands::load_config();
+    mark("config loaded");
     if commands::opt_bool("drm", true) {
         widevine::setup(&profile);
     }
+    mark("widevine setup");
     if commands::opt_bool("adblock", true) {
         adblock::start();
     }
+    mark("adblock started");
     userscripts::load();
+    mark("userscripts loaded");
     config::watch();
 
     let settings = Settings {
@@ -115,6 +151,7 @@ fn main() {
     };
 
     let mut app = RemApp::new(req);
+    mark("before cef initialize");
     let started = initialize(
         Some(args.as_main_args()),
         Some(&settings),
@@ -129,6 +166,7 @@ fn main() {
         }
         std::process::exit(1);
     }
+    mark("cef initialized");
     run_message_loop();
     shutdown();
     if is_private() {
@@ -169,6 +207,7 @@ wrap_browser_process_handler! {
 
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
+            mark("context initialized");
             privacy::apply_prefs();
             ipc::handle(self.req.clone());
             if is_private() {

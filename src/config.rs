@@ -34,6 +34,11 @@ settings:
   smooth-scrolling: true   # false = jump instead of glide
   incsearch: true
   confirm-quit: true       # ask before the last tab closes (d, x, :q) and on Ctrl-q
+  keep-running: false      # true = closing the last window keeps the browser alive in the
+                           # background (~270 MB) so the next launch opens in ~0.1 s, not ~0.9 s.
+                           # :qa / Ctrl-q still quit for real.
+  sleep-after: 10          # minutes a hidden tab may idle before it sleeps (0 = never)
+  # cookie-allow: "bank.example.com"  # hosts allowed to set cookies as a frame (3-D Secure etc.)
   download-path: ~/Downloads
   geolocation: never
   # editor-command: foot nvim %s     # Ctrl-T in text fields; %s = the file

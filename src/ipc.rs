@@ -49,6 +49,14 @@ fn sock() -> PathBuf {
     PathBuf::from(dir).join(if crate::is_private() { "rembrowser-private.sock" } else { "rembrowser.sock" })
 }
 
+/// The socket's folder is ours alone: owned by this user, no group/other access.
+/// Under XDG_RUNTIME_DIR that is given; the /tmp fallback is only safe if we made it.
+fn dir_is_private(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|m| m.is_dir() && m.uid() == unsafe { libc::getuid() } && m.mode() & 0o077 == 0)
+}
+
 /// What became of a request handed to the running rembrowser.
 pub enum Forwarded {
     /// It took it (this process exits).
@@ -60,6 +68,10 @@ pub enum Forwarded {
 
 /// Give `req` to a running rembrowser, which answers "ok" to what it understood.
 pub fn forward(req: &Req) -> Forwarded {
+    // Never hand a URL to a socket in a folder somebody else could own.
+    if !sock().parent().is_some_and(dir_is_private) {
+        return Forwarded::NoInstance;
+    }
     let Ok(mut s) = UnixStream::connect(sock()) else {
         return Forwarded::NoInstance;
     };
@@ -93,7 +105,12 @@ pub fn listen() {
     // Nobody answered forward(): whatever socket file is there is stale.
     let _ = std::fs::remove_file(&path);
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        if !dir_is_private(dir) {
+            eprintln!("rembrowser: {} is not private to you (single-instance off)", dir.display());
+            return;
+        }
     }
     let Ok(listener) = UnixListener::bind(&path) else {
         eprintln!(

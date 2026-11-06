@@ -228,6 +228,30 @@ wrap_download_handler! {
     }
 }
 
+/// Types that run something when opened from a file manager or `xdg-open`.
+const RUNNABLE: &[&str] = &["desktop", "sh", "bash", "appimage", "jar", "run", "bat", "cmd", "scr", "ps1", "vbs", "js"];
+
+/// The server's suggested name made safe to write: no folders, no leading `.` (hidden
+/// file) or `-` (looks like an option), no control characters, and a runnable type gets
+/// `.download` added so it is not one click from running.
+fn safe_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base.chars().map(|c| if c.is_control() { '_' } else { c }).collect();
+    let cleaned = cleaned.trim_start_matches(['.', '-', ' ']).trim_end();
+    if cleaned.is_empty() {
+        return "download".into();
+    }
+    let ext = std::path::Path::new(cleaned)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if RUNNABLE.contains(&ext.as_str()) {
+        format!("{cleaned}.download")
+    } else {
+        cleaned.to_string()
+    }
+}
+
 /// ~/Downloads/<name>, never overwriting: "file (1).pdf", "file (2).pdf", ...
 fn download_path(name: &str) -> std::path::PathBuf {
     let dir = commands::opt("download-path")
@@ -236,15 +260,8 @@ fn download_path(name: &str) -> std::path::PathBuf {
             std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Downloads")
         });
     let _ = std::fs::create_dir_all(&dir);
-    // Strip path separators a hostile server could put in the suggested name.
-    let name = match name
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|n| !n.is_empty() && *n != "..")
-    {
-        Some(n) => n,
-        None => "download",
-    };
+    let name = safe_name(name);
+    let name = name.as_str();
     let p = std::path::Path::new(name);
     let (stem, ext) = (
         p.file_stem().map_or(name.into(), |s| s.to_string_lossy()),
@@ -263,7 +280,21 @@ fn download_path(name: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{download_path, log_line, parse_log};
+    use super::{download_path, log_line, parse_log, safe_name};
+
+    #[test]
+    fn safe_name_cases() {
+        assert_eq!(safe_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_name(".."), "download");
+        assert_eq!(safe_name(""), "download");
+        assert_eq!(safe_name(".bashrc"), "bashrc");
+        assert_eq!(safe_name("-rf"), "rf");
+        assert_eq!(safe_name("evil.desktop"), "evil.desktop.download");
+        assert_eq!(safe_name("x.AppImage"), "x.AppImage.download");
+        assert_eq!(safe_name("a\nb.pdf"), "a_b.pdf");
+        assert_eq!(safe_name("report.pdf"), "report.pdf");
+        assert_eq!(safe_name("C:\\tmp\\run.sh"), "run.sh.download");
+    }
 
     #[test]
     fn download_history_round_trips() {

@@ -2,7 +2,7 @@
 // no-op after the first run), so commands never depend on load timing.
 // Replies go to Rust as console messages: "\x01rem\t<type>\t<field>...".
 window.__rem ??= (() => {
-  const send = (...f) => console.debug('\x01rem\t' + f.map((x) => String(x ?? '').replace(/[\t\n]/g, ' ')).join('\t'));
+  const send = (...f) => console.debug('\x01rem:__NONCE__\t' + f.map((x) => String(x ?? '').replace(/[\t\n]/g, ' ')).join('\t'));
 
   // ── focus → insert-mode indicator ─────────────────────────────
   const deepActive = () => {
@@ -19,6 +19,15 @@ window.__rem ??= (() => {
   addEventListener('focusout', () => setTimeout(report), true);
   // A real click: ends the "stay in normal mode" that Esc started (see vim.rs).
   addEventListener('pointerdown', (e) => { if (e.isTrusted) send('user'); }, true);
+
+  // ── keep-awake: tell Rust when this tab must not be put to sleep ──
+  // Sound playing, or text the user typed. ponytail: a video in an iframe and
+  // WebAudio-only sound are not seen here; add if a site gets slept while playing.
+  let keep = 0, dirty = false;
+  const playing = () => [...document.querySelectorAll('video,audio')].some((m) => !m.paused && !m.ended && !m.muted && m.volume > 0 && m.readyState > 2);
+  const check = () => { const k = (dirty || playing()) ? 1 : 0; if (k !== keep) { keep = k; send('keep', k); } };
+  for (const t of ['play', 'playing', 'pause', 'ended', 'emptied', 'volumechange']) addEventListener(t, () => setTimeout(check), true);
+  addEventListener('input', (e) => { if (e.isTrusted) { dirty = true; check(); } }, true);
 
   // ── scrolling: the element the user is looking at, not always <html> ──
   const canScroll = (el, axis) => {

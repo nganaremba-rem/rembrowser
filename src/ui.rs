@@ -791,7 +791,7 @@ fn short(title: &str, max: usize) -> String {
 /// Rebuild a window's tab bar: per tab a clickable label and a close button (always
 /// there on the active tab, on the others only while the mouse is over the tab).
 /// ponytail: full rebuild per change; diff the labels if hundreds of tabs ever lag.
-pub fn set_tabs(win: u32, titles: &[String], active: usize) {
+pub fn set_tabs(win: u32, titles: &[String], icons: &[Option<Image>], active: usize) {
     let Some((bar, shown, width)) = with_chrome(win, |c| {
         (
             c.tabbar.clone(),
@@ -805,7 +805,9 @@ pub fn set_tabs(win: u32, titles: &[String], active: usize) {
         return;
     }
     // Titles shrink so every tab stays reachable (~8px a character, 6 for " 1 " + "× ").
-    let room = (width - 12) / titles.len().max(1) as i32 / 8 - 6;
+    // A favicon takes about two characters of room.
+    let icon_w = if icons.iter().any(Option::is_some) { 2 } else { 0 };
+    let room = (width - 12) / titles.len().max(1) as i32 / 8 - 6 - icon_w;
     let room = room.clamp(3, TAB_TITLE as i32) as usize;
     bar.remove_all_child_views();
     for (i, t) in titles.iter().enumerate() {
@@ -828,6 +830,11 @@ pub fn set_tabs(win: u32, titles: &[String], active: usize) {
             Press::Tab(win, i),
             (!on).then(|| (x.clone(), bg)),
         );
+        if let Some(Some(img)) = icons.get(i) {
+            for s in [ButtonState::NORMAL, ButtonState::HOVERED, ButtonState::PRESSED, ButtonState::DISABLED] {
+                l.set_image(s, Some(&mut img.clone()));
+            }
+        }
         l.set_tooltip_text(Some(&title.into()));
         x.set_tooltip_text(Some(&"Close tab".into()));
         for b in [&l, &x] {

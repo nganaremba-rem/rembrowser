@@ -212,7 +212,7 @@ wrap_window_delegate! {
             tabs::set_app_focus(None);
             APPS.with_borrow_mut(|a| a.retain(|(x, ..)| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));
             // Last window of any kind gone: quit.
-            if is_empty() && tabs::window().is_none() {
+            if is_empty() && tabs::window().is_none() && tabs::quit_when_empty() {
                 quit_message_loop();
             }
         }

@@ -16,6 +16,31 @@ const CHROME_APP_ID: &str = "rembrowser-chrome";
 pub const BG: u32 = 0xFF1E_1E2E;
 const PAGE_JS: &str = include_str!("page.js");
 
+/// Secret in every page.js message prefix (`\x01rem:<nonce>\t`). A page cannot read it:
+/// page.js is injected at load start, before the page's own scripts, and keeps its
+/// `send` in a closure. Without it a page could forge hint-pick / paste / focus.
+/// ponytail: a page that hooks console.debug before our inline snippets (pip, copy,
+/// paste) could capture it; move those into page.js if that ever matters.
+pub fn nonce() -> &'static str {
+    static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    N.get_or_init(|| {
+        use std::io::Read;
+        let mut b = [0u8; 16];
+        let ok = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_ok();
+        // No /dev/urandom is not a real case on Linux; fall back to something unguessable enough.
+        if !ok {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            b = (t ^ u128::from(std::process::id())).to_le_bytes();
+        }
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    })
+}
+
+/// page.js with this process's nonce filled in.
+pub fn page_js() -> String {
+    PAGE_JS.replace("__NONCE__", nonce())
+}
+
 /// A browser window and its tabs.
 struct Win {
     id: u32,
@@ -40,6 +65,8 @@ thread_local! {
     /// URLs of closed tabs, for `u` / `U`.
     static CLOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static FAVICONS: RefCell<std::collections::HashMap<i32, String>> = RefCell::new(std::collections::HashMap::new());
+    /// Browser id -> when its renderer last died (see on_render_process_terminated).
+    static LAST_CRASH: RefCell<std::collections::HashMap<i32, std::time::Instant>> = RefCell::new(std::collections::HashMap::new());
     /// The web-app window with keyboard focus (None = a browser window).
     static APP_FOCUS: RefCell<Option<BrowserView>> = const { RefCell::new(None) };
     /// Open Chrome-style windows (DevTools, chrome://settings, ...): the last browser
@@ -51,6 +78,119 @@ thread_local! {
     static CLOSING: Cell<bool> = const { Cell::new(false) };
     /// The hidden window extensions see as "current" exists (see ensure_extension_anchor).
     static ANCHOR: Cell<bool> = const { Cell::new(false) };
+    /// Sleeping tabs: placeholder view id -> (url, title). See sleep_idle.
+    static ASLEEP: RefCell<std::collections::HashMap<i32, (String, String)>> = RefCell::new(std::collections::HashMap::new());
+    /// Browser ids whose page asked not to be slept (sound playing / text typed).
+    static KEEP: RefCell<std::collections::HashSet<i32>> = RefCell::new(std::collections::HashSet::new());
+    /// View id -> since when this tab has been hidden.
+    static HIDDEN: RefCell<std::collections::HashMap<i32, std::time::Instant>> = RefCell::new(std::collections::HashMap::new());
+    /// Decoded favicon per browser id (drawn in the tab), and for sleeping tabs per
+    /// placeholder view id.
+    static FAV_IMG: RefCell<std::collections::HashMap<i32, Image>> = RefCell::new(std::collections::HashMap::new());
+    static SLEEP_ICON: RefCell<std::collections::HashMap<i32, Image>> = RefCell::new(std::collections::HashMap::new());
+    static NEXT_SLEEP_ID: Cell<i32> = const { Cell::new(1_000_000) };
+    static SWEEPING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A sleeping tab's real (url, title); None for a live tab.
+fn asleep(bv: &BrowserView) -> Option<(String, String)> {
+    let id = View::from(bv).id();
+    ASLEEP.with_borrow(|m| m.get(&id).cloned())
+}
+
+/// Selecting a sleeping tab loads its page again.
+fn wake(bv: &BrowserView) {
+    let id = View::from(bv).id();
+    SLEEP_ICON.with_borrow_mut(|m| m.remove(&id));
+    if let Some((url, _)) = ASLEEP.with_borrow_mut(|m| m.remove(&id)) {
+        if let Some(f) = bv.browser().and_then(|b| b.main_frame()) {
+            f.load_url(Some(&url.as_str().into()));
+        }
+    }
+}
+
+/// Every minute: a tab hidden for `sleep-after` minutes (default 10, 0 = never) gives
+/// its renderer back. REMBROWSER_SLEEP_SECS overrides the limit in seconds (tests).
+fn sleep_sweep() {
+    let secs = std::env::var("REMBROWSER_SLEEP_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(commands::opt_num("sleep-after", 10).max(0) as u64 * 60);
+    if secs > 0 {
+        sleep_idle(std::time::Duration::from_secs(secs));
+    }
+    ui::run_on_ui(sweep_every(), sleep_sweep);
+}
+
+fn sweep_every() -> i64 {
+    if std::env::var_os("REMBROWSER_SLEEP_SECS").is_some() { 2_000 } else { 60_000 }
+}
+
+fn sleep_idle(limit: std::time::Duration) {
+    let now = std::time::Instant::now();
+    for win in win_ids() {
+        let tabs: Vec<(BrowserView, bool)> = with_win(win, |w| {
+            w.tabs.iter().cloned().enumerate().map(|(i, bv)| (bv, i == w.active)).collect()
+        })
+        .unwrap_or_default();
+        for (bv, active) in tabs {
+            // Keyed by browser id: live tabs all share view id 0.
+            let Some(b) = bv.browser() else { continue };
+            let bid = b.identifier();
+            if active {
+                HIDDEN.with_borrow_mut(|h| h.remove(&bid));
+                continue;
+            }
+            if asleep(&bv).is_some() {
+                continue;
+            }
+            let since = HIDDEN.with_borrow_mut(|h| *h.entry(bid).or_insert(now));
+            let kept = KEEP.with_borrow(|k| k.contains(&bid));
+            if now.duration_since(since) >= limit && !kept && b.is_loading() == 0 && url_of(&bv).starts_with("http") {
+                sleep_tab(win, &bv);
+            }
+        }
+    }
+}
+
+/// Swap the tab's view for a blank one and close the real browser: its renderer (the
+/// RAM) goes away, the tab stays in the bar with the old title until selected.
+fn sleep_tab(win: u32, old: &BrowserView) {
+    let (url, title) = (url_of(old), title_of(old));
+    let Some(fresh) = new_view("about:blank") else { return };
+    let sid = NEXT_SLEEP_ID.replace(NEXT_SLEEP_ID.get() + 1);
+    let mut view = View::from(&fresh);
+    view.set_id(sid);
+    view.set_visible(0);
+    let Some(content) = with_win(win, |w| w.content.clone()) else { return };
+    content.add_child_view(Some(&mut view));
+    let swapped = with_win(win, |w| {
+        let i = w.tabs.iter().position(|b| View::from(b).is_same(Some(&mut View::from(old))) != 0)?;
+        (i != w.active).then(|| w.tabs[i] = fresh.clone())
+    })
+    .flatten();
+    if swapped.is_none() {
+        content.remove_child_view(Some(&mut View::from(&fresh)));
+        return;
+    }
+    ASLEEP.with_borrow_mut(|m| m.insert(sid, (url, title)));
+    if let Some(img) = icon_of(old) {
+        SLEEP_ICON.with_borrow_mut(|m| m.insert(sid, img));
+    }
+    let host = old.browser().and_then(|b| {
+        let id = b.identifier();
+        HIDDEN.with_borrow_mut(|h| h.remove(&id));
+        FAVICONS.with_borrow_mut(|m| m.remove(&id));
+        FAV_IMG.with_borrow_mut(|m| m.remove(&id));
+        KEEP.with_borrow_mut(|k| k.remove(&id));
+        b.host()
+    });
+    // No longer in w.tabs: on_tab_closed ignores this browser, so just release it.
+    content.remove_child_view(Some(&mut View::from(old)));
+    if let Some(h) = host {
+        h.close_browser(1);
+    }
+    refresh_right(win);
 }
 
 /// cef-rs bug (152.3): when an out-struct is written back to C, an *owned* CefString
@@ -88,6 +228,9 @@ pub fn cur() -> u32 {
 pub fn create_window(url: String) {
     CLOSING.set(false);
     ensure_extension_anchor();
+    if !SWEEPING.replace(true) {
+        ui::run_on_ui(sweep_every(), sleep_sweep);
+    }
     let id = NEXT_WIN.replace(NEXT_WIN.get() + 1);
     let mut delegate = RemWindowDelegate::new(id, url);
     window_create_top_level(Some(&mut delegate));
@@ -280,6 +423,7 @@ pub fn select_in(win: u32, i: usize) {
         w.set_title(Some(&title_of(&bv).as_str().into()));
     }
     ui::set_url_for(Owner::Win(win), &url_of(&bv));
+    wake(&bv);
     if win == cur() && switched {
         vim::new_page();
     } else if win == cur() {
@@ -350,22 +494,45 @@ fn close_all() {
     win_ids().into_iter().for_each(close_window);
 }
 
+thread_local! {
+    /// `:qa` / Ctrl-q was used: really quit, even with `keep-running` on.
+    static QUITTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Nothing left open (no windows, no web apps): end the process? Not when `keep-running`
+/// is on (the next `rembrowser URL` then opens a window at once, no engine start), unless
+/// the user asked to quit (`:qa`) or this is a private window (it must leave nothing).
+pub fn quit_when_empty() -> bool {
+    QUITTING.get() || crate::is_private() || !commands::opt_bool("keep-running", false)
+}
+
 /// `:qa` / Ctrl-q: close every browser window, which quits unless web apps are
 /// open. Asks first (confirm-quit); closing a window through the window manager
 /// does not.
 pub fn quit_all() {
     let (wins, tabs) = WINS.with_borrow(|w| (w.len(), w.iter().map(|w| w.tabs.len()).sum::<usize>()));
     if tabs == 0 || !commands::opt_bool("confirm-quit", true) {
-        close_all();
+        quit_now();
         return;
     }
     let s = |n: usize| if n == 1 { "" } else { "s" };
     let text = format!("Quit rembrowser? ({wins} window{}, {tabs} tab{})", s(wins), s(tabs));
     popup::confirm(&text, "Quit", |yes| {
         if yes {
-            close_all();
+            quit_now();
         }
     });
+}
+
+/// Close every browser window and quit. With no window open (a `keep-running` browser
+/// waiting in the background) no "window destroyed" event would come, so quit directly.
+fn quit_now() {
+    QUITTING.set(true);
+    if win_ids().is_empty() && apps::is_empty() {
+        quit_message_loop();
+    } else {
+        close_all();
+    }
 }
 
 pub fn reopen(new_tab: bool) {
@@ -401,6 +568,9 @@ pub fn set_fullscreen(on: bool) {
 }
 
 fn url_of(bv: &BrowserView) -> String {
+    if let Some((url, _)) = asleep(bv) {
+        return url;
+    }
     bv.browser()
         .and_then(|b| b.main_frame())
         .map(|f| CefString::from(&f.url()).to_string())
@@ -408,6 +578,9 @@ fn url_of(bv: &BrowserView) -> String {
 }
 
 fn title_of(bv: &BrowserView) -> String {
+    if let Some((_, title)) = asleep(bv) {
+        return format!("💤 {title}");
+    }
     bv.browser()
         .and_then(|b| b.host()?.visible_navigation_entry())
         .map(|e| CefString::from(&e.title()).to_string())
@@ -453,7 +626,7 @@ pub fn js_in(id: i32, code: &str) {
         .or_else(|| apps::browser(id));
     if let Some(f) = b.and_then(|b| b.main_frame()) {
         f.execute_java_script(
-            Some(&format!("{PAGE_JS};{code}").as_str().into()),
+            Some(&format!("{};{code}", page_js()).as_str().into()),
             Some(&"rembrowser://page.js".into()),
             0,
         );
@@ -480,11 +653,12 @@ pub fn js_gesture(code: &str) {
 /// `gp` / `:pip`: picture-in-picture for the page's main video (toggle).
 pub fn pip() {
     js_gesture(
-        "(() => { if (document.pictureInPictureElement) return document.exitPictureInPicture();\
+        &"(() => { if (document.pictureInPictureElement) return document.exitPictureInPicture();\
          const vs = [...document.querySelectorAll('video')].filter((v) => v.readyState > 0)\
            .sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight);\
          const v = vs.find((v) => !v.paused) ?? vs[0];\
-         v ? v.requestPictureInPicture() : console.debug('\\x01rem\\tpip-none'); })()",
+         v ? v.requestPictureInPicture() : console.debug('\\x01rem:__NONCE__\\tpip-none'); })()"
+            .replace("__NONCE__", nonce()),
     );
 }
 
@@ -552,7 +726,7 @@ pub fn js(code: &str) {
     with_active(|b| {
         if let Some(f) = b.main_frame() {
             f.execute_java_script(
-                Some(&format!("{PAGE_JS};{code}").as_str().into()),
+                Some(&format!("{};{code}", page_js()).as_str().into()),
                 Some(&"rembrowser://page.js".into()),
                 0,
             );
@@ -606,7 +780,14 @@ pub fn set_zoom(level: f64) {
         let path = zoom_file();
         let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
         let _ = std::fs::write(path, text);
+        ZOOM.with_borrow_mut(|c| *c = Some(z));
     }
+}
+
+thread_local! {
+    /// The per-site zoom file, read once. ponytail: edits made to the file while the
+    /// browser runs are not seen until restart; stat the mtime if that ever matters.
+    static ZOOM: RefCell<Option<Vec<(String, f64)>>> = const { RefCell::new(None) };
 }
 
 fn zoom_file() -> std::path::PathBuf {
@@ -614,14 +795,19 @@ fn zoom_file() -> std::path::PathBuf {
 }
 
 fn zoom_levels() -> Vec<(String, f64)> {
-    std::fs::read_to_string(zoom_file())
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let (h, z) = l.split_once('\t')?;
-            Some((h.to_string(), z.parse().ok()?))
+    ZOOM.with_borrow_mut(|c| {
+        c.get_or_insert_with(|| {
+            std::fs::read_to_string(zoom_file())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| {
+                    let (h, z) = l.split_once('\t')?;
+                    Some((h.to_string(), z.parse().ok()?))
+                })
+                .collect()
         })
-        .collect()
+        .clone()
+    })
 }
 
 fn host_of(url: &str) -> String {
@@ -670,12 +856,23 @@ pub fn stop_find() {
     });
 }
 
+/// The favicon to draw in this tab (a sleeping tab keeps its own).
+fn icon_of(bv: &BrowserView) -> Option<Image> {
+    if asleep(bv).is_some() {
+        let id = View::from(bv).id();
+        return SLEEP_ICON.with_borrow(|m| m.get(&id).cloned());
+    }
+    let id = bv.browser()?.identifier();
+    FAV_IMG.with_borrow(|m| m.get(&id).cloned())
+}
+
 pub fn refresh_tabbar(win: u32) {
     let Some((tabs, active)) = with_win(win, |w| (w.tabs.clone(), w.active)) else {
         return;
     };
     let titles: Vec<String> = tabs.iter().map(title_of).collect();
-    ui::set_tabs(win, &titles, active);
+    let icons: Vec<Option<Image>> = tabs.iter().map(icon_of).collect();
+    ui::set_tabs(win, &titles, &icons, active);
 }
 
 pub fn refresh_tabbars() {
@@ -739,8 +936,24 @@ fn on_tab_closed(browser: &mut Browser) {
     };
     let url = url_of(&removed);
     if !url.is_empty() && url != "about:blank" {
-        CLOSED.with_borrow_mut(|c| c.push(url));
+        // Capped: `u` only ever needs the last few.
+        CLOSED.with_borrow_mut(|c| {
+            c.push(url);
+            if c.len() > 100 {
+                c.remove(0);
+            }
+        });
     }
+    // Per-tab state keyed by browser id must not outlive the tab.
+    let vid = View::from(&removed).id();
+    ASLEEP.with_borrow_mut(|m| m.remove(&vid));
+    SLEEP_ICON.with_borrow_mut(|m| m.remove(&vid));
+    let id = browser.identifier();
+    FAV_IMG.with_borrow_mut(|m| m.remove(&id));
+    HIDDEN.with_borrow_mut(|h| h.remove(&id));
+    KEEP.with_borrow_mut(|k| k.remove(&id));
+    FAVICONS.with_borrow_mut(|m| m.remove(&id));
+    LAST_CRASH.with_borrow_mut(|m| m.remove(&id));
     content.remove_child_view(Some(&mut View::from(&removed)));
     if n == 0 {
         // Last tab gone: close the window (the last window quits).
@@ -842,6 +1055,7 @@ wrap_window_delegate! {
             if let Some(bv) = new_view(&self.url) {
                 add(id, bv, false);
             }
+            crate::mark("window created, shown");
             window.show();
             // Fallback for slow first pages; normally the first load_end builds it.
             ui::run_on_ui(1000, move || build_bar(id));
@@ -859,7 +1073,7 @@ wrap_window_delegate! {
             ui::forget_window(self.id);
             popup::forget(Owner::Win(self.id));
             // Web apps keep running on their own; quit with the last window.
-            if cur() == 0 && apps::is_empty() {
+            if cur() == 0 && apps::is_empty() && quit_when_empty() {
                 quit_message_loop();
             }
         }
@@ -1018,8 +1232,21 @@ wrap_display_handler! {
             let (Some(b), Some(list)) = (browser, icon_urls) else { return };
             let urls: Vec<String> = std::mem::take(list).into_iter().map(|u| u.to_string()).collect();
             let best = urls.iter().find(|u| u.ends_with(".png") || u.ends_with(".svg")).or(urls.first()).cloned();
-            if let Some(u) = best {
-                FAVICONS.with_borrow_mut(|f| f.insert(b.identifier(), u));
+            let id = b.identifier();
+            let Some(u) = best else {
+                // A page with no icon: drop the old one. (A reload does not report again, so
+                // this is the only place an icon is cleared.)
+                FAV_IMG.with_borrow_mut(|m| m.remove(&id));
+                if let Some(win) = win_of_browser(id) {
+                    refresh_tabbar(win);
+                }
+                return;
+            };
+            FAVICONS.with_borrow_mut(|f| f.insert(id, u.clone()));
+            // Decoded 16 px copy for the tab (CEF fetches it itself, favicon cache, no cookies).
+            if let Some(h) = b.host() {
+                let mut cb = FavCallback::new(id);
+                h.download_image(Some(&u.as_str().into()), 1, 16, 0, Some(&mut cb));
             }
         }
 
@@ -1052,12 +1279,21 @@ wrap_display_handler! {
             _line: i32,
         ) -> i32 {
             let msg = message.map(|m| m.to_string()).unwrap_or_default();
-            let Some(body) = msg.strip_prefix("\u{1}rem\t") else { return 0 };
-            // Homescreen search box: only from the homescreen itself.
-            if let Some(text) = body.strip_prefix("home-open\t") {
+            // Homescreen search box (a static page of ours, no nonce): only from the homescreen itself.
+            if let Some(text) = msg.strip_prefix("\u{1}rem\thome-open\t") {
                 let from_home = browser.as_ref().and_then(|b| b.main_frame()).is_some_and(|f| home::is_home(&CefString::from(&f.url()).to_string()));
                 if from_home {
                     commands::open(text, false);
+                }
+                return 1;
+            }
+            // Everything else must carry this process's nonce: a page can't forge it.
+            let Some(body) = msg.strip_prefix(&format!("\u{1}rem:{}\t", nonce())) else { return 0 };
+            // Tab sleep: this page is playing sound / has typed text, keep it awake.
+            if let Some(v) = body.strip_prefix("keep\t") {
+                if let Some(b) = browser.as_ref() {
+                    let id = b.identifier();
+                    KEEP.with_borrow_mut(|k| if v == "1" { k.insert(id); } else { k.remove(&id); });
                 }
                 return 1;
             }
@@ -1080,6 +1316,34 @@ wrap_display_handler! {
     }
 }
 
+fn win_of_browser(id: i32) -> Option<u32> {
+    WINS.with_borrow(|ws| {
+        ws.iter()
+            .find(|w| w.tabs.iter().any(|bv| bv.browser().is_some_and(|b| b.identifier() == id)))
+            .map(|w| w.id)
+    })
+}
+
+wrap_download_image_callback! {
+    struct FavCallback {
+        id: i32,
+    }
+
+    impl DownloadImageCallback {
+        fn on_download_image_finished(&self, _url: Option<&CefString>, status: i32, image: Option<&mut Image>) {
+            // Tab may be gone by now; then there is no window and nothing to keep.
+            let Some(win) = win_of_browser(self.id) else { return };
+            match image {
+                Some(img) if (200..300).contains(&status) && img.is_empty() == 0 => {
+                    FAV_IMG.with_borrow_mut(|m| m.insert(self.id, img.clone()));
+                }
+                _ => return,
+            }
+            refresh_tabbar(win);
+        }
+    }
+}
+
 wrap_load_handler! {
     struct RemLoadHandler;
 
@@ -1088,7 +1352,12 @@ wrap_load_handler! {
         // class/id names for the generic rules.
         fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
+            crate::mark("load start");
             let url = CefString::from(&f.url()).to_string();
+            // A new page starts with no keep-awake claim (its page.js reports afresh).
+            if let Some(b) = browser.as_ref() {
+                KEEP.with_borrow_mut(|k| k.remove(&b.identifier()));
+            }
             // A new page: a field it focuses by itself means insert mode again.
             let mut browser = browser;
             if browser.as_deref_mut().is_some_and(is_current) {
@@ -1103,7 +1372,7 @@ wrap_load_handler! {
                 return;
             }
             let (css, generic) = adblock::page_css(&url);
-            let js = format!("{PAGE_JS};__rem.cosmetic({},{generic})", popup::js_str(&css));
+            let js = format!("{};__rem.cosmetic({},{generic})", page_js(), popup::js_str(&css));
             f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://page.js".into()), 0);
             if let Some(js) = userscripts::for_url(&url, userscripts::RunAt::Start) {
                 f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://userscripts".into()), 0);
@@ -1120,6 +1389,7 @@ wrap_load_handler! {
 
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
+            crate::mark("load end");
             let mut browser = browser;
             if let Some(win) = browser.as_deref_mut().and_then(shown_in) {
                 popup::refocus(Owner::Win(win));
@@ -1132,7 +1402,7 @@ wrap_load_handler! {
                 }
             }
             // Install page.js early so focus → INSERT shows without a key press.
-            f.execute_java_script(Some(&PAGE_JS.into()), Some(&"rembrowser://page.js".into()), 0);
+            f.execute_java_script(Some(&page_js().as_str().into()), Some(&"rembrowser://page.js".into()), 0);
             if let Some(js) = userscripts::for_url(&CefString::from(&f.url()).to_string(), userscripts::RunAt::End) {
                 f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://userscripts".into()), 0);
             }
@@ -1268,6 +1538,33 @@ wrap_request_handler! {
             }
             open(&url, background);
             1
+        }
+
+        // The page's renderer died (crash, out of memory, killed). Without this the tab
+        // stays blank and nothing says why. Log it and reload, at most once per 10 s per
+        // tab so a page that crashes while loading cannot loop.
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: i32,
+            _error_string: Option<&CefString>,
+        ) {
+            let Some(b) = browser else { return };
+            let id = b.identifier();
+            let url = b.main_frame().map(|f| CefString::from(&f.url()).to_string()).unwrap_or_default();
+            eprintln!("rembrowser: renderer gone (status {status:?}, code {error_code}) tab {id}: {url}");
+            let again = LAST_CRASH.with_borrow_mut(|m| {
+                let now = std::time::Instant::now();
+                let recent = m.get(&id).is_some_and(|t| now.duration_since(*t).as_secs() < 10);
+                m.insert(id, now);
+                !recent
+            });
+            if again {
+                b.reload();
+            } else {
+                ui::toast("this page keeps crashing: not reloading", true);
+            }
         }
 
         fn resource_request_handler(

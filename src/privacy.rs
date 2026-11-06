@@ -9,6 +9,8 @@ const SWITCHES: &[&str] = &[
     // Distro CEF shows Chromium's first-run Terms dialog and blocks the window.
     "no-first-run",
     "no-default-browser-check",
+    // Shader cache on disk: rebuilt cheaply, grows without a bound.
+    "disable-gpu-shader-disk-cache",
     // Variations seed, component updater, CRLSet, etc. Widevine still loads via the hint file.
     "disable-background-networking",
     "disable-component-update",
@@ -48,6 +50,11 @@ const DISABLED_FEATURES: &[&str] = &[
     "AdInterestGroupAPI",
     "SharedStorageAPI",
     "PrivateAggregationApi",
+    // Memory: whole pages kept alive for back/forward, speculative prerendered pages,
+    // and a spare renderer started ahead of time. All trade RAM for speed we don't need.
+    "BackForwardCache",
+    "Prerender2",
+    "SpareRendererForSitePerProcess",
     // Gemini / AI UI.
     "Glic",
     "LensOverlay",
@@ -85,6 +92,10 @@ pub fn apply_switches(cl: &mut CommandLine) {
     set("disable-features", &features);
     for s in SWITCHES {
         cl.append_switch(Some(&(*s).into()));
+    }
+    // Disk cache was unbounded (1.2 GB seen); 300 MB is plenty for one user.
+    if cl.has_switch(Some(&"disk-cache-size".into())) == 0 {
+        set("disk-cache-size", "314572800");
     }
     // Chrome extensions are opt-in (`extensions: true`): off, none is loaded. On,
     // Chromium gets the folders `:ext-install` unpacked (plus any the user passed).
@@ -163,5 +174,36 @@ pub fn apply_prefs() {
         if ctx.set_preference(Some(&(*name).into()), Some(&mut v), Some(&mut err)) == 0 {
             eprintln!("rembrowser: pref {name}: {err}");
         }
+    }
+    allow_payment_cookies(&ctx);
+}
+
+/// Third-party cookies are blocked, but card checkouts and 3-D Secure frames often need
+/// their own provider's cookie from inside the shop's page. These hosts (and any in the
+/// config's `cookie-allow`, space separated) may set cookies as a frame; nothing else.
+/// ponytail: the default list is from memory of common providers, not a measured
+/// breakage list; add hosts in config when a checkout loops.
+const PAYMENT_HOSTS: &[&str] = &[
+    "js.stripe.com", "hooks.stripe.com", "m.stripe.network", "checkout.stripe.com",
+    "api.razorpay.com", "checkout.razorpay.com",
+    "www.paypal.com", "www.paypalobjects.com",
+    "pay.google.com", "authentication.cardinalcommerce.com", "centinelapi.cardinalcommerce.com",
+];
+
+fn allow_payment_cookies(ctx: &RequestContext) {
+    let extra = crate::commands::opt("cookie-allow").unwrap_or_default();
+    let hosts = PAYMENT_HOSTS.iter().copied().chain(extra.split_whitespace());
+    for host in hosts {
+        // Only plain host names: this goes into a URL pattern.
+        if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            continue;
+        }
+        let scheme = if host.starts_with("127.") || host == "localhost" { "http" } else { "https" };
+        ctx.set_content_setting(
+            Some(&format!("{scheme}://{host}/").as_str().into()),
+            Some(&"".into()),
+            ContentSettingTypes::COOKIES,
+            ContentSettingValues::ALLOW,
+        );
     }
 }
