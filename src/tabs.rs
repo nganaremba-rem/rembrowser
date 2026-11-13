@@ -42,12 +42,34 @@ pub fn page_js() -> &'static str {
     JS.get_or_init(|| PAGE_JS.replace("__NONCE__", nonce()))
 }
 
+/// A tab: a page with its browser, or a sleeping one. A sleeping tab is only text (no
+/// browser, no renderer process: ~10 MB and a process saved each) until it is selected.
+/// The active tab of a window is always Live.
+#[derive(Clone)]
+enum Tab {
+    Live(BrowserView),
+    Asleep { url: String, title: String, icon: Option<Image> },
+}
+
+impl Tab {
+    fn view(&self) -> Option<&BrowserView> {
+        match self {
+            Tab::Live(bv) => Some(bv),
+            Tab::Asleep { .. } => None,
+        }
+    }
+
+    fn browser(&self) -> Option<Browser> {
+        self.view()?.browser()
+    }
+}
+
 /// A browser window and its tabs.
 struct Win {
     id: u32,
     window: Window,
     content: Panel,
-    tabs: Vec<BrowserView>,
+    tabs: Vec<Tab>,
     active: usize,
     /// Status bar right side: find count + load progress of the active tab.
     find: String,
@@ -83,36 +105,13 @@ thread_local! {
     static CLOSING: Cell<bool> = const { Cell::new(false) };
     /// The hidden window extensions see as "current" exists (see ensure_extension_anchor).
     static ANCHOR: Cell<bool> = const { Cell::new(false) };
-    /// Sleeping tabs: placeholder view id -> (url, title). See sleep_idle.
-    static ASLEEP: RefCell<std::collections::HashMap<i32, (String, String)>> = RefCell::new(std::collections::HashMap::new());
     /// Browser ids whose page asked not to be slept (sound playing / text typed).
     static KEEP: RefCell<std::collections::HashSet<i32>> = RefCell::new(std::collections::HashSet::new());
-    /// View id -> since when this tab has been hidden.
+    /// Browser id -> since when this tab has been hidden.
     static HIDDEN: RefCell<std::collections::HashMap<i32, std::time::Instant>> = RefCell::new(std::collections::HashMap::new());
-    /// Decoded favicon per browser id (drawn in the tab), and for sleeping tabs per
-    /// placeholder view id.
+    /// Decoded favicon per browser id (drawn in the tab).
     static FAV_IMG: RefCell<std::collections::HashMap<i32, Image>> = RefCell::new(std::collections::HashMap::new());
-    static SLEEP_ICON: RefCell<std::collections::HashMap<i32, Image>> = RefCell::new(std::collections::HashMap::new());
-    static NEXT_SLEEP_ID: Cell<i32> = const { Cell::new(1_000_000) };
     static SWEEPING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// A sleeping tab's real (url, title); None for a live tab.
-fn asleep(bv: &BrowserView) -> Option<(String, String)> {
-    let id = View::from(bv).id();
-    ASLEEP.with_borrow(|m| m.get(&id).cloned())
-}
-
-/// Selecting a sleeping tab loads its page again.
-fn wake(bv: &BrowserView) {
-    let _t = crate::span("tabs::wake");
-    let id = View::from(bv).id();
-    SLEEP_ICON.with_borrow_mut(|m| m.remove(&id));
-    if let Some((url, _)) = ASLEEP.with_borrow_mut(|m| m.remove(&id)) {
-        if let Some(f) = bv.browser().and_then(|b| b.main_frame()) {
-            f.load_url(Some(&url.as_str().into()));
-        }
-    }
 }
 
 /// Every minute: a tab hidden for `sleep-after` minutes (default 10, 0 = never) gives
@@ -135,11 +134,12 @@ fn sweep_every() -> i64 {
 fn sleep_idle(limit: std::time::Duration) {
     let now = std::time::Instant::now();
     for win in win_ids() {
-        let tabs: Vec<(BrowserView, bool)> = with_win(win, |w| {
-            w.tabs.iter().cloned().enumerate().map(|(i, bv)| (bv, i == w.active)).collect()
+        let tabs: Vec<(Tab, bool)> = with_win(win, |w| {
+            w.tabs.iter().cloned().enumerate().map(|(i, t)| (t, i == w.active)).collect()
         })
         .unwrap_or_default();
-        for (bv, active) in tabs {
+        for (tab, active) in tabs {
+            let Tab::Live(bv) = tab else { continue };
             // Keyed by browser id: live tabs all share view id 0.
             let Some(b) = bv.browser() else { continue };
             let bid = b.identifier();
@@ -147,42 +147,28 @@ fn sleep_idle(limit: std::time::Duration) {
                 HIDDEN.with_borrow_mut(|h| h.remove(&bid));
                 continue;
             }
-            if asleep(&bv).is_some() {
-                continue;
-            }
             let since = HIDDEN.with_borrow_mut(|h| *h.entry(bid).or_insert(now));
             let kept = KEEP.with_borrow(|k| k.contains(&bid));
-            if now.duration_since(since) >= limit && !kept && b.is_loading() == 0 && url_of(&bv).starts_with("http") {
+            if now.duration_since(since) >= limit && !kept && b.is_loading() == 0 && view_url(&bv).starts_with("http") {
                 sleep_tab(win, &bv);
             }
         }
     }
 }
 
-/// Swap the tab's view for a blank one and close the real browser: its renderer (the
-/// RAM) goes away, the tab stays in the bar with the old title until selected.
+/// Turn the tab into a sleeping one and close its browser: the renderer (the RAM) goes
+/// away, the tab stays in the bar with its title and icon until selected.
 fn sleep_tab(win: u32, old: &BrowserView) {
     let _t = crate::span("tabs::sleep_tab");
-    let (url, title) = (url_of(old), title_of(old));
-    let Some(fresh) = new_view("about:blank") else { return };
-    let sid = NEXT_SLEEP_ID.replace(NEXT_SLEEP_ID.get() + 1);
-    let mut view = View::from(&fresh);
-    view.set_id(sid);
-    view.set_visible(0);
+    let asleep = Tab::Asleep { url: view_url(old), title: view_title(old), icon: icon_of(&Tab::Live(old.clone())) };
     let Some(content) = with_win(win, |w| w.content.clone()) else { return };
-    content.add_child_view(Some(&mut view));
     let swapped = with_win(win, |w| {
-        let i = w.tabs.iter().position(|b| View::from(b).is_same(Some(&mut View::from(old))) != 0)?;
-        (i != w.active).then(|| w.tabs[i] = fresh.clone())
+        let i = w.tabs.iter().position(|t| t.view().is_some_and(|b| View::from(b).is_same(Some(&mut View::from(old))) != 0))?;
+        (i != w.active).then(|| w.tabs[i] = asleep)
     })
     .flatten();
     if swapped.is_none() {
-        content.remove_child_view(Some(&mut View::from(&fresh)));
         return;
-    }
-    ASLEEP.with_borrow_mut(|m| m.insert(sid, (url, title)));
-    if let Some(img) = icon_of(old) {
-        SLEEP_ICON.with_borrow_mut(|m| m.insert(sid, img));
     }
     let host = old.browser().and_then(|b| {
         let id = b.identifier();
@@ -254,7 +240,7 @@ pub fn window() -> Option<Window> {
 }
 
 fn active_of(win: u32) -> Option<BrowserView> {
-    with_win(win, |w| w.tabs.get(w.active).cloned()).flatten()
+    with_win(win, |w| w.tabs.get(w.active).and_then(|t| t.view().cloned())).flatten()
 }
 
 /// What vim keys act on: the focused web app's view, else the active tab.
@@ -388,7 +374,7 @@ fn add(win: u32, bv: BrowserView, background: bool) {
     view.set_visible(0);
     content.add_child_view(Some(&mut view));
     let Some(i) = with_win(win, |w| {
-        w.tabs.push(bv);
+        w.tabs.push(Tab::Live(bv));
         w.tabs.len() - 1
     }) else {
         return;
@@ -413,15 +399,27 @@ pub fn select_in(win: u32, i: usize) {
     let _t = crate::span("tabs::select_in");
     let picked = with_win(win, |w| {
         let i = i.min(w.tabs.len().saturating_sub(1));
-        let bv = w.tabs.get(i).cloned()?;
-        let old = w.tabs.get(w.active).cloned();
+        let tab = w.tabs.get(i).cloned()?;
+        let old = w.tabs.get(w.active).and_then(|t| t.view().cloned());
         let switched = i != w.active;
         w.active = i;
         w.find.clear();
-        Some((bv, old, switched))
+        Some((i, tab, old, switched, w.content.clone()))
     });
-    let Some((bv, old, switched)) = picked.flatten() else {
+    let Some((i, tab, old, switched, content)) = picked.flatten() else {
         return;
+    };
+    // A sleeping tab gets a browser again now, loading its page.
+    let bv = match tab {
+        Tab::Live(bv) => bv,
+        Tab::Asleep { url, .. } => {
+            let Some(bv) = new_view(&url) else { return };
+            let mut view = View::from(&bv);
+            view.set_visible(0);
+            content.add_child_view(Some(&mut view));
+            with_win(win, |w| w.tabs[i] = Tab::Live(bv.clone()));
+            bv
+        }
     };
     if switched {
         ui::reveal_tabs();
@@ -434,10 +432,9 @@ pub fn select_in(win: u32, i: usize) {
     // The loading bar follows the tab now shown.
     ui::load_state(win, bv.browser().is_some_and(|b| b.is_loading() != 0));
     if let Some(w) = window_of(win) {
-        w.set_title(Some(&title_of(&bv).as_str().into()));
+        w.set_title(Some(&view_title(&bv).as_str().into()));
     }
-    ui::set_url_for(Owner::Win(win), &url_of(&bv));
-    wake(&bv);
+    ui::set_url_for(Owner::Win(win), &view_url(&bv));
     if win == cur() && switched {
         vim::new_page();
     } else if win == cur() {
@@ -476,11 +473,16 @@ pub fn close_active_now() {
 /// Close tab `i` of a window. A window's last tab takes the window with it, and the
 /// last window the browser: that asks first (confirm-quit).
 pub fn close_tab(win: u32, i: usize) {
-    let found = with_win(win, |w| {
-        let host = w.tabs.get(i).and_then(|bv| bv.browser()?.host())?;
-        Some((host, w.tabs.len() == 1))
-    });
-    let Some((host, last)) = found.flatten() else {
+    let found = with_win(win, |w| Some((w.tabs.get(i)?.clone(), w.tabs.len() == 1)));
+    let Some((tab, last)) = found.flatten() else {
+        return;
+    };
+    // A sleeping tab has no browser to ask: it just leaves the bar. (It is never a
+    // window's last tab: the active tab is always awake.)
+    let Some(host) = tab.browser().and_then(|b| b.host()) else {
+        if matches!(tab, Tab::Asleep { .. }) {
+            remove_tab(win, i);
+        }
         return;
     };
     if !last || !commands::opt_bool("confirm-quit", true) {
@@ -499,6 +501,25 @@ pub fn close_tab(win: u32, i: usize) {
     });
 }
 
+/// A window is asked to close: its sleeping tabs have no browser that could object, so
+/// they leave now (kept in the `u` list). The saved session is not touched by this.
+/// ponytail: if a page's "leave site?" then cancels the close, those tabs are gone from
+/// the bar; `u` reopens them.
+fn drop_asleep(win: u32) {
+    let urls = with_win(win, |w| {
+        let live_before = w.tabs.iter().take(w.active).filter(|t| matches!(t, Tab::Live(_))).count();
+        let urls: Vec<String> = w.tabs.iter().filter(|t| matches!(t, Tab::Asleep { .. })).map(url_of).collect();
+        w.tabs.retain(|t| matches!(t, Tab::Live(_)));
+        w.active = live_before;
+        urls
+    })
+    .unwrap_or_default();
+    if !urls.is_empty() {
+        CLOSED.with_borrow_mut(|c| c.extend(urls));
+        refresh_tabbar(win);
+    }
+}
+
 pub fn close_window(id: u32) {
     if let Some(w) = window_of(id) {
         w.close();
@@ -515,14 +536,14 @@ thread_local! {
     static SESSION_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// A tab whose page is not loaded: blank view, the real url/title kept until selected
-/// (the same trick as tab sleep, so restoring 30 tabs costs the RAM of one).
-fn sleeping_view(url: &str) -> Option<BrowserView> {
-    let fresh = new_view("about:blank")?;
-    let sid = NEXT_SLEEP_ID.replace(NEXT_SLEEP_ID.get() + 1);
-    View::from(&fresh).set_id(sid);
-    ASLEEP.with_borrow_mut(|m| m.insert(sid, (url.to_string(), host_of(url))));
-    Some(fresh)
+/// A tab whose page is not loaded: only its URL until selected (the same state as tab
+/// sleep, so restoring 30 tabs costs the RAM of one).
+fn add_asleep(win: u32, url: &str) {
+    let host = host_of(url);
+    let tab = Tab::Asleep { url: url.to_string(), icon: cached_icon(&host), title: host };
+    with_win(win, |w| w.tabs.push(tab));
+    refresh_right(win);
+    session_dirty();
 }
 
 /// What is worth bringing back: real pages, not the homescreen or error pages.
@@ -656,28 +677,36 @@ pub fn set_fullscreen(on: bool) {
     }
 }
 
-fn url_of(bv: &BrowserView) -> String {
-    if let Some((url, _)) = asleep(bv) {
-        return url;
-    }
+fn view_url(bv: &BrowserView) -> String {
     bv.browser()
         .and_then(|b| b.main_frame())
         .map(|f| CefString::from(&f.url()).to_string())
         .unwrap_or_default()
 }
 
-fn title_of(bv: &BrowserView) -> String {
-    if let Some((_, title)) = asleep(bv) {
-        return format!("💤 {title}");
-    }
+fn view_title(bv: &BrowserView) -> String {
     bv.browser()
         .and_then(|b| b.host()?.visible_navigation_entry())
         .map(|e| CefString::from(&e.title()).to_string())
         .unwrap_or_default()
 }
 
+fn url_of(t: &Tab) -> String {
+    match t {
+        Tab::Live(bv) => view_url(bv),
+        Tab::Asleep { url, .. } => url.clone(),
+    }
+}
+
+fn title_of(t: &Tab) -> String {
+    match t {
+        Tab::Live(bv) => view_title(bv),
+        Tab::Asleep { title, .. } => format!("💤 {title}"),
+    }
+}
+
 pub fn active_url() -> String {
-    active().map(|bv| url_of(&bv)).unwrap_or_default()
+    active().map(|bv| view_url(&bv)).unwrap_or_default()
 }
 
 pub fn active_favicon() -> Option<String> {
@@ -686,7 +715,7 @@ pub fn active_favicon() -> Option<String> {
 }
 
 pub fn active_title() -> String {
-    active().map(|bv| title_of(&bv)).unwrap_or_default()
+    active().map(|bv| view_title(&bv)).unwrap_or_default()
 }
 
 /// (title, url) of every tab of the current window, in order.
@@ -1046,13 +1075,14 @@ pub fn stop_find() {
 }
 
 /// The favicon to draw in this tab (a sleeping tab keeps its own).
-fn icon_of(bv: &BrowserView) -> Option<Image> {
-    if asleep(bv).is_some() {
-        let id = View::from(bv).id();
-        return SLEEP_ICON.with_borrow(|m| m.get(&id).cloned());
+fn icon_of(t: &Tab) -> Option<Image> {
+    match t {
+        Tab::Asleep { icon, .. } => icon.clone(),
+        Tab::Live(bv) => {
+            let id = bv.browser()?.identifier();
+            FAV_IMG.with_borrow(|m| m.get(&id).cloned())
+        }
     }
-    let id = bv.browser()?.identifier();
-    FAV_IMG.with_borrow(|m| m.get(&id).cloned())
 }
 
 thread_local! {
@@ -1143,9 +1173,25 @@ fn shown_in(browser: &mut Browser) -> Option<u32> {
 fn on_tab_closed(browser: &mut Browser) {
     let _t = crate::span("tabs::on_tab_closed");
     let Some((win, i)) = index_of(browser) else { return };
-    let Some((removed, content, n, active)) = with_win(win, |w| {
-        (w.tabs.remove(i), w.content.clone(), w.tabs.len(), w.active)
-    }) else {
+    // Per-tab state keyed by browser id must not outlive the tab.
+    let id = browser.identifier();
+    FAV_IMG.with_borrow_mut(|m| m.remove(&id));
+    HIDDEN.with_borrow_mut(|h| h.remove(&id));
+    KEEP.with_borrow_mut(|k| k.remove(&id));
+    FAVICONS.with_borrow_mut(|m| m.remove(&id));
+    FAV_HOST.with_borrow_mut(|m| m.remove(&id));
+    LAST_CRASH.with_borrow_mut(|m| m.remove(&id));
+    remove_tab(win, i);
+}
+
+/// Take tab `i` out of its window: remembered for `u`, its view (if it has one)
+/// detached, a neighbour shown if it was the visible one, the window closed if it was
+/// the last.
+fn remove_tab(win: u32, i: usize) {
+    let found = with_win(win, |w| {
+        (i < w.tabs.len()).then(|| (w.tabs.remove(i), w.content.clone(), w.tabs.len(), w.active))
+    });
+    let Some((removed, content, n, active)) = found.flatten() else {
         return;
     };
     let url = url_of(&removed);
@@ -1158,18 +1204,9 @@ fn on_tab_closed(browser: &mut Browser) {
             }
         });
     }
-    // Per-tab state keyed by browser id must not outlive the tab.
-    let vid = View::from(&removed).id();
-    ASLEEP.with_borrow_mut(|m| m.remove(&vid));
-    SLEEP_ICON.with_borrow_mut(|m| m.remove(&vid));
-    let id = browser.identifier();
-    FAV_IMG.with_borrow_mut(|m| m.remove(&id));
-    HIDDEN.with_borrow_mut(|h| h.remove(&id));
-    KEEP.with_borrow_mut(|k| k.remove(&id));
-    FAVICONS.with_borrow_mut(|m| m.remove(&id));
-    FAV_HOST.with_borrow_mut(|m| m.remove(&id));
-    LAST_CRASH.with_borrow_mut(|m| m.remove(&id));
-    content.remove_child_view(Some(&mut View::from(&removed)));
+    if let Tab::Live(bv) = &removed {
+        content.remove_child_view(Some(&mut View::from(bv)));
+    }
     session_dirty();
     if n == 0 {
         // Last tab gone: close the window (the last window quits).
@@ -1278,9 +1315,7 @@ wrap_window_delegate! {
             let restore = RESTORE.with_borrow_mut(|q| (!q.is_empty()).then(|| q.remove(0)));
             if let Some(r) = restore {
                 for u in r.urls.iter().skip(1) {
-                    if let Some(bv) = sleeping_view(u) {
-                        add(id, bv, true);
-                    }
+                    add_asleep(id, u);
                 }
                 if r.active > 0 {
                     select_in(id, r.active);
@@ -1326,7 +1361,8 @@ wrap_window_delegate! {
             // Ask every tab (runs beforeunload). Each closed tab hits on_tab_closed;
             // the last one closes the window again, which then passes.
             // The popup overlay too: a browser left open at shutdown trips a CHECK.
-            let mut hosts: Vec<_> = with_win(id, |w| w.tabs.iter().filter_map(|bv| bv.browser()?.host()).collect()).unwrap_or_default();
+            drop_asleep(id);
+            let mut hosts: Vec<_> = with_win(id, |w| w.tabs.iter().filter_map(|t| t.browser()?.host()).collect()).unwrap_or_default();
             hosts.extend(popup::host(Owner::Win(id)));
             hosts.iter().fold(1, |all, h| all & h.try_close_browser())
         }

@@ -96,6 +96,8 @@ struct TabSlot {
     /// The colour the close button has while the mouse is not over the tab.
     hide: Arc<AtomicU32>,
     shown: bool,
+    /// The close button takes room (it is hidden on inactive tabs when space is short).
+    close_shown: bool,
     text: String,
     tip: String,
     /// Drawn as the active tab? None = colours must be applied again (new, theme change).
@@ -863,31 +865,43 @@ pub fn set_tabs(win: u32, titles: &[String], icons: &[Option<Image>], active: us
                     bar.add_child_view(Some(&mut View::from(b)));
                     View::from(b).set_visible(0);
                 }
-                slots.push(TabSlot { label, close, hide, shown: false, text: String::new(), tip: String::new(), on: None, icon: None });
+                slots.push(TabSlot { label, close, hide, shown: false, close_shown: false, text: String::new(), tip: String::new(), on: None, icon: None });
             }
         }
     }
     let more = slots.len() < want;
-    // Titles shrink so every tab stays reachable (~8px a character, 6 for " 1 " + "× ").
-    // A favicon takes about two characters of room.
-    let icon_w = if icons.iter().any(Option::is_some) { 2 } else { 0 };
-    let room = (width - 12) / titles.len().max(1) as i32 / 8 - 6 - icon_w;
-    let room = room.clamp(3, TAB_TITLE as i32) as usize;
+    // Titles shrink so every tab stays inside the window. A tab is about 24 px of button
+    // padding plus 8 px a character (measured on screenshots): " 12 " + title + " ",
+    // then "× ", and a favicon is about three characters wide. With no room for a title
+    // the tab shows its number only.
+    // Then only the active tab keeps its close button (the others would cost ~28 px each).
+    // ponytail: under ~44 px a tab nothing more can shrink, so past ~43 tabs on a
+    // 1920 px window the last ones are cut off; scroll the bar if that ever matters.
+    let n = titles.len().max(1) as i32;
+    let digits = n.to_string().len() as i32;
+    let icon_w = if icons.iter().any(Option::is_some) { 3 } else { 0 };
+    let room = ((width - 12) / n - 24) / 8 - (digits + 3) - 2 - icon_w;
+    let room = room.clamp(0, TAB_TITLE as i32) as usize;
+    let cramped = room < 2;
     let mut changed = false;
     for (i, s) in slots.iter_mut().enumerate() {
         let shown = i < titles.len();
-        if s.shown != shown {
+        let close_shown = shown && (!cramped || i == active);
+        if s.shown != shown || s.close_shown != close_shown {
             s.shown = shown;
+            s.close_shown = close_shown;
             changed = true;
-            for b in [&s.label, &s.close] {
-                View::from(b).set_visible(shown as i32);
-            }
+            View::from(&s.label).set_visible(shown as i32);
+            View::from(&s.close).set_visible(close_shown as i32);
         }
         if !shown {
             continue;
         }
         let title = if titles[i].is_empty() { "New tab" } else { &titles[i] };
-        let text = format!(" {} {} ", i + 1, short(title, room));
+        let text = match cramped {
+            true => format!(" {} ", i + 1),
+            false => format!(" {} {} ", i + 1, short(title, room)),
+        };
         if s.text != text {
             s.label.set_text(Some(&text.as_str().into()));
             s.text = text;
