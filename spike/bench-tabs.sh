@@ -47,6 +47,7 @@ while read -r p; do
   pss=$((pss + ${k:-0})); procs=$((procs + 1))
 done <"$ISO/pids"
 cpu=$(ps -o cputime= -p "$pid" | tr -d ' ')
+allcpu=$(xargs -a "$ISO/pids" ps -o cputimes= -p 2>/dev/null | awk '{s+=$1}END{print s+0}')
 
 rg -o 'UI stall (\d+) ms' -r '$1' "$ISO/log" | sort -n >"$ISO/stalls"
 echo "tabs loaded     $loaded/$n"
@@ -55,4 +56,5 @@ echo "UI stalls       $(wc -l <"$ISO/stalls") (over 30 ms)"
 echo "worst stall     $(tail -1 "$ISO/stalls" 2>/dev/null || echo 0) ms"
 echo "total stalled   $(awk '{s+=$1}END{print s+0}' "$ISO/stalls") ms"
 echo "browser CPU     $cpu (UI process, whole run)"
+echo "all CPU         ${allcpu}s (every process, whole run)"
 echo "memory (PSS)    $((pss / 1024)) MB in $procs processes"

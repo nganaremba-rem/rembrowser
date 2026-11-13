@@ -36,9 +36,10 @@ pub fn nonce() -> &'static str {
     })
 }
 
-/// page.js with this process's nonce filled in.
-pub fn page_js() -> String {
-    PAGE_JS.replace("__NONCE__", nonce())
+/// page.js with this process's nonce filled in (built once).
+pub fn page_js() -> &'static str {
+    static JS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    JS.get_or_init(|| PAGE_JS.replace("__NONCE__", nonce()))
 }
 
 /// A browser window and its tabs.
@@ -1517,6 +1518,11 @@ wrap_display_handler! {
             _source: Option<&CefString>,
             _line: i32,
         ) -> i32 {
+            // Every console line of every tab lands here, on the UI thread. Ours start
+            // with \x01: look at that one character before copying the text.
+            if message.and_then(|m| m.as_slice()).and_then(|s| s.first()) != Some(&1) {
+                return 0;
+            }
             let msg = message.map(|m| m.to_string()).unwrap_or_default();
             // Homescreen search box (a static page of ours, no nonce): only from the homescreen itself.
             if let Some(text) = msg.strip_prefix("\u{1}rem\thome-open\t") {
@@ -1648,7 +1654,7 @@ wrap_load_handler! {
                 }
             }
             // Install page.js early so focus → INSERT shows without a key press.
-            f.execute_java_script(Some(&page_js().as_str().into()), Some(&"rembrowser://page.js".into()), 0);
+            f.execute_java_script(Some(&page_js().into()), Some(&"rembrowser://page.js".into()), 0);
             if let Some(js) = userscripts::for_url(&CefString::from(&f.url()).to_string(), userscripts::RunAt::End) {
                 f.execute_java_script(Some(&js.as_str().into()), Some(&"rembrowser://userscripts".into()), 0);
             }
