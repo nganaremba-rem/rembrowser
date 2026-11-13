@@ -85,34 +85,68 @@ fn installed() -> Vec<(String, String)> {
     out
 }
 
-/// The tabs here have no window of their own, so an extension sees `sender.tab.windowId`
-/// -1, which every `chrome.windows` call rejects ("No window with id: -1"): Bitwarden's
-/// "Unlock account" under a login field dies on it. Read -1 as "the current window".
+/// The tabs here are in no browser window, so an extension sees them wrongly (window id
+/// -1, no active tab, no tab events). Three small patches to its files put that right:
+/// what each one does is written in the two scripts.
 const SHIM: &str = include_str!("ext-shim.js");
+/// Goes at the end of the extension's own content script.
+const ACTIVE: &str = include_str!("ext-active.js");
 const SHIM_END: &str = "/*end rembrowser*/\n";
+const SHIM_FILE: &str = "rembrowser-shim.js";
 
-/// Put the shim at the top of the extension's service worker. (A wrapper that
-/// `importScripts` the original fails to start bundles like Bitwarden's.) Idempotent,
-/// and swaps an older shim for this one; `:ext-install` unpacks a clean copy, patched
-/// again at the next start. True if it changed the file.
-fn patch(folder: &Path) -> bool {
-    let Some(sw) = json(folder.join("manifest.json"))
-        .and_then(|m| m["background"]["service_worker"].as_str().map(String::from))
-    else {
-        return false;
-    };
-    let path = folder.join(sw);
-    let Ok(code) = std::fs::read_to_string(&path) else { return false };
-    if code.starts_with(SHIM) {
-        return false;
+/// `code` without a block of ours (this version or an older one).
+fn strip(code: &str) -> String {
+    match (code.find("/*rembrowser"), code.find(SHIM_END)) {
+        (Some(a), Some(b)) if a < b => format!("{}{}", code[..a].trim_end_matches('\n'), &code[b + SHIM_END.len()..]),
+        // The first shim was one line at the top.
+        (Some(0), None) => code.split_once('\n').map_or("", |(_, rest)| rest).into(),
+        _ => code.into(),
     }
-    let original = match (code.starts_with("/*rembrowser"), code.find(SHIM_END)) {
-        (false, _) => &code[..],
-        (true, Some(i)) if i < 8192 => &code[i + SHIM_END.len()..],
-        // The first shim was one line.
-        (true, _) => code.split_once('\n').map_or("", |(_, rest)| rest),
-    };
-    std::fs::write(&path, format!("{SHIM}{original}")).is_ok()
+}
+
+/// The page with the shim as its first script. None = it is there already.
+fn with_shim_tag(html: &str) -> Option<String> {
+    if html.contains(SHIM_FILE) {
+        return None;
+    }
+    let at = html.find("<script").or_else(|| html.find("<head>").map(|i| i + 6)).unwrap_or(0);
+    Some(format!("{}<script src=\"/{SHIM_FILE}\"></script>{}", &html[..at], &html[at..]))
+}
+
+/// Write `new` to `path` unless that is what it holds. True if the file changed.
+fn put(path: &Path, new: &str) -> bool {
+    !std::fs::read_to_string(path).is_ok_and(|old| old == new) && std::fs::write(path, new).is_ok()
+}
+
+/// Patch one extension (manifest v3). Files, not manifest.json: Chromium loads a store
+/// install's manifest from its saved prefs, so a change there is ignored. Idempotent, and
+/// swaps an older shim for this one; `:ext-install` unpacks a clean copy, patched again
+/// at the next start. True if the service worker changed.
+fn patch(folder: &Path) -> bool {
+    let Some(manifest) = json(folder.join("manifest.json")) else { return false };
+    let Some(sw) = manifest["background"]["service_worker"].as_str() else { return false };
+    // 1. The shim at the top of the worker. (A wrapper that `importScripts` the original
+    //    fails to start bundles like Bitwarden's.)
+    let Ok(code) = std::fs::read_to_string(folder.join(sw)) else { return false };
+    let changed = put(&folder.join(sw), &format!("{SHIM}{}", strip(&code)));
+    // 2. "I am the active page" at the end of a content script that runs in the top frame.
+    let scripts = manifest["content_scripts"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let top = scripts.iter().find(|c| c["all_frames"] != true).or(scripts.first());
+    if let Some(js) = top.and_then(|c| c["js"][0].as_str()) {
+        let path = folder.join(js.trim_start_matches('/'));
+        if let Ok(code) = std::fs::read_to_string(&path) {
+            put(&path, &format!("{}{ACTIVE}", strip(&code)));
+        }
+    }
+    // 3. The same shim in the popup page: it asks "which tab is active?" too.
+    if let Some(page) = popup_page(&manifest) {
+        let path = folder.join(page.trim_start_matches('/').split(['?', '#']).next().unwrap_or(""));
+        if let Some(html) = std::fs::read_to_string(&path).ok().and_then(|h| with_shim_tag(&h)) {
+            let _ = std::fs::write(&path, html);
+        }
+        put(&folder.join(SHIM_FILE), SHIM);
+    }
+    changed
 }
 
 /// (name, folder, id) of the extensions installed through the Web Store page
@@ -343,7 +377,7 @@ pub fn picker() {
 
 #[cfg(test)]
 mod tests {
-    use super::{id_for_path, id_in, popup_page};
+    use super::{id_for_path, id_in, popup_page, strip, with_shim_tag, ACTIVE, SHIM};
 
     #[test]
     fn popup_page_prefers_the_toolbar_button() {
@@ -351,6 +385,22 @@ mod tests {
         assert_eq!(popup_page(&m), Some("ui/popup.html"));
         assert_eq!(popup_page(&serde_json::json!({"options_ui": {"page": "o.html"}})), Some("o.html"));
         assert_eq!(popup_page(&serde_json::json!({"action": {}})), None);
+    }
+
+    #[test]
+    fn patches_apply_once_and_replace_older_ones() {
+        // Worker: an old shim at the top goes, the code stays.
+        assert_eq!(strip("/*rembrowser:2*/\nold();\n/*end rembrowser*/\ncode();"), "code();");
+        assert_eq!(strip("/*rembrowser*/ first_one_line_shim();\ncode();"), "code();");
+        assert_eq!(strip("code();"), "code();");
+        // Patching twice gives the same file.
+        let (worker, script) = (format!("{SHIM}code();"), format!("code();{ACTIVE}"));
+        assert_eq!(format!("{SHIM}{}", strip(&worker)), worker);
+        assert_eq!(format!("{}{ACTIVE}", strip(&script)), script);
+        // Popup page: our script first, added once.
+        let html = with_shim_tag("<html><head><script defer src=\"main.js\"></script></head></html>").unwrap();
+        assert!(html.find("rembrowser-shim.js").unwrap() < html.find("main.js").unwrap());
+        assert_eq!(with_shim_tag(&html), None);
     }
 
     #[test]

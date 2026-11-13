@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "rembrowser probe",
+  "version": "1",
+  "description": "Test only: reports what an extension can see of rembrowser's tabs and windows.",
+  "permissions": ["tabs", "scripting", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "bg.js" },
+  "action": { "default_popup": "popup.html" },
+  "content_scripts": [{ "matches": ["http://*/*"], "js": ["cs.js"], "run_at": "document_start" }]
+}

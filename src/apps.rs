@@ -37,6 +37,7 @@ pub fn app_id(url: &str) -> String {
 
 pub fn open(url: &str) {
     let url = commands::resolve_url(url);
+    tabs::ensure_extension_anchor();
     if let Some(bv) = tabs::new_view(&url) {
         window(bv, app_id(&url));
     }
@@ -212,9 +213,7 @@ wrap_window_delegate! {
             tabs::set_app_focus(None);
             APPS.with_borrow_mut(|a| a.retain(|(x, ..)| View::from(x).is_same(Some(&mut View::from(&*w))) == 0));
             // Last window of any kind gone: quit.
-            if is_empty() && tabs::window().is_none() && tabs::quit_when_empty() {
-                quit_message_loop();
-            }
+            tabs::quit_if_empty();
         }
 
         // The page and (if it was used) this window's command popup.

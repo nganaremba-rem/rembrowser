@@ -638,10 +638,24 @@ pub fn quit_all() {
 /// waiting in the background) no "window destroyed" event would come, so quit directly.
 fn quit_now() {
     QUITTING.set(true);
-    if win_ids().is_empty() && apps::is_empty() {
-        quit_message_loop();
+    if win_ids().is_empty() {
+        quit_if_empty();
     } else {
         close_all();
+    }
+}
+
+/// Nothing left open (no window, no web app) and nothing says stay: end the process.
+/// The Chrome-style windows go first (settings, and the hidden extension anchor): one
+/// still open keeps CEF from shutting down. Each one's on_window_destroyed comes back here.
+pub fn quit_if_empty() {
+    if !win_ids().is_empty() || !apps::is_empty() || !quit_when_empty() {
+        return;
+    }
+    let chrome = CHROME_WINS.with_borrow(|d| d.clone());
+    match chrome.is_empty() {
+        true => quit_message_loop(),
+        false => chrome.iter().for_each(|w| w.close()),
     }
 }
 
@@ -1340,23 +1354,14 @@ wrap_window_delegate! {
             ui::forget_window(self.id);
             popup::forget(Owner::Win(self.id));
             // Web apps keep running on their own; quit with the last window.
-            if cur() == 0 && apps::is_empty() && quit_when_empty() {
-                quit_message_loop();
-            }
+            quit_if_empty();
         }
 
         fn can_close(&self, _window: Option<&mut Window>) -> i32 {
             let id = self.id;
-            // The last window takes the Chrome-style windows (DevTools, settings) with
-            // it: one still open keeps CEF from shutting down. Each one's
-            // on_window_destroyed retries.
+            // The last window: no session saves while its tabs close one by one.
             if win_ids() == [id] {
                 CLOSING.set(true);
-                let chrome = CHROME_WINS.with_borrow(|d| d.clone());
-                if !chrome.is_empty() {
-                    chrome.iter().for_each(|w| w.close());
-                    return 0;
-                }
             }
             // Ask every tab (runs beforeunload). Each closed tab hits on_tab_closed;
             // the last one closes the window again, which then passes.
@@ -1897,8 +1902,9 @@ pub fn extension_popup(url: &str) {
 /// Extensions ask for "the current window" (`chrome.windows.getCurrent`) before they
 /// open a popout; the Alloy tabs are none, so with no Chrome-style window that call
 /// fails and, e.g., Bitwarden's "Unlock account" silently does nothing. One window that
-/// is never shown fixes it for every extension. Closed with the last browser window
-/// like DevTools; the next window made brings it back.
+/// is never shown fixes it for every extension. It lives as long as the engine (made at
+/// start, so also for web-app windows and a `keep-running` browser with no window) and
+/// closes only when the browser quits (quit_if_empty).
 pub fn ensure_extension_anchor() {
     if !commands::opt_bool("extensions", false) || ANCHOR.replace(true) {
         return;
@@ -2015,9 +2021,7 @@ wrap_window_delegate! {
             if self.hidden {
                 ANCHOR.set(false);
             }
-            if CLOSING.get() {
-                ui::run_on_ui(0, close_all);
-            }
+            ui::run_on_ui(0, quit_if_empty);
         }
 
         // Closing the window closes its browser first (like a browser window).

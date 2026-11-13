@@ -240,6 +240,7 @@ wrap_browser_process_handler! {
             mark("context initialized");
             ui::stall_watch();
             privacy::apply_prefs();
+            tabs::ensure_extension_anchor();
             // A bare launch can bring the last session back (see session.rs).
             let bare = matches!(&self.req, ipc::Req::Open(u) if u.is_empty());
             let restore = bare
