@@ -7,7 +7,7 @@ X=$(mktemp -d "$PWD/xdg.XXXX"); mkdir -p "$X/rembrowser"
 ev()   { NO_NAV=1 WAIT=300 node cdp.mjs x "$1"; }
 nav()  { WAIT=2500 node cdp.mjs "$1" 1 >/dev/null; }
 url()  { curl -s 127.0.0.1:9222/json/list | jq -r '[.[]|select(.type=="page" and (.url|startswith("data:text/html;base64,")|not))][0].url'; }
-ntabs(){ curl -s 127.0.0.1:9222/json/list | jq '[.[]|select(.type=="page" and (.url|startswith("data:text/html;base64,")|not) and (.url|startswith("devtools")|not))]|length'; }
+ntabs(){ curl -s 127.0.0.1:9222/json/list | jq '[.[]|select(.type=="page" and (.url|startswith("data:text/html;base64,")|not) and (.url|startswith("devtools")|not) and .url!="about:blank")]|length'; }
 k()    { wtype "$@"; sleep 0.4; }
 check(){ if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1: got [$2] want [$3]"; fails=$((fails+1)); fi; }
 win()  { niri msg -j windows | jq -r ".[]|select(.app_id==\"$1\")|.id" | head -1; }

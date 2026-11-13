@@ -17,6 +17,8 @@ fi
 rm -rf "$ISO"; mkdir -p "$ISO/config/rembrowser"
 # Tab bar pinned (the costly case); nothing restored; no sleep during the run.
 # EXTRA="  adblock: false\n" adds settings lines (to see what a feature costs).
+# SEED=dir: copied in as the data folder first (a profile with an extension to measure).
+[ -n "${SEED:-}" ] && cp -r "$SEED" "$ISO/data"
 printf 'settings:\n  tab-bar: true\n  restore-session: off\n  confirm-quit: false\n  sleep-after: 0\n%b' "${EXTRA:-}" >"$ISO/config/rembrowser/config.yaml"
 
 python3 -m http.server "$port" --bind 127.0.0.1 -d "$here" >/dev/null 2>&1 &
