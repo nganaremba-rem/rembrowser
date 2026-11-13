@@ -275,7 +275,7 @@ fn set(args: &str) {
     match key.as_str() {
         "status-bar" | "tab-bar" | "bookmark-bar" => ui::bars_changed(),
         // Read once at startup (they decide what gets loaded into the process).
-        "adblock" | "drm" | "extensions" | "dark-mode" if ui::is_up() => {
+        "adblock" | "drm" | "extensions" | "dark-mode" | "process-per-site" if ui::is_up() => {
             ui::message(&format!("{key} = {val}: applies after a restart"), false)
         }
         "fullscreen" => tabs::set_fullscreen(opt_bool("fullscreen", false)),
@@ -306,6 +306,7 @@ pub fn settings() -> Vec<(String, String)> {
         "home-page",
         "incsearch",
         "mpv-command",
+        "process-per-site",
         "scroll-step",
         "smooth-scrolling",
         "status-bar",

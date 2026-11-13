@@ -24,7 +24,8 @@ srv=$!
 trap 'kill $srv 2>/dev/null; "$iso" stop; [ -n "${SHOW:-}" ] || "$here/offscreen.sh" stop' EXIT
 for _ in $(seq 1 40); do curl -sf "127.0.0.1:$port/stress.html" >/dev/null && break; sleep 0.25; done
 
-"$iso" start "http://127.0.0.1:$port/stress.html?n=0${Q:-}"
+# shellcheck disable=SC2086  # ARGS="--flag --flag2": extra browser switches, split on purpose
+"$iso" start "http://127.0.0.1:$port/stress.html?n=0${Q:-}" ${ARGS:-}
 sleep 2
 t0=$(date +%s.%N)
 for i in $(seq 1 $((n - 1))); do "$iso" run "http://127.0.0.1:$port/stress.html?n=$i${Q:-}" 2>/dev/null; done

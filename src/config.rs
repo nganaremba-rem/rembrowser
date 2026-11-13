@@ -29,6 +29,8 @@ settings:
   tab-bar: false           # true = always show the tab bar (false = pops up)
   bookmark-bar: false      # true = show the bookmark bar
   dark-mode: true          # sites get prefers-color-scheme: dark (restart)
+  process-per-site: false  # true = tabs of one site share a process: far less RAM with many
+                           # tabs of one site, but they slow down and crash together (restart)
   hint-keys: asdfghjkl
   scroll-step: 60          # pixels per j / k
   smooth-scrolling: true   # false = jump instead of glide

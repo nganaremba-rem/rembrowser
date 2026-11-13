@@ -50,9 +50,9 @@ const DISABLED_FEATURES: &[&str] = &[
     "AdInterestGroupAPI",
     "SharedStorageAPI",
     "PrivateAggregationApi",
-    // Memory: whole pages kept alive for back/forward, speculative prerendered pages,
-    // and a spare renderer started ahead of time. All trade RAM for speed we don't need.
-    "BackForwardCache",
+    // Memory: speculative prerendered pages (never used with Alloy-style tabs anyway) and
+    // a spare renderer started ahead of time (+7 MB, no faster new tab: measured 2026-11).
+    // BackForwardCache stays ON: instant back/forward for +3% RAM (8 tabs x 3 pages).
     "Prerender2",
     "SpareRendererForSitePerProcess",
     // Gemini / AI UI.
@@ -85,7 +85,14 @@ pub fn apply_switches(cl: &mut CommandLine) {
     // Merge with any --disable-features the user passed on the command line.
     let key: CefString = "disable-features".into();
     let user = CefString::from(&cl.switch_value(Some(&key))).to_string();
-    let mut features = DISABLED_FEATURES.join(",");
+    // REMBROWSER_KEEP_FEATURES=A,B leaves those on: to measure what one costs.
+    let keep = std::env::var("REMBROWSER_KEEP_FEATURES").unwrap_or_default();
+    let mut features = DISABLED_FEATURES
+        .iter()
+        .filter(|f| !keep.split(',').any(|k| k == **f))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",");
     if !user.is_empty() {
         features = format!("{user},{features}");
     }
@@ -106,6 +113,11 @@ pub fn apply_switches(cl: &mut CommandLine) {
         let user = CefString::from(&cl.switch_value(Some(&key))).to_string();
         let dirs = if user.is_empty() { ours } else { format!("{user},{ours}") };
         set("load-extension", &dirs);
+    }
+    // process-per-site: all tabs of one site share one renderer. 30 same-site tabs:
+    // 577 -> 331 MB. The price: those tabs share one main thread and crash together.
+    if crate::commands::opt_bool("process-per-site", false) {
+        cl.append_switch(Some(&"process-per-site".into()));
     }
     // dark-mode: sites see prefers-color-scheme: dark.
     if crate::commands::opt_bool("dark-mode", false) {
