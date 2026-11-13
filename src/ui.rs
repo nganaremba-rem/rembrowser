@@ -14,6 +14,7 @@ use crate::popup::Owner;
 use crate::{commands, tabs};
 use cef::*;
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +81,26 @@ struct Chrome {
     loading: bool,
     /// Bumped on every start/finish so stale timers stop themselves.
     load_gen: u32,
+    /// The tab bar's buttons, slot i = tab i (see TabSlot), and a close button made
+    /// ahead for the next slot.
+    slots: Vec<TabSlot>,
+    spare_close: Option<LabelButton>,
+}
+
+/// One tab in the tab bar: its label and its close button, plus what they show now.
+/// Made once and reused. Building a button is the expensive part (see `button`), so the
+/// bar is never rebuilt: `set_tabs` only changes what differs, and hides unused slots.
+struct TabSlot {
+    label: LabelButton,
+    close: LabelButton,
+    /// The colour the close button has while the mouse is not over the tab.
+    hide: Arc<AtomicU32>,
+    shown: bool,
+    text: String,
+    tip: String,
+    /// Drawn as the active tab? None = colours must be applied again (new, theme change).
+    on: Option<bool>,
+    icon: Option<Image>,
 }
 
 thread_local! {
@@ -146,9 +167,11 @@ fn button(
     color: u32,
     font: &str,
     press: Press,
-    reveal: Option<(LabelButton, u32)>,
+    reveal: Option<(LabelButton, Arc<AtomicU32>)>,
 ) -> LabelButton {
     let mut d = BarButton::new(press, reveal);
+    // Costly: ~25 ms of UI thread each on a system with thousands of fonts (measured,
+    // spike/bench-tabs.sh). Never create these in a loop on a hot path; see TabSlot.
     let l = label_button_create(Some(&mut d), Some(&text.into())).expect("label");
     l.set_font_list(Some(&font.into()));
     set_color(&l, color);
@@ -256,6 +279,7 @@ pub fn app_bar(w: &Window, id: i32) {
 
 /// Keyboard focus moved between windows: show the right status line.
 pub fn focus_changed() {
+    let _t = crate::span("ui::focus_changed");
     update();
 }
 
@@ -290,6 +314,7 @@ fn gradient_bar() -> Panel {
 }
 
 pub fn frame(win: u32, window: &Window) -> (Panel, Panel) {
+    let _t = crate::span("ui::frame");
     let slot = |top| panel_create(Some(&mut Slot::new(top))).expect("panel");
     let (top_slot, status_slot) = (slot(true), slot(false));
     let tabbar = bar_panel(
@@ -345,6 +370,8 @@ pub fn frame(win: u32, window: &Window) -> (Panel, Panel) {
             load_still: 0,
             loading: false,
             load_gen: 0,
+            slots: Vec::new(),
+            spare_close: None,
         })
     });
     (top_slot, status_slot)
@@ -352,6 +379,7 @@ pub fn frame(win: u32, window: &Window) -> (Panel, Panel) {
 
 /// Float the bars over the window (after frame()); hidden until needed.
 pub fn attach(win: u32) {
+    let _t = crate::span("ui::attach");
     with_chrome(win, |c| {
         let over = |p: &Panel| {
             c.window
@@ -373,6 +401,7 @@ pub fn attach(win: u32) {
 
 /// Overlay bounds follow the window (resize, fullscreen).
 pub fn place() {
+    let _t = crate::span("ui::place");
     BARS.with_borrow(|bars| {
         for (ctl, win) in bars.iter().filter_map(|b| b.app.as_ref()) {
             let size = View::from(win).size();
@@ -503,6 +532,7 @@ fn live(until: &'static std::thread::LocalKey<Cell<Option<Instant>>>) -> bool {
 
 /// Apply pinned / held / recently-revealed state to slots and overlays.
 fn update() {
+    let _t = crate::span("ui::update");
     let (pin_tabs, pin_books, pin_status) =
         (pinned("tab-bar"), pinned("bookmark-bar"), pinned("status-bar"));
     let cur = tabs::current_owner();
@@ -584,6 +614,7 @@ pub fn typing() {
 /// backwards); before the first report, and while a report stalls, it creeps a little
 /// so a slow server still shows motion. Finishing fills it and hides it.
 pub fn load_state(win: u32, loading: bool) {
+    let _t = crate::span("ui::load_state");
     let epoch = with_chrome(win, |c| {
         // Switching to a tab that is already loaded: nothing to flash.
         if !loading && !c.loading {
@@ -616,6 +647,7 @@ pub fn load_state(win: u32, loading: bool) {
 }
 
 fn load_tick(win: u32, epoch: u32) {
+    let _t = crate::span("ui::load_tick");
     let alive = with_chrome(win, |c| {
         if c.load_gen != epoch || !c.loading {
             return false;
@@ -653,6 +685,7 @@ pub fn reveal_tabs() {
 }
 
 pub fn build(win: u32) {
+    let _t = crate::span("ui::build");
     let Some(panel) = with_chrome(win, |c| c.status.clone()) else {
         return;
     };
@@ -692,6 +725,8 @@ pub fn recolor() {
         bars.iter()
             .for_each(|b| View::from(&b.mode).set_background_color(b.mode_color))
     });
+    // The theme painted over the tab colours: have set_tabs apply them again.
+    CHROME.with_borrow_mut(|cs| cs.iter_mut().flat_map(|c| &mut c.slots).for_each(|s| s.on = None));
     tabs::refresh_tabbars();
     refresh_bookmarks();
 }
@@ -788,10 +823,13 @@ fn short(title: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// Rebuild a window's tab bar: per tab a clickable label and a close button (always
-/// there on the active tab, on the others only while the mouse is over the tab).
-/// ponytail: full rebuild per change; diff the labels if hundreds of tabs ever lag.
-pub fn set_tabs(win: u32, titles: &[String], icons: &[Option<Image>], active: usize) {
+/// Show a window's tabs in its tab bar: per tab a clickable label and a close button
+/// (always there on the active tab, on the others only while the mouse is over the tab).
+/// Only what changed is touched (see TabSlot). At most ONE button is created per call,
+/// so a burst of new tabs never blocks the UI thread for long; returns true while slots
+/// are still missing (call again on a later tick). One spare slot is kept ready.
+pub fn set_tabs(win: u32, titles: &[String], icons: &[Option<Image>], active: usize) -> bool {
+    let _t = crate::span("ui::set_tabs");
     let Some((bar, shown, width)) = with_chrome(win, |c| {
         (
             c.tabbar.clone(),
@@ -799,50 +837,104 @@ pub fn set_tabs(win: u32, titles: &[String], icons: &[Option<Image>], active: us
             View::from(&c.window).size().width,
         )
     }) else {
-        return;
+        return false;
     };
     if !shown || !is_built(win) {
-        return;
+        return false;
     }
+    // Out of the window state while CEF is called: a view callback must not find it borrowed.
+    let (mut slots, mut spare) =
+        with_chrome(win, |c| (std::mem::take(&mut c.slots), c.spare_close.take())).unwrap_or_default();
+    let want = titles.len() + 1;
+    if slots.len() < want {
+        let i = slots.len();
+        match spare.take() {
+            None => {
+                let x = button("× ", TABBAR_BG, TAB_FONT_BOLD, Press::Close(win, i), None);
+                x.set_text_color(ButtonState::HOVERED, RED);
+                x.set_text_color(ButtonState::PRESSED, RED);
+                x.set_tooltip_text(Some(&"Close tab".into()));
+                spare = Some(x);
+            }
+            Some(close) => {
+                let hide = Arc::new(AtomicU32::new(TABBAR_BG));
+                let label = button("", OVERLAY, TAB_FONT, Press::Tab(win, i), Some((close.clone(), hide.clone())));
+                for b in [&label, &close] {
+                    bar.add_child_view(Some(&mut View::from(b)));
+                    View::from(b).set_visible(0);
+                }
+                slots.push(TabSlot { label, close, hide, shown: false, text: String::new(), tip: String::new(), on: None, icon: None });
+            }
+        }
+    }
+    let more = slots.len() < want;
     // Titles shrink so every tab stays reachable (~8px a character, 6 for " 1 " + "× ").
     // A favicon takes about two characters of room.
     let icon_w = if icons.iter().any(Option::is_some) { 2 } else { 0 };
     let room = (width - 12) / titles.len().max(1) as i32 / 8 - 6 - icon_w;
     let room = room.clamp(3, TAB_TITLE as i32) as usize;
-    bar.remove_all_child_views();
-    for (i, t) in titles.iter().enumerate() {
-        let on = i == active;
-        let bg = if on { SURFACE } else { TABBAR_BG };
-        let title = if t.is_empty() { "New tab" } else { t };
-        let x = button(
-            "× ",
-            if on { OVERLAY } else { bg },
-            TAB_FONT_BOLD,
-            Press::Close(win, i),
-            None,
-        );
-        x.set_text_color(ButtonState::HOVERED, RED);
-        x.set_text_color(ButtonState::PRESSED, RED);
-        let l = button(
-            &format!(" {} {} ", i + 1, short(title, room)),
-            if on { TEXT } else { OVERLAY },
-            if on { TAB_FONT_BOLD } else { TAB_FONT },
-            Press::Tab(win, i),
-            (!on).then(|| (x.clone(), bg)),
-        );
-        if let Some(Some(img)) = icons.get(i) {
-            for s in [ButtonState::NORMAL, ButtonState::HOVERED, ButtonState::PRESSED, ButtonState::DISABLED] {
-                l.set_image(s, Some(&mut img.clone()));
+    let mut changed = false;
+    for (i, s) in slots.iter_mut().enumerate() {
+        let shown = i < titles.len();
+        if s.shown != shown {
+            s.shown = shown;
+            changed = true;
+            for b in [&s.label, &s.close] {
+                View::from(b).set_visible(shown as i32);
             }
         }
-        l.set_tooltip_text(Some(&title.into()));
-        x.set_tooltip_text(Some(&"Close tab".into()));
-        for b in [&l, &x] {
-            bar.add_child_view(Some(&mut View::from(b)));
-            View::from(b).set_background_color(bg);
+        if !shown {
+            continue;
+        }
+        let title = if titles[i].is_empty() { "New tab" } else { &titles[i] };
+        let text = format!(" {} {} ", i + 1, short(title, room));
+        if s.text != text {
+            s.label.set_text(Some(&text.as_str().into()));
+            s.text = text;
+            changed = true;
+        }
+        if s.tip != title {
+            s.label.set_tooltip_text(Some(&title.into()));
+            s.tip = title.to_string();
+        }
+        let on = i == active;
+        if s.on != Some(on) {
+            s.on = Some(on);
+            changed = true;
+            let bg = if on { SURFACE } else { TABBAR_BG };
+            set_color(&s.label, if on { TEXT } else { OVERLAY });
+            s.label.set_font_list(Some(&(if on { TAB_FONT_BOLD } else { TAB_FONT }).into()));
+            // On the active tab the close button always shows; elsewhere it has the
+            // tab's own colour until the mouse is over the tab (BarButton::reveal).
+            let rest = if on { OVERLAY } else { bg };
+            s.hide.store(rest, Ordering::Relaxed);
+            s.close.set_text_color(ButtonState::NORMAL, rest);
+            for b in [&s.label, &s.close] {
+                View::from(b).set_background_color(bg);
+            }
+        }
+        let icon = icons.get(i).cloned().flatten();
+        let same = match (&s.icon, &icon) {
+            (Some(a), Some(b)) => a.is_same(Some(&mut b.clone())) != 0,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            for state in [ButtonState::NORMAL, ButtonState::HOVERED, ButtonState::PRESSED, ButtonState::DISABLED] {
+                s.label.set_image(state, icon.clone().as_mut());
+            }
+            s.icon = icon;
+            changed = true;
         }
     }
-    View::from(&bar).invalidate_layout();
+    with_chrome(win, |c| {
+        c.slots = slots;
+        c.spare_close = spare;
+    });
+    if changed {
+        View::from(&bar).invalidate_layout();
+    }
+    more
 }
 
 /// Rebuild the bookmark bars (`set bookmark-bar` turned on, or the bookmarks changed).
@@ -930,7 +1022,7 @@ wrap_button_delegate! {
         press: Press,
         // A tab label's close button and the colour that hides it: shown while the
         // mouse is over the label (over the button itself, its hover colour shows).
-        reveal: Option<(LabelButton, u32)>,
+        reveal: Option<(LabelButton, Arc<AtomicU32>)>,
     }
 
     impl ViewDelegate {}
@@ -950,8 +1042,24 @@ wrap_button_delegate! {
         fn on_button_state_changed(&self, button: Option<&mut Button>) {
             let (Some((x, hidden)), Some(b)) = (&self.reveal, button) else { return };
             let over = b.state() != ButtonState::NORMAL;
-            x.set_text_color(ButtonState::NORMAL, if over { SUBTEXT } else { *hidden });
+            x.set_text_color(ButtonState::NORMAL, if over { SUBTEXT } else { hidden.load(Ordering::Relaxed) });
         }
+    }
+}
+
+/// `REMBROWSER_TIMING=1`: a 50 ms heartbeat on the UI thread. A beat that arrives late
+/// means the thread was busy for that long: printed when over 30 ms (spike/bench-tabs.sh).
+pub fn stall_watch() {
+    fn beat(due: Instant) {
+        let late = due.elapsed().as_millis();
+        if late > 30 {
+            crate::mark(&format!("UI stall {late} ms"));
+        }
+        let next = Instant::now() + Duration::from_millis(50);
+        run_on_ui(50, move || beat(next));
+    }
+    if std::env::var_os("REMBROWSER_TIMING").is_some() {
+        beat(Instant::now());
     }
 }
 

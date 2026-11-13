@@ -104,6 +104,7 @@ fn asleep(bv: &BrowserView) -> Option<(String, String)> {
 
 /// Selecting a sleeping tab loads its page again.
 fn wake(bv: &BrowserView) {
+    let _t = crate::span("tabs::wake");
     let id = View::from(bv).id();
     SLEEP_ICON.with_borrow_mut(|m| m.remove(&id));
     if let Some((url, _)) = ASLEEP.with_borrow_mut(|m| m.remove(&id)) {
@@ -160,6 +161,7 @@ fn sleep_idle(limit: std::time::Duration) {
 /// Swap the tab's view for a blank one and close the real browser: its renderer (the
 /// RAM) goes away, the tab stays in the bar with the old title until selected.
 fn sleep_tab(win: u32, old: &BrowserView) {
+    let _t = crate::span("tabs::sleep_tab");
     let (url, title) = (url_of(old), title_of(old));
     let Some(fresh) = new_view("about:blank") else { return };
     let sid = NEXT_SLEEP_ID.replace(NEXT_SLEEP_ID.get() + 1);
@@ -231,6 +233,7 @@ pub fn cur() -> u32 {
 
 /// A new browser window showing `url`.
 pub fn create_window(url: String) {
+    let _t = crate::span("tabs::create_window");
     CLOSING.set(false);
     ensure_extension_anchor();
     if !SWEEPING.replace(true) {
@@ -327,6 +330,7 @@ fn browser_settings() -> BrowserSettings {
 
 /// A browser view with all of rembrowser's handlers (tabs and web apps).
 pub fn new_view(url: &str) -> Option<BrowserView> {
+    let _t = crate::span("tabs::new_view");
     let mut client = RemClient::new();
     let mut delegate = RemBrowserViewDelegate::new();
     browser_view_create(
@@ -341,6 +345,7 @@ pub fn new_view(url: &str) -> Option<BrowserView> {
 
 /// A tab in the current browser window.
 pub fn open(url: &str, background: bool) {
+    let _t = crate::span("tabs::open");
     // From a web app with no browser window open: open one.
     let win = cur();
     if win == 0 {
@@ -374,6 +379,7 @@ pub fn load(url: &str) {
 }
 
 fn add(win: u32, bv: BrowserView, background: bool) {
+    let _t = crate::span("tabs::add");
     let Some(content) = with_win(win, |w| w.content.clone()) else {
         return;
     };
@@ -403,6 +409,7 @@ pub fn select(i: usize) {
 }
 
 pub fn select_in(win: u32, i: usize) {
+    let _t = crate::span("tabs::select_in");
     let picked = with_win(win, |w| {
         let i = i.min(w.tabs.len().saturating_sub(1));
         let bv = w.tabs.get(i).cloned()?;
@@ -532,6 +539,7 @@ pub fn session_dirty() {
 }
 
 fn session_flush() {
+    let _t = crate::span("tabs::session_flush");
     SESSION_PENDING.set(false);
     // During a quit the windows close one by one: saving then would erase the session.
     if QUITTING.get() || CLOSING.get() {
@@ -1046,17 +1054,40 @@ fn icon_of(bv: &BrowserView) -> Option<Image> {
     FAV_IMG.with_borrow(|m| m.get(&id).cloned())
 }
 
-pub fn refresh_tabbar(win: u32) {
-    let Some((tabs, active)) = with_win(win, |w| (w.tabs.clone(), w.active)) else {
-        return;
-    };
-    let titles: Vec<String> = tabs.iter().map(title_of).collect();
-    let icons: Vec<Option<Image>> = tabs.iter().map(icon_of).collect();
-    ui::set_tabs(win, &titles, &icons, active);
+thread_local! {
+    /// A tab bar redraw is already on its way (see refresh_tabbar).
+    static TABBAR_DIRTY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Something a tab bar shows changed (title, icon, active tab, count). The bars are
+/// redrawn once, on the next UI tick, however often this is called: a loading page
+/// changes its title, icon and progress in bursts.
+pub fn refresh_tabbar(_win: u32) {
+    refresh_tabbars();
 }
 
 pub fn refresh_tabbars() {
-    win_ids().into_iter().for_each(refresh_tabbar);
+    if !TABBAR_DIRTY.replace(true) {
+        ui::run_on_ui(0, flush_tabbars);
+    }
+}
+
+fn flush_tabbars() {
+    let _t = crate::span("tabs::flush_tabbars");
+    TABBAR_DIRTY.set(false);
+    let mut more = false;
+    for win in win_ids() {
+        let Some((tabs, active)) = with_win(win, |w| (w.tabs.clone(), w.active)) else {
+            continue;
+        };
+        let titles: Vec<String> = tabs.iter().map(title_of).collect();
+        let icons: Vec<Option<Image>> = tabs.iter().map(icon_of).collect();
+        more |= ui::set_tabs(win, &titles, &icons, active);
+    }
+    // Buttons still to make (one per tick, they are slow to build): come back shortly.
+    if more && !TABBAR_DIRTY.replace(true) {
+        ui::run_on_ui(20, flush_tabbars);
+    }
 }
 
 fn refresh_right(win: u32) {
@@ -1078,6 +1109,7 @@ fn refresh_right(win: u32) {
 /// ~100 ms of UI thread, which at startup lands exactly when the first page commits
 /// (measured: launch→loaded 0.55 s with it up front, 0.45 s without).
 fn build_bar(win: u32) {
+    let _t = crate::span("tabs::build_bar");
     let Some(w) = window_of(win) else { return };
     if ui::is_built(win) {
         return;
@@ -1108,6 +1140,7 @@ fn shown_in(browser: &mut Browser) -> Option<u32> {
 }
 
 fn on_tab_closed(browser: &mut Browser) {
+    let _t = crate::span("tabs::on_tab_closed");
     let Some((win, i)) = index_of(browser) else { return };
     let Some((removed, content, n, active)) = with_win(win, |w| {
         (w.tabs.remove(i), w.content.clone(), w.tabs.len(), w.active)
@@ -1170,6 +1203,7 @@ wrap_window_delegate! {
 
         // Resize / fullscreen: the floating bars follow the window edges.
         fn on_layout_changed(&self, _view: Option<&mut View>, _new_bounds: Option<&Rect>) {
+            let _t = crate::span("cb::on_layout_changed");
             ui::place();
         }
     }
@@ -1195,6 +1229,7 @@ wrap_window_delegate! {
         // overwriting any earlier set_background_color — so per-view colours are
         // re-applied on the next tick.
         fn on_theme_colors_changed(&self, window: Option<&mut Window>, _chrome_theme: i32) {
+            let _t = crate::span("cb::on_theme_colors_changed");
             if let Some(w) = window {
                 ui::theme(w);
             }
@@ -1205,6 +1240,7 @@ wrap_window_delegate! {
         }
 
         fn on_window_created(&self, window: Option<&mut Window>) {
+            let _t = crate::span("cb::on_window_created");
             let Some(window) = window else { return };
             // [ tab bar ] over [ tabs (flex) ] over [ status bar ]. The bars start as
             // empty fixed-height slots so the page doesn't shift when they fill in.
@@ -1256,6 +1292,7 @@ wrap_window_delegate! {
         }
 
         fn on_window_activation_changed(&self, _window: Option<&mut Window>, active: i32) {
+            let _t = crate::span("cb::on_window_activation_changed");
             if active != 0 {
                 set_cur(self.id);
             }
@@ -1409,6 +1446,7 @@ wrap_display_handler! {
 
     impl DisplayHandler {
         fn on_title_change(&self, browser: Option<&mut Browser>, title: Option<&CefString>) {
+            let _t = crate::span("cb::on_title_change");
             if let Some(b) = browser.as_ref().filter(|b| apps::is_app(b)) {
                 apps::set_title(b, title);
                 return;
@@ -1423,6 +1461,7 @@ wrap_display_handler! {
 
         // Remembered for :app-install (launcher icon). Prefer png/svg over .ico.
         fn on_favicon_urlchange(&self, browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
+            let _t = crate::span("cb::on_favicon_urlchange");
             let (Some(b), Some(list)) = (browser, icon_urls) else { return };
             let urls: Vec<String> = std::mem::take(list).into_iter().map(|u| u.to_string()).collect();
             let best = urls.iter().find(|u| u.ends_with(".png") || u.ends_with(".svg")).or(urls.first()).cloned();
@@ -1446,6 +1485,7 @@ wrap_display_handler! {
         }
 
         fn on_address_change(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
+            let _t = crate::span("cb::on_address_change");
             let main = frame.is_some_and(|f| f.is_main() != 0);
             if let (true, Some(b), Some(u)) = (main, browser.as_ref(), url) {
                 show_cached_icon(b.identifier(), &u.to_string());
@@ -1460,6 +1500,7 @@ wrap_display_handler! {
         }
 
         fn on_loading_progress_change(&self, browser: Option<&mut Browser>, progress: f64) {
+            let _t = crate::span("cb::on_loading_progress_change");
             if let Some(win) = browser.and_then(shown_in) {
                 with_win(win, |w| w.progress = (progress * 100.0) as u8);
                 ui::load_progress(win, progress as f32);
@@ -1530,6 +1571,7 @@ wrap_download_image_callback! {
 
     impl DownloadImageCallback {
         fn on_download_image_finished(&self, _url: Option<&CefString>, status: i32, image: Option<&mut Image>) {
+            let _t = crate::span("cb::on_download_image_finished");
             // Tab may be gone by now; then there is no window and nothing to keep.
             let Some(win) = win_of_browser(self.id) else { return };
             match image {
@@ -1552,6 +1594,7 @@ wrap_load_handler! {
         // Cosmetic adblock: site CSS before the page paints; page.js starts reporting
         // class/id names for the generic rules.
         fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+            let _t = crate::span("cb::on_load_start");
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
             crate::mark("load start");
             let url = CefString::from(&f.url()).to_string();
@@ -1582,6 +1625,7 @@ wrap_load_handler! {
 
         // Top-edge loading bar of the visible tab.
         fn on_loading_state_change(&self, browser: Option<&mut Browser>, is_loading: i32, _can_go_back: i32, _can_go_forward: i32) {
+            let _t = crate::span("cb::on_loading_state_change");
             if let Some(win) = browser.and_then(shown_in) {
                 ui::load_state(win, is_loading != 0);
                 popup::refocus(Owner::Win(win));
@@ -1589,6 +1633,7 @@ wrap_load_handler! {
         }
 
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
+            let _t = crate::span("cb::on_load_end");
             let Some(f) = frame.filter(|f| f.is_main() != 0) else { return };
             crate::mark("load end");
             let mut browser = browser;
@@ -1682,6 +1727,7 @@ wrap_life_span_handler! {
         }
 
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            let _t = crate::span("cb::do_close");
             // A web app's browser closing = its window closing (the default).
             if browser.as_ref().is_some_and(|b| apps::is_app(b)) {
                 return 0;
@@ -1903,6 +1949,7 @@ wrap_window_delegate! {
             1
         }
         fn on_window_created(&self, window: Option<&mut Window>) {
+            let _t = crate::span("cb::on_window_created");
             let Some(w) = window else { return };
             let layout = w.set_to_box_layout(Some(&BoxLayoutSettings {
                 cross_axis_alignment: AxisAlignment::STRETCH,

@@ -74,12 +74,34 @@ fn install_panic_log() {
     }));
 }
 
+fn timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("REMBROWSER_TIMING").is_some())
+}
+
 /// `REMBROWSER_TIMING=1`: print how long each startup stage took (ms since main).
 pub fn mark(label: &str) {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let t0 = T0.get_or_init(std::time::Instant::now);
-    if std::env::var_os("REMBROWSER_TIMING").is_some() {
+    if timing() {
         eprintln!("[timing] {:>5} ms  {label}", t0.elapsed().as_millis());
+    }
+}
+
+/// `REMBROWSER_TIMING=1`: `let _t = crate::span("name");` at the top of a function prints
+/// "slow name N ms" when it took 15 ms or more of the UI thread. Does nothing otherwise.
+pub struct Span(&'static str, Option<std::time::Instant>);
+
+pub fn span(label: &'static str) -> Span {
+    Span(label, timing().then(std::time::Instant::now))
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        let ms = self.1.map_or(0, |t| t.elapsed().as_millis());
+        if ms >= 15 {
+            mark(&format!("slow {} {ms} ms", self.0));
+        }
     }
 }
 
@@ -216,6 +238,7 @@ wrap_browser_process_handler! {
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
             mark("context initialized");
+            ui::stall_watch();
             privacy::apply_prefs();
             // A bare launch can bring the last session back (see session.rs).
             let bare = matches!(&self.req, ipc::Req::Open(u) if u.is_empty());

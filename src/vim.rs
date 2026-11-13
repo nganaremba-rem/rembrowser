@@ -333,12 +333,14 @@ fn show_mode() {
 /// Another page has the keys now (tab, window, navigation): a field focused there
 /// means insert mode again.
 pub fn new_page() {
+    let _t = crate::span("vim::new_page");
     VIM.with_borrow_mut(|v| v.escaped = false);
     reset();
 }
 
 /// Active tab changed or page reported focus: leave Insert/Hint, keep Pass.
 pub fn reset() {
+    let _t = crate::span("vim::reset");
     VIM.with_borrow_mut(|v| {
         v.pending.clear();
         v.count = None;
@@ -351,6 +353,7 @@ pub fn reset() {
 
 /// A RAWKEYDOWN in a tab. Returns true to swallow it.
 pub fn on_key(e: &KeyEvent) -> bool {
+    let _t = crate::span("vim::on_key");
     let Some(k) = keys::from_event(e) else {
         return false;
     };
@@ -892,6 +895,7 @@ fn hint_key(k: &str) {
 
 /// Messages from page.js in the active tab.
 pub fn on_page_msg(fields: &[&str]) {
+    let _t = crate::span("vim::on_page_msg");
     match fields {
         // A real click (mouse or hint) into the page: a field it lands in is wanted.
         ["user"] => VIM.with_borrow_mut(|v| v.escaped = false),

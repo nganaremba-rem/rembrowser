@@ -134,6 +134,7 @@ pub fn listen() {
 }
 
 pub fn handle(req: Req) {
+    let _t = crate::span("ipc::handle");
     match req {
         // Like Chrome: a URL becomes a tab in the window last used, a bare launch
         // a new window.

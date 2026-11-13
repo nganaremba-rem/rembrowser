@@ -1,0 +1,37 @@
+<!doctype html>
+<!-- A page that behaves like a heavy site, the same way every run (spike/bench-tabs.sh):
+     title changes, console noise, a big DOM with many class names, then steady churn. -->
+<meta charset="utf-8">
+<title>stress</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%23f38ba8'/></svg>">
+<body>
+<script>
+  const q = new URLSearchParams(location.search);
+  const id = q.get('n') ?? '0';
+  let n = 0;
+  // ?calm=1: an idle page, the control run.
+  if (q.get('calm')) { document.title = `tab ${id} calm`; throw 'calm'; }
+  const box = (i) => {
+    const d = document.createElement('div');
+    d.className = `card c${id}-${i} box${i % 50} ad-banner`;
+    d.id = `i${id}-${i}`;
+    for (let j = 0; j < 10; j++) {
+      const s = document.createElement('span');
+      s.className = `s${id}-${i}-${j} label`;
+      s.textContent = 'x';
+      d.append(s);
+    }
+    return d;
+  };
+  // Load burst: what a real page does while it comes up.
+  for (let i = 0; i < 1500; i++) document.body.append(box(i));
+  for (let i = 0; i < 200; i++) console.log(`load ${id} ${i} ${'x'.repeat(200)}`);
+  for (let i = 0; i < 5; i++) document.title = `tab ${id} loading ${i}`;
+  // Steady state (the browser throttles these timers itself in a hidden tab).
+  setInterval(() => { document.title = `tab ${id} · ${n++}`; }, 50);
+  setInterval(() => { for (let i = 0; i < 10; i++) console.log(`spam ${id} ${n} ${'x'.repeat(200)}`); }, 50);
+  setInterval(() => {
+    document.body.append(box(1500 + n));
+    if (document.body.children.length > 1600) document.body.children[1].remove();
+  }, 20);
+</script>

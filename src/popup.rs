@@ -129,6 +129,7 @@ fn with_from<R>(b: &Browser, f: impl FnOnce(&mut Pop) -> R) -> Option<R> {
 }
 
 pub fn init(window: &Window, owner: Owner) {
+    let _t = crate::span("popup::init");
     if with_owner(owner, |_| ()).is_some() {
         return;
     }
@@ -366,6 +367,7 @@ fn place(p: &Pop) {
 }
 
 fn show(js: String) {
+    let _t = crate::span("popup::show");
     show_in(tabs::current_owner(), js);
 }
 
@@ -417,6 +419,7 @@ pub fn host(owner: Owner) -> Option<BrowserHost> {
 /// A page load took the keyboard from a command line that is open (the page's view
 /// grabs focus when its navigation commits): give it back, so the cursor stays.
 pub fn refocus(owner: Owner) {
+    let _t = crate::span("popup::refocus");
     with_owner(owner, |p| {
         if p.ready && p.ctl.is_visible() != 0 {
             p.bv.request_focus();
