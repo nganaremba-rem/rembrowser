@@ -7,5 +7,5 @@
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "bg.js" },
   "action": { "default_popup": "popup.html" },
-  "content_scripts": [{ "matches": ["http://*/*"], "js": ["cs.js"], "run_at": "document_start" }]
+  "content_scripts": [{ "matches": ["*://*/*"], "js": ["cs.js"], "run_at": "document_start" }]
 }

@@ -8,7 +8,9 @@ iso="$here/iso.sh"; A=127.0.0.1:8767; B=localhost:8767
 WAYLAND_DISPLAY=$("$here/offscreen.sh" start) || exit 1; export WAYLAND_DISPLAY
 read -r swaypid _ <"${XDG_RUNTIME_DIR:-/tmp}/rembrowser-offscreen"
 python3 -m http.server 8767 --bind 127.0.0.1 -d "$here/ext-probe" >/dev/null 2>&1 & srv=$!
-trap 'kill $srv 2>/dev/null; "$iso" stop; "$here/offscreen.sh" stop' EXIT
+# An idle virtual keyboard: without a keyboard no page ever has keyboard focus here.
+wtype -s 3600000 -k Shift_L & kbd=$!
+trap 'kill $srv $kbd 2>/dev/null; "$iso" stop; "$here/offscreen.sh" stop' EXIT
 for _ in $(seq 1 40); do curl -sf "$A/a.html" >/dev/null && break; sleep 0.25; done
 
 fresh() { # a new profile with the probe installed, then: iso.sh start ARGS
@@ -40,6 +42,13 @@ show "focus before 2nd click" "$(focused)"
 show "2nd click (focus the popout)" "$(ask "$A" focus)"; sleep 2
 show "focus after 2nd click" "$(focused)   (want: the popup)"
 show "popouts now" "$(popup | cut -c1-8)"
+# Bitwarden drops tab events from other windows once a real window (the popout) had
+# focus: its list then stays on the previous site.
+swaymsg -s "${XDG_RUNTIME_DIR:-/tmp}/sway-ipc.$(id -u).$swaypid.sock" '[app_id="^rembrowser$"] focus' >/dev/null; sleep 0.5
+"$iso" run ":open http://$A/b.html"; sleep 2
+r=$(ask "$A/b.html" bg)
+show "same tab to site b: Bitwarden list" "$(jq -r .bitwarden.lastUrl <<<"$r")   ignored $(jq .bitwarden.ignored <<<"$r")   (want: b.html, 0)"
+"$iso" run ":open http://$A/a.html"; sleep 2
 if [ -z "${NOSLEEP:-}" ]; then
   sleep 40; r=$(ask "$B" bg)
   show "after 40 s idle: worker restarted" "$([ "$(jq .boot <<<"$r")" != "$boot" ] && echo yes || echo no)"
@@ -55,6 +64,7 @@ show "open popout (Unlock now)" "$(ask "$A" win)"; sleep 1.5; show "popouts now"
 
 echo "== 3. browser window closed, web app still open"
 fresh "http://$B/b.html"; "$iso" run "--app=http://$A/a.html"; sleep 2
+swaymsg -s "${XDG_RUNTIME_DIR:-/tmp}/sway-ipc.$(id -u).$swaypid.sock" '[app_id="^rembrowser$"] focus' >/dev/null; sleep 0.5
 "$iso" run ":q" 2>/dev/null; sleep 2; r=$(ask "$A" bg)
 show "windows.get(-1) / getCurrent" "$(jq -c '[.winMinus1,.winCurrent]' <<<"$r")"
 show "open popout (Unlock now)" "$(ask "$A" win)"; sleep 1.5; show "popouts now" "$(popup | cut -c1-8)"

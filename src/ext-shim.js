@@ -1,4 +1,4 @@
-/*rembrowser:3*/
+/*rembrowser:4*/
 // Tabs here are not in any browser window, so extensions see them wrongly. This runs
 // first in each extension's service worker and in its popup page (see extensions.rs).
 // spike/ext-probe.sh shows every case below, before and after.
@@ -6,7 +6,7 @@
   if (!chrome.tabs || !chrome.windows) return;
   const CUR = chrome.windows.WINDOW_ID_CURRENT;
   const win = {};
-  for (const m of ['get', 'update', 'remove', 'create']) win[m] = chrome.windows[m].bind(chrome.windows);
+  for (const m of ['get', 'getAll', 'update', 'remove', 'create']) win[m] = chrome.windows[m].bind(chrome.windows);
   // Both call styles: f(args..., callback) and a promise.
   const reply = (p, cb) => (cb ? void p.then(cb) : p);
   const split = (args) => (typeof args[args.length - 1] === 'function' ? [args.slice(0, -1), args[args.length - 1]] : [args]);
@@ -34,6 +34,19 @@
     return reply(p, cb);
   };
 
+  // Our tabs have window id -1. Extensions that once saw a real window take focus (the
+  // Unlock popout, the :extensions popup) then drop every event of a tab in another window:
+  // Bitwarden kept the old site's logins after you moved on. So our tabs carry the hidden
+  // anchor window's id (its only tab is about:blank), and focus moves there with them.
+  let anchorId, lastFocus;
+  const anchor = async () => {
+    if (anchorId === undefined) {
+      const all = await win.getAll({ populate: true }).catch(() => []);
+      anchorId = (all.find((w) => w.tabs && w.tabs.length === 1 && w.tabs[0].url === 'about:blank') || {}).id;
+    }
+    return anchorId;
+  };
+
   // The active tab. Chromium's answer is the anchor window's about:blank (or, in the
   // popup, the popup itself), so a password manager finds no site and lists everything.
   // The page in use says so itself (ext-active.js, added to the extension's content
@@ -50,7 +63,7 @@
     await ready;
     while (active) {
       try {
-        return { ...(await chrome.tabs.get(active.id)), active: true, highlighted: true };
+        return { ...(await chrome.tabs.get(active.id)), windowId: active.windowId, active: true, highlighted: true };
       } catch {
         active = waiting; waiting = undefined; save();
       }
@@ -59,16 +72,21 @@
 
   // Our tabs never fire tabs.onActivated / onUpdated, which extensions use to refresh
   // what they show for "this page". Fire them when the page in use changes.
-  const heard = { onActivated: [], onUpdated: [] };
-  for (const ev of Object.keys(heard)) {
-    const add = chrome.tabs[ev].addListener.bind(chrome.tabs[ev]);
-    chrome.tabs[ev].addListener = (f, ...rest) => { heard[ev].push(f); return add(f, ...rest); };
+  const heard = { onActivated: chrome.tabs, onUpdated: chrome.tabs, onFocusChanged: chrome.windows };
+  for (const [ev, api] of Object.entries(heard)) {
+    const add = api[ev].addListener.bind(api[ev]);
+    heard[ev] = [];
+    api[ev].addListener = (f, ...rest) => { heard[ev].push(f); return add(f, ...rest); };
   }
   const fire = (ev, ...args) => heard[ev].forEach((f) => { try { f(...args); } catch (e) { console.error(e); } });
-  const accept = (tab) => {
+  chrome.windows.onFocusChanged.addListener((id) => { lastFocus = id; });
+  const accept = async (tab, focused) => {
+    const id = await anchor();
+    if (id !== undefined) tab = { ...tab, windowId: id };
     const now = `${tab.id} ${tab.url} ${tab.status}`;
     const switched = !active || active.id !== tab.id;
     active = tab; save();
+    if (focused && id !== undefined && lastFocus !== id) fire('onFocusChanged', id);
     if (now === shown) return;
     shown = now;
     if (switched) fire('onActivated', { tabId: tab.id, windowId: tab.windowId });
@@ -88,7 +106,7 @@
         return;
       }
       const tab = { ...s.tab, active: true, highlighted: true, status: m.ready ? 'complete' : 'loading' };
-      if (m.focused || !active || active.hidden || active.id === id) accept(tab);
+      if (m.focused || !active || active.hidden || active.id === id) accept(tab, m.focused);
       else waiting = tab;
     });
   });
@@ -99,7 +117,8 @@
   chrome.tabs.query = (info, cb) => {
     const wants = info && info.active === true && info.highlighted !== false &&
       Object.keys(info).every((k) => asks.includes(k)) &&
-      (info.windowId === undefined || info.windowId === CUR || info.windowId === -1);
+      (info.windowId === undefined || info.windowId === CUR || info.windowId === -1 ||
+        (anchorId !== undefined && info.windowId === anchorId));
     if (!wants) return reply(query(info), cb);
     // No window named = the active tab of every window: ours first, never the anchor's.
     const everyWindow = !info.currentWindow && !info.lastFocusedWindow && info.windowId === undefined;
